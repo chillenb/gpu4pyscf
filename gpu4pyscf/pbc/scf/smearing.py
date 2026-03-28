@@ -122,10 +122,7 @@ class _SmearingKSCF(mol_smearing._SmearingSCF):
             nocc = nelectron = self.mol.tot_electrons(nkpts)
             mo_es = mo_energy_kpts.ravel()
             if is_rhf:
-                if not getattr(self.mol, 'permit_fractional_charge', False):
-                    nocc = (nelectron + 1) // 2
-                else:
-                    nocc = nelectron / 2.0
+                nocc = nelectron / 2.0
 
             if self.mu0 is None:
                 mu, mo_occs = mol_smearing._smearing_optimize(f_occ, mo_es, nocc, sigma)
