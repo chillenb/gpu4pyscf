@@ -118,6 +118,8 @@ class PeriodicLPBE(lib.StreamObject):
         density = self.get_rhoG(dm_kpts)
         mesh = self.mesh
         density = density.reshape(-1, *mesh)
+        ngrids = np.prod(mesh)
+        weight = self.cell.vol / ngrids
         density = ifft_in_place(density).real.reshape(nset, -1, ngrids)
         density /= weight
         return density
