@@ -147,5 +147,10 @@ class PeriodicLPBE(lib.StreamObject):
             logger.info(self, f"Nelec by integration: {nelec_by_integration}")
 
         S, Sprime = shape_function(rhoR, self.cav_smear, self.cav_dens_cutoff)
-        Svol = cp.sum(S) * vol / ngrids
-        print(Svol)
+
+        if self.debug_checks:
+            Svol = cp.sum(S) * vol / ngrids
+            Svol_ang = Svol * (nist.BOHR_SI ** 3)
+            cell_vol_ang = cell.vol * (nist.BOHR_SI ** 3)
+            logger.info(self, f"Svol: {Svol_ang} Ang^3")
+            logger.info(self, f"Cell vol: {cell_vol_ang} Ang^3")
