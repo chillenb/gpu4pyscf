@@ -150,7 +150,7 @@ class PeriodicLPBE(lib.StreamObject):
 
         if self.debug_checks:
             Svol = cp.sum(S) * vol / ngrids
-            Svol_ang = Svol * (nist.BOHR_SI ** 3)
-            cell_vol_ang = cell.vol * (nist.BOHR_SI ** 3)
+            Svol_ang = Svol * (nist.BOHR ** 3)
+            cell_vol_ang = cell.vol * (nist.BOHR ** 3)
             logger.info(self, f"Svol: {Svol_ang} Ang^3")
             logger.info(self, f"Cell vol: {cell_vol_ang} Ang^3")
