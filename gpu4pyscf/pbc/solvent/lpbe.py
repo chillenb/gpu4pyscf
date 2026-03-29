@@ -81,7 +81,7 @@ class PeriodicLPBE(lib.StreamObject):
         self.is_built = False
         self.tol = 5e-5
         self.frozen = False
-        self.debug_checks = debug_checks
+        self.debug_checks = kwargs.get('debug_checks', False)
 
         self.eps        = kwargs.get('eps', 1e-10)
         self.cav_smear  = kwargs.get('cav_smear', 0.6)
