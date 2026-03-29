@@ -141,6 +141,11 @@ class PeriodicLPBE(lib.StreamObject):
         dms = _format_dms(dm_kpts, kpts)
 
         rhoR = self.get_rhoR(dms)
+
+        if self.debug_checks:
+            nelec_by_integration = cp.sum(rhoR) * vol / ngrids
+            logger.info(self, f"Nelec by integration: {nelec_by_integration}")
+
         S, Sprime = shape_function(rhoR, self.cav_smear, self.cav_dens_cutoff)
         Svol = cp.sum(S) * vol / ngrids
         print(Svol)
