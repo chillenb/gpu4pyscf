@@ -90,6 +90,7 @@ class PeriodicLPBE(lib.StreamObject):
         self.rel_permittivity = kwargs.get('rel_permittivity', 78.4)
         self.debye_length = kwargs.get('debye_length', 10.0)
 
+        self.vpplocG = None
 
 
     def dump_flags(self, verbose=None):
