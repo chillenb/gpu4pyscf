@@ -78,6 +78,10 @@ class PeriodicLPBE(lib.StreamObject):
         self.ni = MultiGridNumInt(self.cell)
         self.ni.mesh = mesh
 
+        self.Gv = None
+        self.Gabs2 = None
+        self.coul_kernel = None
+
         self.is_built = False
         self.tol = 5e-5
         self.frozen = False
@@ -104,6 +108,9 @@ class PeriodicLPBE(lib.StreamObject):
             self.is_built = True
             self.ni.build()
             logger.info(self, f"LPBE: using mesh {self.ni.mesh}")
+            self.Gv = pbc_tools._get_Gv(self.cell, self.mesh)
+            self.coul_kernel = pbc_tools.get_coulG(self.cell, Gv=self.Gv)
+            self.Gabs2 = cp.einsum('gi,gi->g', self.Gv, self.Gv)
 
 
     def get_vpplocG(self):
