@@ -35,7 +35,7 @@ path_list.append(site.USER_SITE)    # Search for the directory where user-specif
 path_list = [os.path.join(p, 'gpu4pyscf', 'lib', 'deps', 'lib') for p in path_list]
 # then add library search locations from LD_LIBRARY_PATH, since CUDA libxc
 # might be installed there on a cluster.
-path_list.extend(os.environ['LD_LIBRARY_PATH'].split(':'))
+# path_list.extend(os.environ['LD_LIBRARY_PATH'].split(':'))
 
 # monkey patch libxc reference due to a bug in nvcc
 __reference__ = 'unable to decode the reference due to https://github.com/NVIDIA/cuda-python/issues/29'
