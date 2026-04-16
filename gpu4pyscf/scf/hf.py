@@ -160,8 +160,15 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
         damp_factor = mf.damp
     if damp_factor is not None and 0 <= cycle < diis_start_cycle-1 and fock_last is not None:
         f = damping(f, fock_last, damp_factor)
+
+    diis_damp_sched = getattr(mf, 'diis_damp_sched', None)
+    if diis_damp_sched is not None and cycle >= 0:
+        diis_damp_factor = diis_damp_sched(cycle)
+    else:
+        diis_damp_factor = None
+
     if diis is not None and cycle >= diis_start_cycle:
-        f = diis.update(s1e, dm, f)
+        f = diis.update(s1e, dm, f, damp=diis_damp_factor)
 
     if level_shift_factor is None:
         level_shift_factor = mf.level_shift
@@ -235,6 +242,7 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         mf_diis = mf.DIIS(mf, mf.diis_file)
         mf_diis.space = mf.diis_space
         mf_diis.rollback = mf.diis_space_rollback
+        mf_diis.damp = mf.diis_damp
         # CDIIS just require a C that's orthonormal (C.T@S@C==I), and X satisfies that.
         if isinstance(x_orth, list): # k point
             mf_diis.Corth = stack_with_padding(x_orth)

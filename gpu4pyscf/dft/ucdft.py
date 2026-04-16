@@ -477,8 +477,15 @@ class CDFT_UKS(CDFTBaseMixin, dft.UKS):
                 dampa = dampb = damp_factor
             f = cp.asarray((asarray(damping(f[0], fock_last[0], dampa)),
                             asarray(damping(f[1], fock_last[1], dampb))))
+
+        diis_damp_sched = getattr(self, 'diis_damp_sched', None)
+        if diis_damp_sched is not None and cycle >= 0:
+            diis_damp_factor = diis_damp_sched(cycle)
+        else:
+            diis_damp_factor = None
+
         if diis and cycle >= diis_start_cycle:
-            f = diis.update(s1e, dm, f)
+            f = diis.update(s1e, dm, f, damp=diis_damp_factor)
 
         if level_shift_factor is None:
             level_shift_factor = self.level_shift

@@ -89,8 +89,15 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
             dampa = dampb = damp_factor
         f = cupy.asarray((asarray(damping(f[0], fock_last[0], dampa)),
                           asarray(damping(f[1], fock_last[1], dampb))))
+
+    diis_damp_sched = getattr(mf, 'diis_damp_sched', None)
+    if diis_damp_sched is not None and cycle >= 0:
+        diis_damp_factor = diis_damp_sched(cycle)
+    else:
+        diis_damp_factor = None
+
     if diis and cycle >= diis_start_cycle:
-        f = diis.update(s1e, dm, f)
+        f = diis.update(s1e, dm, f, damp=diis_damp_factor)
 
     if level_shift_factor is None:
         level_shift_factor = mf.level_shift

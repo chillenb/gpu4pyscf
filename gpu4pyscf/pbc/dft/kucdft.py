@@ -149,8 +149,16 @@ class CDFT_KUKS(CDFTBaseMixin, dft.KUKS):
                 f_a.append(asarray(mol_hf.damping(f_kpts[0][k], fock_last[0][k], dampa)))
                 f_b.append(asarray(mol_hf.damping(f_kpts[1][k], fock_last[1][k], dampb)))
             f_kpts = cp.asarray([f_a, f_b])
+
+        diis_damp_sched = getattr(self, 'diis_damp_sched', None)
+        if diis_damp_sched is not None and cycle >= 0:
+            diis_damp_factor = diis_damp_sched(cycle)
+        else:
+            diis_damp_factor = None
+
         if diis and cycle >= diis_start_cycle:
-            f_kpts = diis.update(s_kpts, dm_kpts, f_kpts, self, h1e_kpts, vhf_kpts, f_prev=fock_last)
+            f_kpts = diis.update(s_kpts, dm_kpts, f_kpts, self, h1e_kpts, vhf_kpts,
+                                 f_prev=fock_last, damp=diis_damp_factor)
 
         if level_shift_factor is None:
             level_shift_factor = self.level_shift

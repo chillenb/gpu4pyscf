@@ -46,6 +46,7 @@ class CDIIS(lib.diis.DIIS):
         self.rollback = False
         self.Corth = None
         self.space = 8
+        self.damp = 0
 
     def update(self, s, d, f, *args, **kwargs):
         if d.dtype == cp.complex128:
@@ -64,7 +65,18 @@ class CDIIS(lib.diis.DIIS):
             nao, nmo = self.Corth.shape
         errvec = pack_tril(errvec.reshape(-1,nmo,nmo))
         f_tril = pack_tril(f.reshape(-1,nao,nao))
-        xnew = lib.diis.DIIS.update(self, f_tril, xerr=errvec)
+        f_prev = kwargs.get('f_prev', None)
+
+        damp = kwargs.get('damp', self.damp)
+        if damp is None:
+            damp = self.damp
+
+        logger.debug(self, 'DIIS damping factor = %g', damp)
+        if abs(damp) < 1e-6 or f_prev is None:
+            xnew = lib.diis.DIIS.update(self, f_tril, xerr=errvec)
+        else:
+            f_prev_tril = pack_tril(f_prev.reshape(-1,nao,nao))
+            xnew = lib.diis.DIIS.update(self, f_tril*(1-damp) + f_prev_tril*damp, xerr=errvec)
         if self.rollback > 0 and len(self._bookkeep) == self.space:
             self._bookkeep = self._bookkeep[-self.rollback:]
         return unpack_tril(xnew).reshape(f.shape)

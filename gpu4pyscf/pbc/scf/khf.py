@@ -57,8 +57,17 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
         # need to convert CPArrayWithTag to cp.ndarray via cupy_helper.asarray().
         f_kpts = cp.asarray([asarray(pbchf.damping(f, f_prev, damp_factor))
                             for f,f_prev in zip(f_kpts,fock_last)])
+
+    diis_damp_sched = getattr(mf, 'diis_damp_sched', None)
+    if diis_damp_sched is not None and cycle >= 0:
+        diis_damp_factor = diis_damp_sched(cycle)
+        logger.debug(mf, 'DIIS damping factor = %s', diis_damp_factor)
+    else:
+        logger.debug(mf, 'DIIS damping factor is None')
+        diis_damp_factor = None
+
     if diis and cycle >= diis_start_cycle:
-        f_kpts = diis.update(s_kpts, dm_kpts, f_kpts, mf, h1e_kpts, vhf_kpts, f_prev=fock_last)
+        f_kpts = diis.update(s_kpts, dm_kpts, f_kpts, mf, h1e_kpts, vhf_kpts, f_prev=fock_last, damp=diis_damp_factor)
 
     if level_shift_factor is None:
         level_shift_factor = mf.level_shift
