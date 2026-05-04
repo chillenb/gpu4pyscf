@@ -149,6 +149,7 @@ class PeriodicLPBE(lib.StreamObject):
         self.cav_tension = kwargs.get('cav_tension', vasp_tau_to_pyscf_tau(5.25e-4))
         self.rel_permittivity = kwargs.get('rel_permittivity', 78.4)
 
+        self.has_electrolyte = True
         self.debye_length = debye_length_au(molar_to_au(kwargs.get('ionic_strength', 1.0)), 298.15)
 
         self.vpplocG = None
@@ -158,6 +159,11 @@ class PeriodicLPBE(lib.StreamObject):
         logger.info(self, "******** Periodic LPBE flags ********")
         logger.info(self, f"  kpts: {self.kpts}")
         logger.info(self, f"  tol: {self.tol}")
+        logger.info(self, f"  cav_smear: {self.cav_smear}")
+        logger.info(self, f"  cav_dens_cutoff: {self.cav_dens_cutoff}")
+        logger.info(self, f"  cav_tension: {self.cav_tension}")
+        logger.info(self, f"  rel_permittivity: {self.rel_permittivity}")
+        logger.info(self, f"  debye_length: {self.debye_length}")
         return self
     
     def build(self):
@@ -248,18 +254,23 @@ class PeriodicLPBE(lib.StreamObject):
 
         solute_chargeR = -rhoR + pseudo_nucdensityR
 
-        if self.debug_checks:
-            nelec_by_integration = cp.sum(rhoR) * vol / ngrids
-            log.info(f"Nelec by integration: {nelec_by_integration}")
+        nelec_by_integration = cp.sum(rhoR) * vol / ngrids
+        nuc_charge_by_integration = cp.sum(pseudo_nucdensityR) * vol / ngrids
+        qsol = nuc_charge_by_integration - nelec_by_integration
 
-            nuc_charge_by_integration = cp.sum(pseudo_nucdensityR) * vol / ngrids
+        if self.debug_checks:
+            log.info(f"Nelec by integration: {nelec_by_integration}")
             log.info(f"Nuclear charge by integration of pseudo_nucdensityR: {nuc_charge_by_integration}")
+            log.info(f"Total solute charge by integration: {qsol}")
 
 
         S, Sprime = shape_function(rhoR + pseudo_nucdensityR, self.cav_smear, self.cav_dens_cutoff)
 
         eps_r_field = 1. + (self.rel_permittivity - 1.) * S
-        kappa2 = 1.0 / (self.debye_length ** 2)
+        if self.has_electrolyte:
+            kappa2 = 1.0 / (self.debye_length ** 2)
+        else:
+            kappa2 = 0.0
 
         if self.debug_checks:
             Svol = cp.sum(S) * vol / ngrids
@@ -350,13 +361,96 @@ class PeriodicLPBE(lib.StreamObject):
 
         grad_solution_phiG = gradient_recip(solution_phi_G, self.Gv)
         grad_solution_phiR = pbc_tools.ifft(grad_solution_phiG, mesh).real
-    
-        vcorr_r = -1.0/(8*np.pi) * Sprime.reshape(-1) * cp.einsum('ng, ng ->g', grad_solution_phiR, grad_solution_phiR) \
-             - 1.0/(8*np.pi) * kappa2 * Sprime.reshape(-1) * solution_phi_R.reshape(-1)**2
+
+
+        # Ionic and dielectric components of solvation potential.
+        lambdalq_ion = - 1.0/(8*np.pi) * kappa2 * solution_phi_R.reshape(-1)**2
+        lambdalq_diel = -1.0/(8*np.pi) * (self.rel_permittivity - 1.) * cp.einsum('ng, ng ->g', grad_solution_phiR, grad_solution_phiR)
+
+        vion_r = Sprime.reshape(-1) * lambdalq_ion
+        vdiel_r = Sprime.reshape(-1) * lambdalq_diel
+
+        Eion = cp.sum(lambdalq_ion.real * S.reshape(-1)) * vol / ngrids
+        Ediel = cp.sum(lambdalq_diel.real * S.reshape(-1)) * vol / ngrids
+
+        # Coulomb correction energy
+        lapl_solvation_phiG = -self.Gabs2 * solvation_potentialG
+        lapl_solvation_phiR = pbc_tools.ifft(lapl_solvation_phiG.reshape(-1), mesh).real.reshape(*mesh)
+        E_coul_corr1 = qsol / vol * cp.sum(solvation_potentialR) * vol / ngrids
+        E_coul_corr2 = 1.0/(8.0*np.pi) * cp.sum(lapl_solvation_phiR * solvation_potentialR) * vol / ngrids
+        E_coul_corr1 = E_coul_corr1.real
+        E_coul_corr2 = E_coul_corr2.real
+        E_coul_corr = E_coul_corr1 + E_coul_corr2
+
+
+        # Vacuum alignment in z-direction. This is important when there is no electrolyte.
+        rhoG = pbc_tools.fft(rhoR.reshape(-1), mesh).reshape(-1)
+        rhoG_smoothed = rhoG * cp.exp(-100.0 * (self.Gabs2) * 0.5)
+        rhoR_smoothed = pbc_tools.ifft(rhoG_smoothed.reshape(-1), mesh).real.reshape(*mesh)
+        rhoR_z = rhoR_smoothed.mean(axis=(0, 1))
+        dens_min_idx = cp.argmin(rhoR_z)
+        vacpot_at_zmin = vac_coulomb_potentialR.reshape(mesh).real.mean(axis=(0, 1))[dens_min_idx]
+        solpot_at_zmin = solution_phi_R.reshape(mesh).real.mean(axis=(0, 1))[dens_min_idx]
+
+
+
+        if self.debug_checks:
+            log.info(f"Eion: {Eion:.3e} Hartree ({Eion*nist.HARTREE2EV:.3e} eV)")
+            log.info(f"Ediel: {Ediel:.3e} Hartree ({Ediel*nist.HARTREE2EV:.3e} eV)")
+            log.info(f"E_coul_corr1: {E_coul_corr1:.3e} Hartree ({E_coul_corr1*nist.HARTREE2EV:.3e} eV)")
+            log.info(f"E_coul_corr2: {E_coul_corr2:.3e} Hartree ({E_coul_corr2*nist.HARTREE2EV:.3e} eV)")
+            log.info(f"Coulomb correction energy: {E_coul_corr:.3e} Hartree ({E_coul_corr*nist.HARTREE2EV:.3e} eV)")
+            log.info(f"Vacuum potential in empty space: {vacpot_at_zmin:.3e} Hartree ({vacpot_at_zmin*nist.HARTREE2EV:.3e} eV)")
+            log.info(f"Phi in empty space: {solpot_at_zmin:.3e} Hartree ({solpot_at_zmin*nist.HARTREE2EV:.3e} eV)")
+
+        # V_\mathrm{cav} = \tau \partial_{\rho} S(r) \left( \frac{\nabla^{2}\rho}{|\nabla\rho|} - 
+        #                  \frac{1}{|\nabla\rho|^{3}}(\nabla\rho)^{\mathrm{t}}\mathbf{H}_{\rho}(\nabla\rho) \right)
+        # tau is self.cav_tension.
+
+        # Cavitation potential.
+
+
+        grad_rho_g = gradient_recip(rhoG, self.Gv)
+        grad_rho_r = pbc_tools.ifft(grad_rho_g, mesh).real.reshape(3, *mesh)
+
+        lap_rho_g = -self.Gabs2 * rhoG
+        lap_rho_r = pbc_tools.ifft(lap_rho_g.reshape(-1), mesh).real.reshape(*mesh)
+
+        # grad_hess_grad_r = (nabla rho)^t H(rho) (nabla rho)
+        grad_hess_grad_r = cp.zeros(mesh, dtype=cp.float64)
+
+        for i in range(3):
+            for j in range(3):
+                hij_g = -(self.Gv[:, i] * self.Gv[:, j]) * rhoG
+                hij_r = pbc_tools.ifft(hij_g.reshape(-1), mesh).real.reshape(*mesh)
+                grad_hess_grad_r += grad_rho_r[i] * hij_r * grad_rho_r[j]
+
+        grad_abs_r = cp.sqrt(cp.einsum('i...,i...->...', grad_rho_r, grad_rho_r))
+        grad_abs_safe_r = cp.maximum(grad_abs_r, self.eps)
+
+        vcav_r = self.cav_tension * Sprime * (
+            lap_rho_r / grad_abs_safe_r
+            - grad_hess_grad_r / (grad_abs_safe_r ** 3)
+        )
+        vcav_r = vcav_r.reshape(-1)
+
+
+        vcorr_r = vion_r + vdiel_r + vcav_r
+
         vcorr_g = solvation_potentialG + pbc_tools.fft(vcorr_r.reshape(-1), mesh).reshape(-1)
     
         vcorr_mat = self.potg_to_potmat(vcorr_g)
 
+
+        surf_area = cp.sum( (Sprime * grad_abs_r).reshape(-1) ) * vol / ngrids
+        Ecav = self.cav_tension * surf_area
+
+
+
+
+        if self.debug_checks:
+            log.info(f"Surface area: {surf_area:.3f} Bohr^2")
+            log.info(f"Ecav: {Ecav:.3e} Hartree ({Ecav*nist.HARTREE2EV:.3e} eV)")
 
         results = {}
         results['S'] = S
@@ -374,6 +468,11 @@ class PeriodicLPBE(lib.StreamObject):
         results['vcorr_r'] = vcorr_r
         results['vcorr_mat'] = vcorr_mat
 
+        results['Eion'] = Eion
+        results['Ediel'] = Ediel
+        results['Ecav'] = Ecav
+        results['E_coul_corr'] = E_coul_corr
+
 
 
         if self.plot_results:
@@ -386,19 +485,33 @@ class PeriodicLPBE(lib.StreamObject):
             solvation_potential_z = solvation_potentialR.reshape(mesh).mean(axis=(0, 1))
             vac_coulomb_potential_z = vac_coulomb_potentialR.reshape(mesh).mean(axis=(0, 1))
             vcorr_z = vcorr_r.reshape(mesh).mean(axis=(0, 1))
-            ax2 = ax.twinx()
+            #ax2 = ax.twinx()
             ax.plot(z, solvation_potential_z.real.get(), label='Difference due to solvation')
             ax.plot(z, solution_phi_z.real.get(), label='Coulomb potential in solution')
             ax.plot(z, vac_coulomb_potential_z.real.get(), label='Vacuum Coulomb potential')
-            ax2.plot(z, vcorr_z.real.get(), label='VCorr', color='red')
+            ax.plot(z, vcorr_z.real.get(), label='VCorr', color='red')
             ax.set_xlabel('Z (Angstrom)')
             ax.set_ylabel('Hartree')
-            ax2.set_ylabel('VCorr')
+            #ax2.set_ylabel('VCorr')
             ax.legend()
-            ax2.legend(loc='upper right')
+            #ax2.legend(loc='upper right')
             fig.savefig(f"{self.plot_filestem}-pot-{self.ncalls}.png")
             plt.close()
 
+            fig, ax = plt.subplots(figsize=(12, 8))
+            vcorr_z = vcorr_r.reshape(mesh).mean(axis=(0, 1))
+            vion_z = vion_r.reshape(mesh).mean(axis=(0, 1))
+            vdiel_z = vdiel_r.reshape(mesh).mean(axis=(0, 1))
+            vcav_z = vcav_r.reshape(mesh).mean(axis=(0, 1))
+            ax.plot(z, vcorr_z.real.get(), label='VCorr', color='red')
+            ax.plot(z, vion_z.real.get(), label='Vion', color='green')
+            ax.plot(z, vdiel_z.real.get(), label='Vdiel', color='orange')
+            ax.plot(z, vcav_z.real.get(), label='Vcav', color='blue')
+            ax.set_xlabel('Z (Angstrom)')
+            ax.set_ylabel('Hartree')
+            ax.legend()
+            fig.savefig(f"{self.plot_filestem}-vcorr-{self.ncalls}.png")
+            plt.close()
 
             fig, ax = plt.subplots(figsize=(12, 8))
             # plot XY-averaged densities along Z.
@@ -444,8 +557,9 @@ class PeriodicLPBE(lib.StreamObject):
 
     def kernel(self, dm_kpts, tol=None):
         results = self.kernel_detail(dm_kpts, tol=tol)
+        Ecorr = results['Eion'] + results['Ediel'] + results['Ecav'] + results['E_coul_corr']
         self.ncalls += 1
         if self.ncalls < self.nskip:
             return 0.0, 0.0
         else:
-            return 0.0, results['vcorr_mat'][0]
+            return Ecorr, results['vcorr_mat'][0]
