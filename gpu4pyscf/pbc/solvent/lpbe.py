@@ -134,6 +134,7 @@ class PeriodicLPBE(lib.StreamObject):
         self.ncalls = 0
         self.nskip = 0
         self.plot_results = False
+        self.chkfile = None
         self.plot_filestem = "lpbe_results"
 
         self.extra_screening_list = None
@@ -150,7 +151,7 @@ class PeriodicLPBE(lib.StreamObject):
         self.rel_permittivity = kwargs.get('rel_permittivity', 78.4)
 
         self.has_electrolyte = True
-        self.debye_length = debye_length_au(molar_to_au(kwargs.get('ionic_strength', 1.0)), 298.15)
+        self.debye_length = debye_length_au(molar_to_au(kwargs.get('ionic_strength', 1.0)), 298.15, eps_r=self.rel_permittivity)
 
         self.vpplocG = None
 
@@ -268,9 +269,9 @@ class PeriodicLPBE(lib.StreamObject):
 
         eps_r_field = 1. + (self.rel_permittivity - 1.) * S
         if self.has_electrolyte:
-            kappa2 = 1.0 / (self.debye_length ** 2)
+            ebkappa2 = self.rel_permittivity / (self.debye_length ** 2)
         else:
-            kappa2 = 0.0
+            ebkappa2 = 0.0
 
         if self.debug_checks:
             Svol = cp.sum(S) * vol / ngrids
@@ -278,7 +279,8 @@ class PeriodicLPBE(lib.StreamObject):
             cell_vol_ang = cell.vol * (nist.BOHR ** 3)
             log.info(f"Svol: {Svol_ang} Ang^3")
             log.info(f"Cell vol: {cell_vol_ang} Ang^3")
-            log.info(f"kappa2: {kappa2:.3e} 1/Bohr^2, debye length: {1/np.sqrt(kappa2):.3f} Bohr")
+            log.info(f"ebkappa2: {ebkappa2:.3e} 1/Bohr^2, debye length: {self.debye_length:.3f} Bohr")
+            log.info(f"ebkappa2: {ebkappa2 / (nist.BOHR ** 2):.3e} 1/Angstrom^2, debye length: {self.debye_length * nist.BOHR:.3f} Angstrom")
 
 
         if self.extra_screening_list is not None and self.ncalls < len(self.extra_screening_list):
@@ -307,10 +309,10 @@ class PeriodicLPBE(lib.StreamObject):
                 return -(div_eps_grad_phiG - debye_term_G).reshape(-1)
             return Aop
 
-        if kappa2 == 0:
+        if ebkappa2 == 0:
             yukawa_kernel = self.coul_kernel # laplacian operator
         else:
-            yukawa_kernel = 4.0 * np.pi / (self.Gabs2 + kappa2/(self.rel_permittivity))
+            yukawa_kernel = 4.0 * np.pi / (self.Gabs2 + ebkappa2/(self.rel_permittivity))
 
         def Mprecond(phiG):
             precond_phiG = yukawa_kernel * phiG
@@ -319,31 +321,23 @@ class PeriodicLPBE(lib.StreamObject):
         from cupyx.scipy.sparse.linalg import LinearOperator, cg
         t0 = log.init_timer()
 
-        A = LinearOperator((ngrids, ngrids), matvec=make_aop(extrakappa2 + S*kappa2))
+        A = LinearOperator((ngrids, ngrids), matvec=make_aop(extrakappa2 + S*ebkappa2))
         M = LinearOperator((ngrids, ngrids), matvec=Mprecond)
         rhs = -4*np.pi*solute_chargeR.reshape(-1)
         rhs = pbc_tools.fft(rhs.reshape(-1), mesh).reshape(-1)
-        solution_phi_G, info = cg(A, rhs, M=M, x0=self.pot_guess, tol=1e-8, maxiter=200)
+        solution_phi_G, info = cg(A, rhs, M=M, x0=self.pot_guess, tol=self.tol, maxiter=200)
         if info != 0:
             logger.warn(self, f"Conjugate gradient did not converge: info={info}")
 
         t1 = log.timer("LPBE CG solve", *t0)
-        # def makecallback():
-        #     iter = 0
-        #     def callback(xk):
-        #         nonlocal iter
-        #         iter += 1
-        #         res = Aop(xk) - rhs
-        #         res_norm = cp.linalg.norm(res)
-        #         logger.info(self, f"CG iteration {iter}, residual norm {res_norm:.3e}")
-        #     return callback
 
+        t2 = log.init_timer()
 
         solution_phi_R = pbc_tools.ifft(solution_phi_G.reshape(-1), mesh).reshape(*mesh)
 
         self.pot_guess = solution_phi_G
 
-        rho_ion_R = solution_phi_R * S * kappa2 / (4*np.pi)
+        rho_ion_R = solution_phi_R * S * (ebkappa2 / (4*np.pi))
 
 
         # compute solvation potential.
@@ -359,29 +353,34 @@ class PeriodicLPBE(lib.StreamObject):
 
         solvation_potentialG = pbc_tools.fft(solvation_potentialR.reshape(-1), mesh).reshape(-1)
 
-        grad_solution_phiG = gradient_recip(solution_phi_G, self.Gv)
-        grad_solution_phiR = pbc_tools.ifft(grad_solution_phiG, mesh).real
+        grad_solution_phiR = pbc_tools.ifft(gradient_recip(solution_phi_G, self.Gv), mesh).real
 
+        S_grad_solution_phiR = S * grad_solution_phiR.reshape(3, *mesh)
+        div_S_grad_solution_phiG = divergence_recip( pbc_tools.fft(S_grad_solution_phiR.reshape(3, -1), mesh), self.Gv)
+        div_S_grad_solution_phiR = pbc_tools.ifft(div_S_grad_solution_phiG.reshape(-1), mesh)
+        diel_bound_charge_density_R = div_S_grad_solution_phiR * ( (self.rel_permittivity - 1.) / (4*np.pi) )
+        del S_grad_solution_phiR, div_S_grad_solution_phiG, div_S_grad_solution_phiR
 
         # Ionic and dielectric components of solvation potential.
-        lambdalq_ion = - 1.0/(8*np.pi) * kappa2 * solution_phi_R.reshape(-1)**2
-        lambdalq_diel = -1.0/(8*np.pi) * (self.rel_permittivity - 1.) * cp.einsum('ng, ng ->g', grad_solution_phiR, grad_solution_phiR)
+        lambdalq_ion = - 1.0/(8*np.pi) * ebkappa2 * solution_phi_R.reshape(-1)**2
+        lambdalq_diel = -1.0/(8*np.pi) * (self.rel_permittivity - 1.) * cp.einsum('ng, ng ->g', grad_solution_phiR.real, grad_solution_phiR.real)
 
         vion_r = Sprime.reshape(-1) * lambdalq_ion
         vdiel_r = Sprime.reshape(-1) * lambdalq_diel
 
-        Eion = cp.sum(lambdalq_ion.real * S.reshape(-1)) * vol / ngrids
-        Ediel = cp.sum(lambdalq_diel.real * S.reshape(-1)) * vol / ngrids
+        Eion = cp.einsum('g, g ->', lambdalq_ion.real, S.reshape(-1)) * vol / ngrids
+        Ediel = cp.einsum('g, g ->', lambdalq_diel.real, S.reshape(-1)) * vol / ngrids
 
         # Coulomb correction energy
         lapl_solvation_phiG = -self.Gabs2 * solvation_potentialG
         lapl_solvation_phiR = pbc_tools.ifft(lapl_solvation_phiG.reshape(-1), mesh).real.reshape(*mesh)
+        del lapl_solvation_phiG
         E_coul_corr1 = qsol / vol * cp.sum(solvation_potentialR) * vol / ngrids
         E_coul_corr2 = 1.0/(8.0*np.pi) * cp.sum(lapl_solvation_phiR * solvation_potentialR) * vol / ngrids
         E_coul_corr1 = E_coul_corr1.real
         E_coul_corr2 = E_coul_corr2.real
         E_coul_corr = E_coul_corr1 + E_coul_corr2
-
+        del lapl_solvation_phiR
 
         # Vacuum alignment in z-direction. This is important when there is no electrolyte.
         rhoG = pbc_tools.fft(rhoR.reshape(-1), mesh).reshape(-1)
@@ -392,16 +391,10 @@ class PeriodicLPBE(lib.StreamObject):
         vacpot_at_zmin = vac_coulomb_potentialR.reshape(mesh).real.mean(axis=(0, 1))[dens_min_idx]
         solpot_at_zmin = solution_phi_R.reshape(mesh).real.mean(axis=(0, 1))[dens_min_idx]
 
+        del rhoG_smoothed, rhoR_smoothed, rhoR_z
 
 
-        if self.debug_checks:
-            log.info(f"Eion: {Eion:.3e} Hartree ({Eion*nist.HARTREE2EV:.3e} eV)")
-            log.info(f"Ediel: {Ediel:.3e} Hartree ({Ediel*nist.HARTREE2EV:.3e} eV)")
-            log.info(f"E_coul_corr1: {E_coul_corr1:.3e} Hartree ({E_coul_corr1*nist.HARTREE2EV:.3e} eV)")
-            log.info(f"E_coul_corr2: {E_coul_corr2:.3e} Hartree ({E_coul_corr2*nist.HARTREE2EV:.3e} eV)")
-            log.info(f"Coulomb correction energy: {E_coul_corr:.3e} Hartree ({E_coul_corr*nist.HARTREE2EV:.3e} eV)")
-            log.info(f"Vacuum potential in empty space: {vacpot_at_zmin:.3e} Hartree ({vacpot_at_zmin*nist.HARTREE2EV:.3e} eV)")
-            log.info(f"Phi in empty space: {solpot_at_zmin:.3e} Hartree ({solpot_at_zmin*nist.HARTREE2EV:.3e} eV)")
+
 
         # V_\mathrm{cav} = \tau \partial_{\rho} S(r) \left( \frac{\nabla^{2}\rho}{|\nabla\rho|} - 
         #                  \frac{1}{|\nabla\rho|^{3}}(\nabla\rho)^{\mathrm{t}}\mathbf{H}_{\rho}(\nabla\rho) \right)
@@ -409,12 +402,9 @@ class PeriodicLPBE(lib.StreamObject):
 
         # Cavitation potential.
 
+        grad_rho_r = pbc_tools.ifft(gradient_recip(rhoG, self.Gv), mesh).real.reshape(3, *mesh)
 
-        grad_rho_g = gradient_recip(rhoG, self.Gv)
-        grad_rho_r = pbc_tools.ifft(grad_rho_g, mesh).real.reshape(3, *mesh)
-
-        lap_rho_g = -self.Gabs2 * rhoG
-        lap_rho_r = pbc_tools.ifft(lap_rho_g.reshape(-1), mesh).real.reshape(*mesh)
+        lap_rho_r = pbc_tools.ifft((-self.Gabs2 * rhoG).reshape(-1), mesh).real.reshape(*mesh)
 
         # grad_hess_grad_r = (nabla rho)^t H(rho) (nabla rho)
         grad_hess_grad_r = cp.zeros(mesh, dtype=cp.float64)
@@ -434,38 +424,44 @@ class PeriodicLPBE(lib.StreamObject):
         )
         vcav_r = vcav_r.reshape(-1)
 
+        del lap_rho_r, grad_hess_grad_r, grad_abs_safe_r, grad_rho_r, hij_g, hij_r
 
         vcorr_r = vion_r + vdiel_r + vcav_r
 
         vcorr_g = solvation_potentialG + pbc_tools.fft(vcorr_r.reshape(-1), mesh).reshape(-1)
     
+        t5 = log.init_timer()
         vcorr_mat = self.potg_to_potmat(vcorr_g)
+        log.timer("potg_to_potmat", *t5)
 
 
         surf_area = cp.sum( (Sprime * grad_abs_r).reshape(-1) ) * vol / ngrids
         Ecav = self.cav_tension * surf_area
 
-
-
-
         if self.debug_checks:
-            log.info(f"Surface area: {surf_area:.3f} Bohr^2")
             log.info(f"Ecav: {Ecav:.3e} Hartree ({Ecav*nist.HARTREE2EV:.3e} eV)")
+            log.info(f"Eion: {Eion:.3e} Hartree ({Eion*nist.HARTREE2EV:.3e} eV)")
+            log.info(f"Ediel: {Ediel:.3e} Hartree ({Ediel*nist.HARTREE2EV:.3e} eV)")
+            log.info(f"E_coul_corr1: {E_coul_corr1:.3e} Hartree ({E_coul_corr1*nist.HARTREE2EV:.3e} eV)")
+            log.info(f"E_coul_corr2: {E_coul_corr2:.3e} Hartree ({E_coul_corr2*nist.HARTREE2EV:.3e} eV)")
+            log.info(f"Coulomb correction energy: {E_coul_corr:.3e} Hartree ({E_coul_corr*nist.HARTREE2EV:.3e} eV)")
+            log.info(f"Vacuum potential in empty space: {vacpot_at_zmin:.3e} Hartree ({vacpot_at_zmin*nist.HARTREE2EV:.3e} eV)")
+            log.info(f"Phi in empty space: {solpot_at_zmin:.3e} Hartree ({solpot_at_zmin*nist.HARTREE2EV:.3e} eV)")
+            log.info(f"Surface area: {surf_area:.3f} Bohr^2")
 
         results = {}
-        results['S'] = S
-        results['solution_phi_G'] = solution_phi_G.reshape(*mesh)
-        results['solution_phi_R'] = solution_phi_R
-        results['rho_ion_R'] = rho_ion_R
+        # results['S'] = S
+        # results['solution_phi_G'] = solution_phi_G.reshape(*mesh)
+        # results['solution_phi_R'] = solution_phi_R
+        # results['rho_ion_R'] = rho_ion_R
 
-        rhog = pbc_tools.fft(rhoR.reshape(-1), mesh).reshape(-1)
-        vhar = self.coul_kernel * rhog
-        vj = self.potg_to_potmat(vhar)
-        results['vj'] = vj
-        results['solvation_potentialR'] = solvation_potentialR
-        results['solvation_potentialG'] = solvation_potentialG
-        results['vac_coulomb_potentialR'] = vac_coulomb_potentialR
-        results['vcorr_r'] = vcorr_r
+        # vhar = self.coul_kernel * rhoG
+        # vj = self.potg_to_potmat(vhar)
+        # results['vj'] = vj
+        # results['solvation_potentialR'] = solvation_potentialR
+        # results['solvation_potentialG'] = solvation_potentialG
+        # results['vac_coulomb_potentialR'] = vac_coulomb_potentialR
+        # results['vcorr_r'] = vcorr_r
         results['vcorr_mat'] = vcorr_mat
 
         results['Eion'] = Eion
@@ -475,84 +471,123 @@ class PeriodicLPBE(lib.StreamObject):
 
 
 
-        if self.plot_results:
-            import matplotlib.pyplot as plt
+        if self.plot_results or (self.chkfile is not None):
             mesh = self.mesh
-            fig, ax = plt.subplots(figsize=(12, 8))
-            # plot XY-averaged potentials along Z.
             z = np.arange(mesh[2]) * self.cell.lattice_vectors(unit='A')[2, 2] / mesh[2]
-            solution_phi_z = solution_phi_R.reshape(mesh).mean(axis=(0, 1))
-            solvation_potential_z = solvation_potentialR.reshape(mesh).mean(axis=(0, 1))
-            vac_coulomb_potential_z = vac_coulomb_potentialR.reshape(mesh).mean(axis=(0, 1))
-            vcorr_z = vcorr_r.reshape(mesh).mean(axis=(0, 1))
-            #ax2 = ax.twinx()
-            ax.plot(z, solvation_potential_z.real.get(), label='Difference due to solvation')
-            ax.plot(z, solution_phi_z.real.get(), label='Coulomb potential in solution')
-            ax.plot(z, vac_coulomb_potential_z.real.get(), label='Vacuum Coulomb potential')
-            ax.plot(z, vcorr_z.real.get(), label='VCorr', color='red')
-            ax.set_xlabel('Z (Angstrom)')
-            ax.set_ylabel('Hartree')
-            #ax2.set_ylabel('VCorr')
-            ax.legend()
-            #ax2.legend(loc='upper right')
-            fig.savefig(f"{self.plot_filestem}-pot-{self.ncalls}.png")
-            plt.close()
+            solution_phi_z = solution_phi_R.reshape(mesh).mean(axis=(0, 1)).real
+            solvation_potential_z = solvation_potentialR.reshape(mesh).mean(axis=(0, 1)).real
+            vac_coulomb_potential_z = vac_coulomb_potentialR.reshape(mesh).mean(axis=(0, 1)).real
+            vcorr_z = vcorr_r.reshape(mesh).mean(axis=(0, 1)).real
+            rho_z = rhoR.reshape(mesh).mean(axis=(0, 1)).real
+            pseudo_nucdensity_z = pseudo_nucdensityR.reshape(mesh).mean(axis=(0, 1)).real
+            vion_z = vion_r.reshape(mesh).mean(axis=(0, 1)).real
+            vdiel_z = vdiel_r.reshape(mesh).mean(axis=(0, 1)).real
+            vcav_z = vcav_r.reshape(mesh).mean(axis=(0, 1)).real
+            rhoion_z = rho_ion_R.reshape(mesh).mean(axis=(0, 1)).real
+            rhodiel_z = diel_bound_charge_density_R.reshape(mesh).mean(axis=(0, 1)).real
+            S_z = S.reshape(mesh).mean(axis=(0, 1)).real
+            Sprime_z = Sprime.reshape(mesh).mean(axis=(0, 1)).real
+            Sphi_z = (solution_phi_R * S).real.reshape(mesh).mean(axis=(0, 1))
 
-            fig, ax = plt.subplots(figsize=(12, 8))
-            vcorr_z = vcorr_r.reshape(mesh).mean(axis=(0, 1))
-            vion_z = vion_r.reshape(mesh).mean(axis=(0, 1))
-            vdiel_z = vdiel_r.reshape(mesh).mean(axis=(0, 1))
-            vcav_z = vcav_r.reshape(mesh).mean(axis=(0, 1))
-            ax.plot(z, vcorr_z.real.get(), label='VCorr', color='red')
-            ax.plot(z, vion_z.real.get(), label='Vion', color='green')
-            ax.plot(z, vdiel_z.real.get(), label='Vdiel', color='orange')
-            ax.plot(z, vcav_z.real.get(), label='Vcav', color='blue')
-            ax.set_xlabel('Z (Angstrom)')
-            ax.set_ylabel('Hartree')
-            ax.legend()
-            fig.savefig(f"{self.plot_filestem}-vcorr-{self.ncalls}.png")
-            plt.close()
+            solution_phi_z = solution_phi_z.get()
+            solvation_potential_z = solvation_potential_z.get()
+            vac_coulomb_potential_z = vac_coulomb_potential_z.get()
+            vcorr_z = vcorr_z.get()
+            rho_z = rho_z.get()
+            pseudo_nucdensity_z = pseudo_nucdensity_z.get()
+            vion_z = vion_z.get()
+            vdiel_z = vdiel_z.get()
+            vcav_z = vcav_z.get()
+            rhoion_z = rhoion_z.get()
+            rhodiel_z = rhodiel_z.get()
+            S_z = S_z.get()
+            Sprime_z = Sprime_z.get()
+            Sphi_z = Sphi_z.get()
 
-            fig, ax = plt.subplots(figsize=(12, 8))
-            # plot XY-averaged densities along Z.
-            rhoion_z = rho_ion_R.reshape(mesh).mean(axis=(0, 1))
-            ax.plot(z, rhoion_z.real.get(), label='Ion density')
-            ax.set_xlabel('Z (Angstrom)')
-            ax.set_ylabel('density (e/Bohr^3)')
-            ax.legend()
-            ax.set_title('xy-averaged densities along z')
-            fig.savefig(f"{self.plot_filestem}-rhoion-{self.ncalls}.png")
-            plt.close()
+            if self.chkfile is not None:
+                np.savez(self.chkfile,
+                    z=z,
+                    solution_phi_z=solution_phi_z,
+                    solvation_potential_z=solvation_potential_z,
+                    vac_coulomb_potential_z=vac_coulomb_potential_z,
+                    vcorr_z=vcorr_z.real,
+                    vion_z=vion_z.real,
+                    vdiel_z=vdiel_z,
+                    vcav_z=vcav_z,
+                    rhoion_z=rhoion_z,
+                    rhodiel_z=rhodiel_z,
+                    S_z=S_z,
+                    Sprime_z=Sprime_z,
+                    rho_z=rho_z,
+                    sphi_z=Sphi_z,
+                    pseudo_nucdensity_z=pseudo_nucdensity_z,
+                )
 
-            fig, ax = plt.subplots(figsize=(6, 4))
-            # plot XY-averaged densities along Z.
-            S_z = S.reshape(mesh).mean(axis=(0, 1))
-            Sprime_z = Sprime.reshape(mesh).mean(axis=(0, 1))
-            ax.plot(z, S_z.real.get(), label='Cavity function', color='black')
-            ax2 = ax.twinx()
-            ax2.plot(z, Sprime_z.real.get(), label='Cavity derivative', color='red')
-            ax.set_xlabel('Z (Angstrom)')
-            ax.set_ylabel('Cavity function')
-            ax2.set_ylabel('Cavity derivative')
-            ax.legend()
-            ax2.legend(loc='upper right')
-            fig.savefig(f"{self.plot_filestem}-cav-{self.ncalls}.png", dpi=600)
-            plt.close()
+            if self.plot_results:
+                import matplotlib.pyplot as plt
+                fig, ax = plt.subplots(figsize=(12, 8))
+                ax.plot(z, solvation_potential_z, label='Difference due to solvation')
+                ax.plot(z, solution_phi_z, label='Coulomb potential in solution')
+                ax.plot(z, vac_coulomb_potential_z, label='Vacuum Coulomb potential')
+                ax.plot(z, vcorr_z, label='VCorr', color='red')
+                ax.set_xlabel('Z (Angstrom)')
+                ax.set_ylabel('Hartree')
+                ax.legend()
+                fig.savefig(f"{self.plot_filestem}-pot-{self.ncalls}.png")
+                plt.close()
 
-            fig, ax = plt.subplots(figsize=(12, 8))
-            #ax2 = ax.twinx()
-            # plot XY-averaged densities along Z.
-            rho_z = rhoR.reshape(mesh).mean(axis=(0, 1))
-            pseudo_nucdensity_z = pseudo_nucdensityR.reshape(mesh).mean(axis=(0, 1))
-            ax.plot(z, rho_z.real.get(), label='Charge density')
-            ax.plot(z, pseudo_nucdensity_z.real.get(), label='Pseudo nuclear charge density', color='red')
-            ax.set_xlabel('Z (Angstrom)')
-            ax.set_ylabel('density (e/Bohr^3)')
-            ax.legend()
-            ax.set_title('xy-averaged densities along z')
-            fig.savefig(f"{self.plot_filestem}-chgdens-{self.ncalls}.png", dpi=600)
-            plt.close()
+                fig, ax = plt.subplots(figsize=(12, 8))
+                ax.plot(z, vcorr_z, label='VCorr', color='red')
+                ax.plot(z, vion_z, label='Vion', color='green')
+                ax.plot(z, vdiel_z, label='Vdiel', color='orange')
+                ax.plot(z, vcav_z, label='Vcav', color='blue')
+                ax.set_xlabel('Z (Angstrom)')
+                ax.set_ylabel('Hartree')
+                ax.legend()
+                fig.savefig(f"{self.plot_filestem}-vcorr-{self.ncalls}.png")
+                plt.close()
 
+                fig, ax = plt.subplots(figsize=(12, 8))
+                ax.plot(z, rhoion_z, label='Ion density')
+                ax.set_xlabel('Z (Angstrom)')
+                ax.set_ylabel('density (e/Bohr^3)')
+                ax.legend()
+                ax.set_title('xy-averaged densities along z')
+                fig.savefig(f"{self.plot_filestem}-rhoion-{self.ncalls}.png")
+                plt.close()
+
+                fig, ax = plt.subplots(figsize=(12, 8))
+                ax.plot(z, Sphi_z, label='S * phi')
+                ax.set_xlabel('Z (Angstrom)')
+                ax.set_ylabel('Hartree')
+                ax.legend()
+                ax.set_title('xy-averaged densities along z')
+                fig.savefig(f"{self.plot_filestem}-sphi-{self.ncalls}.png")
+                plt.close()
+
+                fig, ax = plt.subplots(figsize=(6, 4))
+                ax.plot(z, S_z, label='Cavity function', color='black')
+                ax2 = ax.twinx()
+                ax2.plot(z, Sprime_z, label='Cavity derivative', color='red')
+                ax.set_xlabel('Z (Angstrom)')
+                ax.set_ylabel('Cavity function')
+                ax2.set_ylabel('Cavity derivative')
+                ax.legend()
+                ax2.legend(loc='upper right')
+                fig.savefig(f"{self.plot_filestem}-cav-{self.ncalls}.png", dpi=600)
+                plt.close()
+
+                fig, ax = plt.subplots(figsize=(12, 8))
+                ax.plot(z, rho_z, label='Charge density')
+                ax.plot(z, pseudo_nucdensity_z, label='Pseudo nuclear charge density', color='red')
+                ax.set_xlabel('Z (Angstrom)')
+                ax.set_ylabel('density (e/Bohr^3)')
+                ax.legend()
+                ax.set_title('xy-averaged densities along z')
+                fig.savefig(f"{self.plot_filestem}-chgdens-{self.ncalls}.png", dpi=600)
+                plt.close()
+
+        t3 = log.timer("LPBE workup", *t2)
         return results
 
     def kernel(self, dm_kpts, tol=None):
