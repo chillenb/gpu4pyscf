@@ -178,17 +178,10 @@ class PeriodicLPBE(lib.StreamObject):
 
 
     def get_vpplocG(self):
-        vpplocG = multigrid_v1.eval_vpplocG(self.cell, self.mesh)
-        return vpplocG
-
-    def get_vpplocR(self):
-        vpplocG = self.get_vpplocG()
-        mesh = self.mesh
-        ngrids = np.prod(mesh)
-        weight = self.cell.vol / ngrids
-        vpplocR = ifft_in_place(vpplocG.reshape(-1, *self.mesh))
-        vpplocR /= weight
-        return vpplocR
+        if self.vpplocG is None:
+            vpplocG = multigrid_v1.eval_vpplocG(self.cell, self.mesh)
+            self.vpplocG = vpplocG
+        return self.vpplocG
 
     def get_pseudo_nucdensity(self):
         """
@@ -214,17 +207,17 @@ class PeriodicLPBE(lib.StreamObject):
         dms = _format_dms(dm_kpts, self.kpts)
         return multigrid_v2.evaluate_density_on_g_mesh(self.ni, dms, self.kpts)
 
-    def get_rhoR(self, dm_kpts):
+    def get_rhoG_rhoR(self, dm_kpts):
         dms = _format_dms(dm_kpts, self.kpts)
         nset = dms.shape[0]
-        density = self.get_rhoG(dm_kpts)
+        rhoG = self.get_rhoG(dm_kpts)
         mesh = self.mesh
-        density = density.reshape(-1, *mesh)
         ngrids = np.prod(mesh)
         weight = self.cell.vol / ngrids
-        density = ifft_in_place(density).real.reshape(-1, *self.mesh)
-        density /= weight
-        return density
+        rhoG = rhoG.reshape(-1) / weight
+        rhoR = pbc_tools.ifft(rhoG, mesh).real.reshape(-1, *self.mesh)
+        rhoG.reshape(-1, *self.mesh)
+        return rhoG, rhoR
 
     def potg_to_potmat(self, potG):
         weight = self.cell.vol / np.prod(self.mesh)
@@ -238,8 +231,6 @@ class PeriodicLPBE(lib.StreamObject):
             tol = self.tol
         tol = max(tol, self.tol)
 
-        if self.vpplocG is None:
-            self.vpplocG = self.get_vpplocG()
         mesh = self.ni.mesh
         ngrids = np.prod(mesh)
         cell = self.cell
@@ -247,7 +238,9 @@ class PeriodicLPBE(lib.StreamObject):
         kpts = self.kpts
         dms = _format_dms(dm_kpts, kpts)
 
-        rhoR = self.get_rhoR(dms)
+        weight = vol / ngrids
+
+        rhoG, rhoR = self.get_rhoG_rhoR(dms)
         pseudo_nucdensityR = self.get_pseudo_nucdensityR().real
 
         rhoR = rhoR.reshape(*mesh)
@@ -344,7 +337,19 @@ class PeriodicLPBE(lib.StreamObject):
         solute_chargeG = pbc_tools.fft(solute_chargeR.reshape(-1), mesh).reshape(-1)
         vac_coulomb_potentialG = -1.0 * self.coul_kernel * solute_chargeG
 
+        vac_coulomb_potentialG = vac_coulomb_potentialG.reshape(-1)
+        
+        # The next line ensures that the G=0 component of the vacuum Coulomb potential
+        # is consistent with vpplocG.
+        # vpplocG has a non-zero G=0 component.
 
+        vac_coulomb_potentialG[0] += self.vpplocG.reshape(-1)[0]/weight
+        if False:
+            my_vpp_plus_vj = self.potg_to_potmat(vac_coulomb_potentialG)
+            actual_vpploc = multigrid_v2.convert_xc_on_g_mesh_to_fock(self.ni, self.vpplocG, hermi=1, kpts=self.kpts)[0]
+            actual_vpp_plus_vj = actual_vpploc + self.ni.get_j(dm_kpts, kpts=self.kpts)
+            diff = cp.linalg.norm(my_vpp_plus_vj - actual_vpp_plus_vj)
+            log.info(f"Check: norm of difference between vpp+vj from LPBE and actual vpp+vj: {diff:.3e} Ha")
 
         vac_coulomb_potentialR = pbc_tools.ifft(vac_coulomb_potentialG.reshape(-1), mesh).reshape(*mesh)
 
@@ -383,7 +388,6 @@ class PeriodicLPBE(lib.StreamObject):
         del lapl_solvation_phiR
 
         # Vacuum alignment in z-direction. This is important when there is no electrolyte.
-        rhoG = pbc_tools.fft(rhoR.reshape(-1), mesh).reshape(-1)
         rhoG_smoothed = rhoG * cp.exp(-100.0 * (self.Gabs2) * 0.5)
         rhoR_smoothed = pbc_tools.ifft(rhoG_smoothed.reshape(-1), mesh).real.reshape(*mesh)
         rhoR_z = rhoR_smoothed.mean(axis=(0, 1))
