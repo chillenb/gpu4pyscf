@@ -188,7 +188,7 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
     if damp_factor is not None and 0 <= cycle < diis_start_cycle-1 and fock_last is not None:
         f = damping(f, fock_last, damp_factor)
     if diis is not None and cycle >= diis_start_cycle:
-        f = diis.update(s1e, dm, f)
+        f = diis.update(s1e, dm, f, mf, h1e, vhf, cycle=cycle, fock_last=fock_last)
 
     if level_shift_factor is None:
         level_shift_factor = mf.level_shift
@@ -266,6 +266,8 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         mf_diis = mf.DIIS(mf, mf.diis_file)
         mf_diis.space = mf.diis_space
         mf_diis.rollback = mf.diis_space_rollback
+        mf_diis.damp = mf.diis_damp
+        mf_diis.ndamp_cycles = mf.diis_damp_cycles
         # CDIIS just require a C that's orthonormal (C.T@S@C==I), and X satisfies that.
         if isinstance(x_orth, list): # k point
             mf_diis.Corth = stack_with_padding(x_orth)
@@ -291,7 +293,7 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, mf_diis, fock_last=fock_last)
         t1 = log.timer_debug1('DIIS', *t0)
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
-        if mf.damp is not None:
+        if mf.damp is not None or mf.diis_damp is not None:
             fock_last = fock
         fock = None
         t1 = log.timer_debug1('eig', *t1)
@@ -706,6 +708,7 @@ class SCF(pyscf_lib.StreamObject):
     diis                = hf_cpu.SCF.diis
     diis_space          = hf_cpu.SCF.diis_space
     diis_damp           = hf_cpu.SCF.diis_damp
+    diis_damp_cycles    = 0
     diis_start_cycle    = hf_cpu.SCF.diis_start_cycle
     diis_file           = hf_cpu.SCF.diis_file
     diis_space_rollback = hf_cpu.SCF.diis_space_rollback
