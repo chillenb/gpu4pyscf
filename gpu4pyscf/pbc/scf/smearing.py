@@ -15,6 +15,7 @@
 import numpy as np
 import cupy as cp
 from pyscf import lib
+from pyscf.data import nist
 from pyscf.pbc.lib.kpts import KPoints
 from gpu4pyscf.lib import logger
 from gpu4pyscf.scf import smearing as mol_smearing
@@ -138,10 +139,11 @@ class _SmearingKSCF(mol_smearing._SmearingSCF):
 
             if self.verbose >= logger.INFO:
                 fermi = mol_smearing._get_fermi(mo_es, nocc)
-                logger.debug(self, '    Fermi level %g  Sum mo_occ_kpts = %s  should equal nelec = %s',
-                             fermi, mo_occs.sum(), nelectron)
-                logger.info(self, '    sigma = %g  Optimized mu = %.12g  entropy = %.12g',
-                            sigma, mu, self.entropy)
+                logger.debug(self, '    Fermi level %g  (%g eV)', fermi, fermi * nist.HARTREE2EV)
+                logger.debug(self, '    Sum mo_occ_kpts = %s  should equal nelec = %s',
+                            mo_occs.sum(), nelectron)
+                logger.info(self, '    sigma = %g  Optimized mu = %.12g (%.12g eV)  entropy = %.12g',
+                            sigma, mu, mu * nist.HARTREE2EV, self.entropy)
 
             if is_uhf:
                 # mo_es_a and mo_es_b may have different dimensions for

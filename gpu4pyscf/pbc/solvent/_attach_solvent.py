@@ -17,6 +17,7 @@
 import cupy
 from pyscf import lib
 from pyscf.lib import logger
+from pyscf.data import nist
 
 from gpu4pyscf.lib.cupy_helper import tag_array
 from gpu4pyscf.pbc.scf import khf
@@ -106,5 +107,6 @@ class KSCFWithLPBE(_Solvation):
             e_solvent = e_solvent.get()[()]
         e_tot += e_solvent
         self.scf_summary['e_solvent'] = e_solvent
-        logger.info(self, 'Solvent Energy = %.15g', e_solvent)
+        logger.info(self, 'Solvation energy = %.15e', e_solvent)
+        logger.info(self, 'Solvation energy (eV) = %.15e', e_solvent * nist.HARTREE2EV)
         return e_tot, e2
