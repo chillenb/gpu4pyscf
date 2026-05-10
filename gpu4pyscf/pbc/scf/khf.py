@@ -64,7 +64,7 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
         f_kpts = cp.asarray([asarray(pbchf.damping(f, f_prev, damp_factor))
                             for f,f_prev in zip(f_kpts,fock_last)])
     if diis and cycle >= diis_start_cycle:
-        f_kpts = diis.update(s_kpts, dm_kpts, f_kpts, mf, h1e_kpts, vhf_kpts, f_prev=fock_last)
+        f_kpts = diis.update(s_kpts, dm_kpts, f_kpts, mf, h1e_kpts, vhf_kpts, cycle=cycle, f_prev=fock_last)
 
     if level_shift_factor is None:
         level_shift_factor = mf.level_shift

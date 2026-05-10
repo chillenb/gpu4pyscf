@@ -20,6 +20,7 @@
 DIIS
 """
 
+import numpy as np
 import cupy as cp
 import scipy.linalg
 import scipy.optimize
@@ -46,6 +47,8 @@ class CDIIS(lib.diis.DIIS):
         self.rollback = False
         self.Corth = None
         self.space = 8
+        self.damp = 0
+        self.ndamp_cycles = -1
 
     def update(self, s, d, f, *args, **kwargs):
         if d.dtype == cp.complex128:
@@ -57,6 +60,8 @@ class CDIIS(lib.diis.DIIS):
             if not self.incore:
                 logger.debug(self, 'Large system detected. DIIS intermediates '
                              'are saved in the host memory')
+        f_prev = kwargs.get('f_prev', None)
+        cycle = kwargs.get('cycle', 0)
         if self.Corth.ndim == 3:
             nao, nmo = self.Corth.shape[-2:]
         else:
@@ -64,7 +69,18 @@ class CDIIS(lib.diis.DIIS):
             nao, nmo = self.Corth.shape
         errvec = pack_tril(errvec.reshape(-1,nmo,nmo))
         f_tril = pack_tril(f.reshape(-1,nao,nao))
-        xnew = lib.diis.DIIS.update(self, f_tril, xerr=errvec)
+
+        if abs(self.damp) > 1e-6 and cycle == self.ndamp_cycles:
+            logger.debug(self, 'DIIS is being cleared after %d cycles', self.ndamp_cycles)
+            self.clear()
+
+        if abs(self.damp) < 1e-6 or f_prev is None or cycle >= self.ndamp_cycles:
+            logger.debug(self, 'DIIS damping factor %s, damping is inactive', self.damp)
+            xnew = lib.diis.DIIS.update(self, f_tril, xerr=errvec)
+        else:
+            logger.debug(self, 'DIIS damping factor %s, damping active', self.damp)
+            f_prev_tril = pack_tril(f_prev.reshape(-1,nao,nao))
+            xnew = lib.diis.DIIS.update(self, f_tril*(1-self.damp) + f_prev_tril*self.damp, xerr=errvec)
         if self.rollback > 0 and len(self._bookkeep) == self.space:
             self._bookkeep = self._bookkeep[-self.rollback:]
         return unpack_tril(xnew).reshape(f.shape)
@@ -127,3 +143,63 @@ class CDIIS(lib.diis.DIIS):
         return errvec.ravel()
 
 SCFDIIS = SCF_DIIS = DIIS = CDIIS
+
+class EDIIS(lib.diis.DIIS):
+    '''SCF-EDIIS
+    Ref: JCP 116, 8255 (2002); DOI:10.1063/1.1470195
+    '''
+    def update(self, s, d, f, mf, h1e, vhf, *args, **kwargs):
+        if self._head >= self.space:
+            self._head = 0
+        if not self._buffer:
+            shape = (self.space,) + f.shape
+            self._buffer['dm'  ] = cp.zeros(shape, dtype=f.dtype)
+            self._buffer['fock'] = cp.zeros(shape, dtype=f.dtype)
+            self._buffer['etot'] = cp.zeros(self.space)
+        self._buffer['dm'  ][self._head] = d
+        self._buffer['fock'][self._head] = f
+        self._buffer['etot'][self._head] = mf.energy_elec(d, h1e, vhf)[0]
+        self._head += 1
+
+        ds = self._buffer['dm'  ]
+        fs = self._buffer['fock']
+        es = self._buffer['etot']
+        etot, c = ediis_minimize(es.get(), ds.get(), fs.get())
+        c = cp.asarray(c)
+        logger.debug1(self, 'E %s  diis-c %s', etot, c)
+        fock = cp.einsum('i,i...pq->...pq', c, fs)
+        return fock
+
+def ediis_minimize(es, ds, fs):
+    nx = es.size
+    nao = ds.shape[-1]
+    ds = ds.reshape(nx,-1,nao,nao)
+    fs = fs.reshape(nx,-1,nao,nao)
+    df = np.einsum('inpq,jnqp->ij', ds, fs).real
+    diag = df.diagonal()
+    df = diag[:,None] + diag - df - df.T
+
+    def costf(x):
+        c = x**2 / (x**2).sum()
+        return np.einsum('i,i', c, es) - np.einsum('i,ij,j', c, df, c)
+
+    def grad(x):
+        x2sum = (x**2).sum()
+        c = x**2 / x2sum
+        fc = es - 2*np.einsum('i,ik->k', c, df)
+        cx = np.diag(x*x2sum) - np.einsum('k,n->kn', x**2, x)
+        cx *= 2/x2sum**2
+        return np.einsum('k,kn->n', fc, cx)
+
+    if False:
+        x0 = np.random.random(nx)
+        dfx0 = np.zeros_like(x0)
+        for i in range(nx):
+            x1 = x0.copy()
+            x1[i] += 1e-4
+            dfx0[i] = (costf(x1) - costf(x0))*1e4
+        print((dfx0 - grad(x0)) / dfx0)
+
+    res = scipy.optimize.minimize(costf, np.ones(nx), method='BFGS',
+                                  jac=grad, tol=1e-9)
+    return res.fun, (res.x**2)/(res.x**2).sum()
