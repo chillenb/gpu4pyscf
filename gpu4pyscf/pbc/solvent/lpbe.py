@@ -140,7 +140,7 @@ class PeriodicLPBE(lib.StreamObject):
         self.extra_screening_list = None
 
         self.is_built = False
-        self.tol = 1e-12
+        self.tol = 1e-8
         self.frozen = False
         self.debug_checks = kwargs.get('debug_checks', False)
 
@@ -280,10 +280,17 @@ class PeriodicLPBE(lib.StreamObject):
                 return -(div_eps_grad_phiG - debye_term_G).reshape(-1)
             return Aop
 
+        mean_S = cp.mean(S.reshape(-1))
+        mean_eps_r = (self.rel_permittivity - 1.) * mean_S
+        mean_ebkappa2 = mean_S * ebkappa2
+
         if ebkappa2 == 0:
             yukawa_kernel = self.coul_kernel # laplacian operator
         else:
-            yukawa_kernel = 4.0 * np.pi / (self.Gabs2 + ebkappa2/(self.rel_permittivity))
+            yukawa_kernel = 4.0 * np.pi / (mean_eps_r * self.Gabs2 + mean_ebkappa2)
+
+        sqrt_yukawa_kernel = cp.sqrt(yukawa_kernel)
+        one_over_epsr = 1.0 / eps_r_field.reshape(-1)
 
         def Mprecond(phiG):
             precond_phiG = yukawa_kernel * phiG
@@ -296,11 +303,18 @@ class PeriodicLPBE(lib.StreamObject):
         M = LinearOperator((ngrids, ngrids), matvec=Mprecond)
         rhs = pbc_tools.fft(4*np.pi*solute_chargeR.reshape(-1), mesh) * weight
 
+        niter = 0
+        def callback(x):
+            nonlocal niter
+            niter += 1
+
         # Div( eps_r * Grad(phi) ) - S phi / (debye_length^2) = -4*pi*solute_chargeR.
-        solution_phi_G, info = cg(A, rhs, M=M, x0=self.pot_guess, tol=self.tol, maxiter=400)
+        solution_phi_G, info = cg(A, rhs, M=M, x0=self.pot_guess, tol=self.tol, maxiter=400, callback=callback)
 
         if info != 0:
             logger.warn(self, f"Conjugate gradient did not converge: info={info}")
+
+        log.info(f"Number of CG iterations: {niter}")
 
         t1 = log.timer("LPBE CG solve", *t0)
 
