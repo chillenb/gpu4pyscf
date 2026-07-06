@@ -31,6 +31,7 @@ from gpu4pyscf.lib.cupy_helper import (
     block_diag, sandwich_dot, stack_with_padding)
 from gpu4pyscf.scf import diis, jk, j_engine
 from . import dispersion
+from gpu4pyscf.scf.gcscf import gcscf
 from gpu4pyscf.scf.smearing import smearing
 from gpu4pyscf.lib import logger
 from gpu4pyscf import __config__
@@ -877,6 +878,7 @@ class SCF(pyscf_lib.StreamObject):
     canonicalize             = NotImplemented
     dump_scf_summary         = hf_cpu.dump_scf_summary
 
+    gcscf = gcscf
     smearing = smearing
 
     def init_guess_by_minao(self, mol=None):
