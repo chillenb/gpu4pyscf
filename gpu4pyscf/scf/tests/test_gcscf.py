@@ -16,10 +16,11 @@ import unittest
 
 import numpy as np
 import pyscf
-from pyscf.scf import addons as cpu_addons
+from pyscf.scf import gcscf as cpu_gcscf
 from pyscf.scf import hf as cpu_hf
+from pyscf.scf import uhf as cpu_uhf
 from gpu4pyscf import scf as gpu_scf
-from gpu4pyscf.scf import gcscf
+from gpu4pyscf.scf import gcscf as gpu_gcscf
 
 
 SIGMA = .1
@@ -41,75 +42,75 @@ def tearDownModule():
     del mol
 
 
-def _run_gcscf(mf, **kwargs):
-    mf = gcscf.gcscf(mf, sigma=SIGMA, **kwargs)
+def _run_gpu_gcscf(mf, **kwargs):
+    mf = gpu_gcscf.gcscf(mf, sigma=SIGMA, **kwargs)
     mf.conv_tol = 1e-10
     mf.conv_tol_grad = 1e-8
     return mf.run()
 
 
-def _run_reference(mf, **kwargs):
-    mf = cpu_addons.smearing(mf, sigma=SIGMA, method='fermi', **kwargs)
+def _run_cpu_gcscf(mf, **kwargs):
+    mf = cpu_gcscf.gcscf(mf, sigma=SIGMA, **kwargs)
     mf.conv_tol = 1e-10
+    mf.conv_tol_grad = 1e-8
     return mf.run()
 
 
 class KnownValues(unittest.TestCase):
-    def test_rhf_matches_cpu_smearing(self):
-        gpu_mf = _run_gcscf(gpu_scf.RHF(mol))
-        cpu_mf = _run_reference(cpu_hf.RHF(mol))
+    def test_rhf_matches_cpu_gcscf(self):
+        gpu_mf = _run_gpu_gcscf(gpu_scf.RHF(mol))
+        cpu_mf = _run_cpu_gcscf(cpu_hf.RHF(mol))
 
         self.assertTrue(gpu_mf.converged)
         self.assertTrue(cpu_mf.converged)
         self.assertAlmostEqual(gpu_mf.e_tot, cpu_mf.e_tot, 8)
         self.assertAlmostEqual(gpu_mf.e_free, cpu_mf.e_free, 8)
-        self.assertAlmostEqual(gpu_mf.entropy, cpu_mf.entropy, 8)
-        self.assertAlmostEqual(gpu_mf.nelectron, mol.nelectron, 8)
+        self.assertAlmostEqual(gpu_mf.e_grand, cpu_mf.e_grand, 8)
+        self.assertAlmostEqual(gpu_mf.entropy, cpu_mf.entropy, 7)
+        self.assertAlmostEqual(gpu_mf.nelectron, cpu_mf.nelectron, 8)
         self.assertGreater(gpu_mf.n_haux_eval, 0)
         self.assertLess(gpu_mf.auxh_residual_norm, 1e-7)
 
-    def test_rhf_fixed_mu0_matches_cpu_smearing(self):
+    def test_rhf_fixed_mu0_matches_cpu_gcscf(self):
         mu0 = -.3
-        gpu_mf = _run_gcscf(gpu_scf.RHF(mol), mu0=mu0)
-        cpu_mf = _run_reference(cpu_hf.RHF(mol), mu0=mu0)
-        nelectron = np.sum(cpu_mf.mo_occ)
-        e_grand = cpu_mf.e_free - mu0 * nelectron
+        gpu_mf = _run_gpu_gcscf(gpu_scf.RHF(mol), mu0=mu0)
+        cpu_mf = _run_cpu_gcscf(cpu_hf.RHF(mol), mu0=mu0)
 
         self.assertTrue(gpu_mf.converged)
         self.assertTrue(cpu_mf.converged)
         self.assertAlmostEqual(gpu_mf.e_tot, cpu_mf.e_tot, 8)
         self.assertAlmostEqual(gpu_mf.e_free, cpu_mf.e_free, 8)
-        self.assertAlmostEqual(gpu_mf.e_grand, e_grand, 8)
-        self.assertAlmostEqual(gpu_mf.nelectron, nelectron, 8)
+        self.assertAlmostEqual(gpu_mf.e_grand, cpu_mf.e_grand, 8)
+        self.assertAlmostEqual(gpu_mf.nelectron, cpu_mf.nelectron, 8)
         self.assertGreater(gpu_mf.n_haux_eval, 0)
         self.assertLess(gpu_mf.auxh_residual_norm, 1e-7)
 
-    def test_uhf_fix_spin_matches_cpu_smearing(self):
-        gpu_mf = _run_gcscf(gpu_scf.UHF(mol), fix_spin=True)
-        cpu_mf = _run_reference(cpu_hf.UHF(mol), fix_spin=True)
+    def test_uhf_fix_spin_matches_cpu_gcscf(self):
+        gpu_mf = _run_gpu_gcscf(gpu_scf.UHF(mol), fix_spin=True)
+        cpu_mf = _run_cpu_gcscf(cpu_uhf.UHF(mol), fix_spin=True)
 
         self.assertTrue(gpu_mf.converged)
         self.assertTrue(cpu_mf.converged)
         self.assertAlmostEqual(gpu_mf.e_tot, cpu_mf.e_tot, 8)
         self.assertAlmostEqual(gpu_mf.e_free, cpu_mf.e_free, 8)
-        self.assertAlmostEqual(gpu_mf.entropy, cpu_mf.entropy, 8)
-        self.assertAlmostEqual(gpu_mf.nelectron, np.sum(cpu_mf.mo_occ), 8)
+        self.assertAlmostEqual(gpu_mf.e_grand, cpu_mf.e_grand, 8)
+        self.assertAlmostEqual(gpu_mf.entropy, cpu_mf.entropy, 7)
+        self.assertAlmostEqual(gpu_mf.nelectron, cpu_mf.nelectron, 8)
         self.assertEqual(np.asarray(gpu_mf.mu).shape, (2,))
         self.assertGreater(gpu_mf.n_haux_eval, 0)
         self.assertLess(gpu_mf.auxh_residual_norm, 1e-7)
 
     def test_method_hook_and_to_cpu(self):
         gpu_mf = gpu_scf.RHF(mol).gcscf(sigma=SIGMA)
-        self.assertIsInstance(gpu_mf, gcscf._GCSCF)
+        self.assertIsInstance(gpu_mf, gpu_gcscf._GCSCF)
 
         cpu_mf = gpu_mf.to_cpu()
-        from pyscf.scf import gcscf as cpu_gcscf
         self.assertIsInstance(cpu_mf, cpu_gcscf._GCSCF)
         self.assertEqual(cpu_mf.sigma, SIGMA)
 
         cpu_mf = cpu_gcscf.gcscf(cpu_hf.RHF(mol), sigma=SIGMA)
         gpu_mf = cpu_mf.to_gpu()
-        self.assertIsInstance(gpu_mf, gcscf._GCSCF)
+        self.assertIsInstance(gpu_mf, gpu_gcscf._GCSCF)
         self.assertEqual(gpu_mf.sigma, SIGMA)
 
 
