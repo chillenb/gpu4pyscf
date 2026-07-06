@@ -23,7 +23,7 @@ from gpu4pyscf import scf as gpu_scf
 from gpu4pyscf.scf import gcscf as gpu_gcscf
 
 
-SIGMA = .1
+SIGMA = .05
 
 
 def setUpModule():
@@ -45,14 +45,14 @@ def tearDownModule():
 def _run_gpu_gcscf(mf, **kwargs):
     mf = gpu_gcscf.gcscf(mf, sigma=SIGMA, **kwargs)
     mf.conv_tol = 1e-10
-    mf.conv_tol_grad = 1e-8
+    mf.conv_tol_grad = 1e-10
     return mf.run()
 
 
 def _run_cpu_gcscf(mf, **kwargs):
     mf = cpu_gcscf.gcscf(mf, sigma=SIGMA, **kwargs)
     mf.conv_tol = 1e-10
-    mf.conv_tol_grad = 1e-8
+    mf.conv_tol_grad = 1e-10
     return mf.run()
 
 
