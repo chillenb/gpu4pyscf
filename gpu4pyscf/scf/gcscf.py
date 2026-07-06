@@ -782,15 +782,11 @@ def _smearing_matrix_gradient(eta, mo_occ, sigma, grad_filling,
     occ_prime = _fermi_occupation_derivative(mo_occ, sigma, spin_degeneracy)
     energy_diff = eta[:,None] - eta[None,:]
     occ_diff = mo_occ[:,None] - mo_occ[None,:]
-
-    with cupy.errstate(divide='ignore', invalid='ignore'):
-        factors = cupy.divide(
-            occ_diff, energy_diff,
-            out=cupy.zeros_like(grad_filling, dtype=float),
-            where=cupy.abs(energy_diff) > 1e-12)
+    factors = occ_diff / energy_diff
 
     near_degenerate = cupy.isclose(energy_diff, 0.0, atol=1e-12, rtol=1e-12)
     derivative_average = .5 * (occ_prime[:, None] + occ_prime[None, :])
+    factors = cupy.where(cupy.abs(energy_diff) > 1e-12, factors, 0.0)
     factors[near_degenerate] = derivative_average[near_degenerate]
 
     return _hermitian_part(_hermitian_part(grad_filling) * factors)
