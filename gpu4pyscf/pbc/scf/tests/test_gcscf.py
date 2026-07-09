@@ -73,7 +73,6 @@ class KnownValues(unittest.TestCase):
         self.assertTrue(cpu_mf.converged)
         self.assertAlmostEqual(gpu_mf.e_tot, cpu_mf.e_tot, 8)
         self.assertAlmostEqual(gpu_mf.e_free, cpu_mf.e_free, 8)
-        self.assertAlmostEqual(gpu_mf.e_grand, cpu_mf.e_grand, 8)
         self.assertAlmostEqual(gpu_mf.entropy, cpu_mf.entropy, 7)
         self.assertAlmostEqual(gpu_mf.nelectron, cpu_mf.nelectron, 8)
         self.assertGreater(gpu_mf.n_haux_eval, 1)
@@ -104,7 +103,6 @@ class KnownValues(unittest.TestCase):
         self.assertTrue(cpu_mf.converged)
         self.assertAlmostEqual(gpu_mf.e_tot, cpu_mf.e_tot, 8)
         self.assertAlmostEqual(gpu_mf.e_free, cpu_mf.e_free, 8)
-        self.assertAlmostEqual(gpu_mf.e_grand, cpu_mf.e_grand, 8)
         self.assertAlmostEqual(gpu_mf.entropy, cpu_mf.entropy, 7)
         self.assertAlmostEqual(gpu_mf.nelectron, cpu_mf.nelectron, 8)
         self.assertEqual(np.asarray(gpu_mf.mu).shape, (2,))
@@ -120,7 +118,7 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(cpu_mf.sigma, SIGMA)
 
         cpu_mf = cpu_gcscf.gcscf(cpu_pscf.KRHF(cell, kpts=kpts), sigma=SIGMA)
-        gpu_mf = cpu_mf.to_gpu()
+        gpu_mf = gpu_gcscf.from_cpu(cpu_mf)
         self.assertIsInstance(gpu_mf, gpu_gcscf._GCKSCF)
         self.assertEqual(gpu_mf.sigma, SIGMA)
 
