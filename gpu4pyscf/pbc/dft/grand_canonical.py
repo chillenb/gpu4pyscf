@@ -45,6 +45,7 @@ class GrandCanonicalConfig:
     cg_restart_interval: int = 20
     cg_beta_max: float = 5.0
     descent_tolerance: float = 1.0e-12
+    preconditioned_descent_cosine_min: float = 0.05
     exact_gradient_polish_residual_rms: float = 1.0e-4
 
     # Optional branch selector for low-temperature calculations.  This shifts
@@ -736,9 +737,36 @@ class GrandCanonicalKRKS:
             return False
         return self.inner(state.gradient, direction) < -self.config.descent_tolerance * gnorm * dnorm
 
+    def _descent_cosine(self, state: _GCState, direction: Sequence) -> float:
+        gnorm, dnorm = self.norm(state.gradient), self.norm(direction)
+        if gnorm == 0.0 or dnorm == 0.0:
+            return 0.0
+        return -self.inner(state.gradient, direction) / (gnorm * dnorm)
+
+    def _blend_poorly_aligned_direction(self, state: _GCState,
+                                        direction: Sequence) -> tuple[list, bool]:
+        """Add frontier sensitivity without discarding the Fock residual."""
+        if (self._descent_cosine(state, direction) >=
+                self.config.preconditioned_descent_cosine_min):
+            return self.copy_blocks(direction), False
+        gradient = self.scale_blocks(-1.0, state.gradient)
+        gnorm, dnorm = self.norm(gradient), self.norm(direction)
+        if gnorm == 0.0 or dnorm == 0.0:
+            return self.copy_blocks(direction), False
+        blended = self.axpy(dnorm / gnorm, gradient, direction)
+        blended = self.hermitize_blocks(blended)
+        blended, _ = self.project_time_reversal(blended)
+        if self._is_descent(state, blended):
+            return blended, True
+        return self.copy_blocks(direction), False
+
     def _restart_direction(self, state: _GCState) -> tuple[list, str]:
         residual = self.copy_blocks(state.residual)
         if self._is_descent(state, residual):
+            residual, blended = self._blend_poorly_aligned_direction(
+                state, residual)
+            if blended:
+                return residual, 'restarted with blended residual/exact gradient'
             return residual, 'restarted with preconditioned residual'
         gradient = self.scale_blocks(-1.0, state.gradient)
         if self._is_descent(state, gradient):
@@ -756,6 +784,10 @@ class GrandCanonicalKRKS:
             if self._is_descent(state, gradient):
                 return gradient, True, 'exact-gradient final polishing'
         if self._is_descent(state, direction):
+            direction, blended = self._blend_poorly_aligned_direction(
+                state, direction)
+            if blended:
+                return direction, True, 'blended poorly aligned direction with exact gradient'
             return direction, False, ''
         direction, reason = self._restart_direction(state)
         if self._is_descent(state, direction):
