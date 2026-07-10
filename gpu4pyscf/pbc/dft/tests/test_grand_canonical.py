@@ -374,6 +374,30 @@ def test_real_multik_krks_evaluator_and_finalisation():
     assert abs(mf.grand_potential - result.grand_potential) < 1.0e-12
 
 
+def test_real_multik_fixed_electron_number_minimisation():
+    cell = _small_periodic_cell()
+    mf = cell.KRKS(kpts=cell.make_kpts([3, 1, 1])).to_gpu()
+    mf.xc = 'LDA,VWN'
+    config = GrandCanonicalConfig(
+        max_cycle=25, required_consecutive_conv=1, conv_tol_omega=1.0e-7,
+        conv_tol_grad_rms=1.0e-6, conv_tol_residual_rms=1.0e-5,
+        conv_tol_density_rms=1.0e-7, conv_tol_nelec=1.0e-7,
+        line_search_max_evals=10, line_search_zoom_evals=10,
+    )
+    solver = GrandCanonicalKRKS(
+        mf, sigma=0.08, config=config, electron_number=2.0)
+    result = solver.kernel()
+    assert result.converged, result.message
+    assert result.fixed_electron_number
+    assert abs(result.electron_number - 2.0) < config.mu_electron_number_tol
+    assert np.isfinite(result.mu)
+    assert all(b.free_energy <= a.free_energy + 1.0e-10
+               for a, b in zip(result.history, result.history[1:]))
+    reconstructed = mf.make_rdm1(mf.mo_coeff, mf.mo_occ)
+    assert float(cp.max(cp.abs(reconstructed - result.dm_ao)).item()) < 1.0e-9
+    assert abs(mf.free_energy - result.free_energy) < 1.0e-12
+
+
 def test_real_gga_evaluator_is_supported():
     cell = _small_periodic_cell()
     mf = cell.KRKS(kpts=cell.make_kpts([1, 1, 1])).to_gpu()
