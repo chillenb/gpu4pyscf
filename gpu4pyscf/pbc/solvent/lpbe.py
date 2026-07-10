@@ -406,7 +406,7 @@ class PeriodicLPBE(lib.StreamObject):
         grad_abs_r = cp.sqrt(cp.einsum('i...,i...->...', grad_rho_r, grad_rho_r))
         grad_abs_safe_r = cp.maximum(grad_abs_r, self.eps)
 
-        vcav_r = self.cav_tension * Sprime * (
+        vcav_r = -self.cav_tension * Sprime * (
             lap_rho_r / grad_abs_safe_r
             - grad_hess_grad_r / (grad_abs_safe_r ** 3)
         )
