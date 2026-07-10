@@ -342,7 +342,10 @@ class GrandCanonicalKRKS:
             return  # lightweight fixed-Fock test evaluators
         if libxc.is_hybrid_xc(xc):
             raise NotImplementedError('hybrid and range-separated functionals are not supported')
-        xctype = libxc.xc_type(xc).upper()
+        # gpu4pyscf.dft.libxc intentionally exposes only the GPU entry points;
+        # the functional-family classifier remains in the PySCF libxc module.
+        from pyscf.dft import libxc as pyscf_libxc
+        xctype = pyscf_libxc.xc_type(xc).upper()
         if xctype not in ('LDA', 'GGA'):
             raise NotImplementedError(f'{xctype} functionals are not supported')
 
