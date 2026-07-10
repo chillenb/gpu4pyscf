@@ -45,6 +45,7 @@ class GrandCanonicalConfig:
     cg_restart_interval: int = 20
     cg_beta_max: float = 5.0
     descent_tolerance: float = 1.0e-12
+    exact_gradient_polish_residual_rms: float = 1.0e-4
 
     # Optional branch selector for low-temperature calculations.  This shifts
     # only the initial auxiliary Hamiltonian by a scalar; mu and every
@@ -750,6 +751,10 @@ class GrandCanonicalKRKS:
         if projected_change > self.config.hermiticity_tol * max(1.0, self.norm(direction)):
             direction, reason = self._restart_direction(state)
             return direction, True, 'time-reversal projection changed CG direction; ' + reason
+        if state.residual_rms <= self.config.exact_gradient_polish_residual_rms:
+            gradient = self.scale_blocks(-1.0, state.gradient)
+            if self._is_descent(state, gradient):
+                return gradient, True, 'exact-gradient final polishing'
         if self._is_descent(state, direction):
             return direction, False, ''
         direction, reason = self._restart_direction(state)
