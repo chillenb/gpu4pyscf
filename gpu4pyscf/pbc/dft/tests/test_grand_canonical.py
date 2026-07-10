@@ -1,5 +1,6 @@
 import cupy as cp
 import numpy as np
+import pytest
 from pyscf.pbc import gto
 
 from gpu4pyscf.lib.cupy_helper import tag_array
@@ -82,7 +83,8 @@ class _TaggedSolventKRKS(_FixedFockKRKS):
         return energy, 0.0
 
 
-def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None):
+def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
+            cg_update='fletcher-reeves', cg_beta_max=5.0):
     f0 = cp.asarray([[[-0.7, 0.12j], [-0.12j, 0.3]]], dtype=cp.complex128)
     mf = _FixedFockKRKS(f0)
     config = GrandCanonicalConfig(
@@ -92,6 +94,8 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None):
         conv_tol_nelec=1.0e-9, check_time_reversal=False,
         checkpoint_path=checkpoint_path,
         initial_electron_number=initial_electron_number,
+        cg_update=cg_update,
+        cg_beta_max=cg_beta_max,
     )
     return mf, GrandCanonicalKRKS(mf, mu=mu, sigma=0.15, config=config)
 
@@ -162,6 +166,47 @@ def test_fixed_fock_direct_minimisation_and_final_density():
                for a, b in zip(solver.history, solver.history[1:]))
     reconstructed = (mf.mo_coeff * mf.mo_occ[:, None, :]) @ mf.mo_coeff.conj().transpose(0, 2, 1)
     assert float(cp.max(cp.abs(reconstructed - result.dm_ao)).item()) < 1.0e-10
+
+
+def test_cg_update_formulas_aliases_and_validation():
+    aliases = {
+        'FR': 'fletcher-reeves',
+        'polak_ribiere': 'polak-ribiere',
+        'Hestenes Stiefel': 'hestenes-stiefel',
+    }
+    h = [cp.asarray([[-0.3, 0.08 + 0.03j], [0.08 - 0.03j, 0.2]])]
+    for alias, canonical in aliases.items():
+        _, solver = _solver(cg_update=alias, cg_beta_max=1.0e6)
+        assert solver.config.cg_update == canonical
+        old = solver.evaluate(h)
+        old_direction = solver.copy_blocks(old.residual)
+        new = solver.evaluate(solver.axpy(0.1, old_direction, h))
+        beta, reason = solver._cg_beta(old, new, old_direction)
+        assert reason == ''
+
+        if canonical == 'fletcher-reeves':
+            numerator = solver.inner(new.gradient, new.z)
+            denominator = solver.inner(old.gradient, old.z)
+        else:
+            delta_z = solver.axpy(-1.0, old.z, new.z)
+            numerator = solver.inner(new.gradient, delta_z)
+            if canonical == 'polak-ribiere':
+                denominator = solver.inner(old.gradient, old.z)
+            else:
+                delta_gradient = solver.axpy(-1.0, old.gradient, new.gradient)
+                denominator = solver.inner(old_direction, delta_gradient)
+        assert abs(beta - numerator / denominator) < 1.0e-13
+
+    with pytest.raises(ValueError, match='unsupported cg_update'):
+        _solver(cg_update='not-a-cg-update')
+
+
+def test_all_cg_updates_converge_fixed_fock_problem():
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j], [0.19 + 0.11j, 0.6]])]
+    for update in ('fletcher-reeves', 'polak-ribiere', 'hestenes-stiefel'):
+        _, solver = _solver(cg_update=update)
+        result = solver.kernel(h0=h0)
+        assert result.converged, f'{update}: {result.message}'
 
 
 def test_initial_auxiliary_electron_number_selects_requested_basin():

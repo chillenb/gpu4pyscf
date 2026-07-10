@@ -42,6 +42,7 @@ class GrandCanonicalConfig:
     conv_tol_nelec: float = 1.0e-7
     required_consecutive_conv: int = 2
 
+    cg_update: str = 'fletcher-reeves'
     cg_restart_interval: int = 20
     cg_beta_max: float = 5.0
     descent_tolerance: float = 1.0e-12
@@ -273,6 +274,7 @@ class GrandCanonicalKRKS:
             raise ValueError('sigma must be positive')
         self.beta = 1.0 / self.sigma
         self.config = config or GrandCanonicalConfig()
+        self.config.cg_update = self._canonical_cg_update(self.config.cg_update)
         self.verbose = (getattr(mf, 'verbose', logger.NOTE)
                         if self.config.verbose is None else self.config.verbose)
         self.log = logger.new_logger(mf, self.verbose)
@@ -293,6 +295,27 @@ class GrandCanonicalKRKS:
             self.config.initial_electron_number = target
 
     # ---- fixed basis data and validation ---------------------------------
+
+    @staticmethod
+    def _canonical_cg_update(value: str) -> str:
+        if not isinstance(value, str):
+            raise TypeError('cg_update must be a string')
+        key = value.strip().lower().replace('_', '-').replace(' ', '-')
+        aliases = {
+            'fr': 'fletcher-reeves',
+            'fletcher-reeves': 'fletcher-reeves',
+            'pr': 'polak-ribiere',
+            'polak-ribiere': 'polak-ribiere',
+            'hs': 'hestenes-stiefel',
+            'hestenes-stiefel': 'hestenes-stiefel',
+        }
+        try:
+            return aliases[key]
+        except KeyError as error:
+            choices = ', '.join(('fletcher-reeves', 'polak-ribiere',
+                                 'hestenes-stiefel'))
+            raise ValueError(
+                f'unsupported cg_update {value!r}; choose one of {choices}') from error
 
     def _prepare_fixed_basis_data(self) -> None:
         required = ('cell', 'kpts', 'get_ovlp', 'get_hcore', 'get_veff',
@@ -794,6 +817,38 @@ class GrandCanonicalKRKS:
             return direction, True, reason
         return direction, True, 'restart direction is not downhill'
 
+    def _cg_beta(self, old: _GCState, new: _GCState,
+                 old_direction: Sequence) -> tuple[float, str]:
+        """Return the selected preconditioned nonlinear-CG update.
+
+        ``z`` is the positive-preconditioned-gradient representation and the
+        search direction is formed as ``-z_new + beta * old_direction``.
+        """
+        update = self.config.cg_update
+        old_gz = self.inner(old.gradient, old.z)
+        if update == 'fletcher-reeves':
+            numerator = self.inner(new.gradient, new.z)
+            denominator = old_gz
+        else:
+            delta_z = self.axpy(-1.0, old.z, new.z)
+            numerator = self.inner(new.gradient, delta_z)
+            if update == 'polak-ribiere':
+                denominator = old_gz
+            else:  # hestenes-stiefel
+                delta_gradient = self.axpy(-1.0, old.gradient, new.gradient)
+                denominator = self.inner(old_direction, delta_gradient)
+
+        label = update.replace('-', ' ').title()
+        finite = np.isfinite(numerator) and np.isfinite(denominator)
+        valid_denominator = (abs(denominator) > 1.0e-30 if update == 'hestenes-stiefel'
+                             else denominator > 1.0e-30)
+        if not finite or not valid_denominator:
+            return 0.0, f'ill-conditioned {label} denominator'
+        candidate = numerator / denominator
+        if not np.isfinite(candidate) or abs(candidate) > self.config.cg_beta_max:
+            return 0.0, f'invalid {label} beta'
+        return candidate, ''
+
     def _alpha_cap(self, direction: Sequence) -> float:
         block_rms = self.max_block_rms(direction)
         if block_rms == 0.0:
@@ -1012,20 +1067,12 @@ class GrandCanonicalKRKS:
                 break
             new_state = line_search.state
             self._verify_accepted_step(state, new_state, direction, line_search.alpha, dphi0)
-            denominator = self.inner(state.gradient, state.z)
-            numerator = self.inner(new_state.gradient, new_state.z)
             beta = 0.0
             if force_restart or restarted or line_search.force_restart:
                 restart_reason = restart_reason or line_search.message
             elif cycle > 0 and cycle % self.config.cg_restart_interval != 0:
-                if denominator > 1.0e-30 and np.isfinite(denominator) and np.isfinite(numerator):
-                    candidate = numerator / denominator
-                    if 0.0 <= candidate <= self.config.cg_beta_max:
-                        beta = candidate
-                    else:
-                        restart_reason = 'invalid Fletcher-Reeves beta'
-                else:
-                    restart_reason = 'ill-conditioned Fletcher-Reeves denominator'
+                beta, beta_reason = self._cg_beta(state, new_state, direction)
+                restart_reason = restart_reason or beta_reason
             else:
                 restart_reason = restart_reason or 'scheduled CG restart'
             self._record(cycle, state, new_state, line_search, dphi0, beta, restart_reason)
