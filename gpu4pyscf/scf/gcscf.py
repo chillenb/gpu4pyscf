@@ -23,7 +23,7 @@ from gpu4pyscf.lib import logger
 
 GCSCF_SIGMA = getattr(__config__, 'scf_gcscf_sigma', None)
 GCSCF_STEP = getattr(__config__, 'scf_gcscf_step', 1.0)
-GCSCF_MIN_STEP = getattr(__config__, 'scf_gcscf_min_step', 1e-4)
+GCSCF_MIN_STEP = getattr(__config__, 'scf_gcscf_min_step', 1e-8)
 GCSCF_LINE_MAX_CYCLE = getattr(__config__, 'scf_gcscf_line_max_cycle', 6)
 
 
