@@ -420,6 +420,18 @@ class PeriodicLPBE(lib.StreamObject):
     
         t5 = log.init_timer()
         vcorr_mat = multigrid_v2.convert_xc_on_g_mesh_to_fock(self.ni, vcorr_g, hermi=1, kpts=self.kpts)
+        if getattr(self, 'debug_components', False):
+            component_g = {
+                'electrostatic': solvation_potentialG,
+                'ionic': pbc_tools.fft(vion_r.reshape(-1), mesh).reshape(-1) * weight,
+                'dielectric': pbc_tools.fft(vdiel_r.reshape(-1), mesh).reshape(-1) * weight,
+                'cavitation': pbc_tools.fft(vcav_r.reshape(-1), mesh).reshape(-1) * weight,
+            }
+            self.debug_v_components = {
+                key: multigrid_v2.convert_xc_on_g_mesh_to_fock(
+                    self.ni, value, hermi=1, kpts=self.kpts)
+                for key, value in component_g.items()
+            }
         log.timer("convert_xc_on_g_mesh_to_fock", *t5)
 
 
