@@ -84,7 +84,8 @@ class _TaggedSolventKRKS(_FixedFockKRKS):
 
 
 def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
-            cg_update='fletcher-reeves', cg_beta_max=5.0):
+            cg_update='fletcher-reeves', cg_beta_max=5.0,
+            electron_number=None):
     f0 = cp.asarray([[[-0.7, 0.12j], [-0.12j, 0.3]]], dtype=cp.complex128)
     mf = _FixedFockKRKS(f0)
     config = GrandCanonicalConfig(
@@ -97,7 +98,9 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
         cg_update=cg_update,
         cg_beta_max=cg_beta_max,
     )
-    return mf, GrandCanonicalKRKS(mf, mu=mu, sigma=0.15, config=config)
+    return mf, GrandCanonicalKRKS(
+        mf, mu=mu, sigma=0.15, config=config,
+        electron_number=electron_number)
 
 
 def test_stable_fermi_scalars_and_divided_difference():
@@ -134,6 +137,64 @@ def test_fixed_fock_gradient_and_evaluator_pairing():
     assert abs(finite_difference - analytic) < 2.0e-6
     assert solver.inner(state.gradient, state.residual) <= 1.0e-12
     assert mf.energy_veff_seen is mf.veff_seen
+
+
+def test_fixed_electron_number_gradient_and_mu_constraint():
+    target = 1.3
+    _, solver = _solver(electron_number=target)
+    h = [cp.asarray([[-0.3, 0.08 + 0.03j], [0.08 - 0.03j, 0.2]])]
+    direction = [cp.asarray([[0.15, 0.04j], [-0.04j, -0.07]])]
+    state = solver.evaluate(h)
+    epsilon = 1.0e-5
+    plus = solver.evaluate(solver.axpy(epsilon, direction, h))
+    minus = solver.evaluate(solver.axpy(-epsilon, direction, h))
+    finite_difference = (plus.free_energy - minus.free_energy) / (2.0 * epsilon)
+    analytic = solver.inner(state.gradient, direction)
+    assert abs(finite_difference - analytic) < 2.0e-6
+    assert abs(state.electron_number - target) < solver.config.mu_electron_number_tol
+    assert abs(plus.electron_number - target) < solver.config.mu_electron_number_tol
+    assert abs(minus.electron_number - target) < solver.config.mu_electron_number_tol
+    assert abs(solver.inner(state.gradient, solver.identity)) < 1.0e-12
+
+
+def test_fixed_electron_number_minimisation_and_physical_mu():
+    target = 1.25
+    f0 = cp.asarray([[[-0.7, 0.12j], [-0.12j, 0.3]]], dtype=cp.complex128)
+    mf = _FixedFockKRKS(f0)
+    config = GrandCanonicalConfig(
+        max_cycle=50, required_consecutive_conv=1,
+        conv_tol_omega=1.0e-10, conv_tol_grad_rms=1.0e-8,
+        conv_tol_residual_rms=1.0e-7, conv_tol_density_rms=1.0e-9,
+        conv_tol_nelec=1.0e-9, check_time_reversal=False,
+    )
+    solver = GrandCanonicalKRKS(
+        mf, sigma=0.15, config=config, electron_number=target)
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j], [0.19 + 0.11j, 0.6]])]
+    result = solver.kernel(h0=h0)
+    assert result.converged, result.message
+    assert result.fixed_electron_number
+    assert result.target_electron_number == target
+    assert abs(result.electron_number - target) < config.mu_electron_number_tol
+    assert abs(result.free_energy -
+               (result.dft_total_energy + result.entropy_energy)) < 1.0e-13
+    expected_mu = solver._solve_chemical_potential(
+        [cp.linalg.eigvalsh(f0[0])])
+    assert abs(result.mu - expected_mu) < 1.0e-7
+    assert all(b.objective <= a.objective + 1.0e-11
+               for a, b in zip(result.history, result.history[1:]))
+    reconstructed = (mf.mo_coeff * mf.mo_occ[:, None, :]) @ mf.mo_coeff.conj().transpose(0, 2, 1)
+    assert float(cp.max(cp.abs(reconstructed - result.dm_ao)).item()) < 1.0e-10
+
+
+def test_fixed_electron_number_mu_increases_with_target():
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j], [0.19 + 0.11j, 0.6]])]
+    _, low_solver = _solver(electron_number=0.8)
+    _, high_solver = _solver(electron_number=1.4)
+    low = low_solver.kernel(h0=h0)
+    high = high_solver.kernel(h0=h0)
+    assert low.converged, low.message
+    assert high.converged, high.message
+    assert high.mu > low.mu
 
 
 def test_tagged_solvent_potential_is_included_in_fock_and_gradient():
