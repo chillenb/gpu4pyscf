@@ -8,7 +8,8 @@ authoritative evaluator of the DFT functional.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -331,6 +332,23 @@ class GrandCanonicalKRKS:
         self.ndof = sum(float(self.weights[k].item()) * n * n
                          for k, n in enumerate(self.north))
         self._tr_pairs, self._time_reversal_enabled = self._initialise_time_reversal()
+        self._checkpoint_fingerprint = self._mean_field_fingerprint()
+
+    def _mean_field_fingerprint(self) -> str:
+        """A conservative restart guard for cell, basis, and DFT configuration."""
+        cell = self.mf.cell
+        try:
+            cell_data = cell.dumps()
+        except (AttributeError, TypeError):
+            cell_data = repr((type(cell).__module__, type(cell).__qualname__,
+                              getattr(cell, 'atom', None), getattr(cell, 'basis', None),
+                              getattr(cell, 'pseudo', None), getattr(cell, 'a', None),
+                              getattr(cell, 'unit', None)))
+        configuration = repr((type(self.mf).__module__, type(self.mf).__qualname__,
+                              cell_data, getattr(self.mf, 'xc', None),
+                              getattr(self.mf, 'exxdiv', None), self.kpts.tolist(),
+                              tuple(self.north)))
+        return hashlib.sha256(configuration.encode()).hexdigest()
 
     def _validate_functional(self) -> None:
         if getattr(self.mf, 'do_nlc', lambda: False)():
@@ -582,10 +600,14 @@ class GrandCanonicalKRKS:
         with np.load(path, allow_pickle=False) as checkpoint:
             kpts = checkpoint['kpts']
             ranks = checkpoint['ranks']
+            if 'fingerprint' not in checkpoint:
+                raise ValueError('checkpoint lacks the required mean-field fingerprint')
             if kpts.shape != self.kpts.shape or not np.allclose(kpts, self.kpts):
                 raise ValueError('checkpoint k-point mesh does not match this calculation')
             if tuple(ranks.tolist()) != tuple(self.north):
                 raise ValueError('checkpoint overlap ranks do not match this calculation')
+            if str(checkpoint['fingerprint'].item()) != self._checkpoint_fingerprint:
+                raise ValueError('checkpoint cell, basis, or mean-field configuration does not match')
             return [cp.asarray(checkpoint[f'h_{k}']) for k in range(self.nkpts)]
 
     def _initial_h(self, dm0: Any = None, h0: Any = None) -> list:
@@ -609,6 +631,7 @@ class GrandCanonicalKRKS:
             'mu': self.mu, 'sigma': self.sigma, 'kpts': self.kpts,
             'weights': cp.asnumpy(self.weights), 'ranks': np.asarray(self.north),
             'x_dims': np.asarray([x.shape for x in self.x_ao2orth]),
+            'fingerprint': self._checkpoint_fingerprint,
             'grand_potential': state.grand_potential,
             'electron_number': state.electron_number, 'cycle': cycle,
         })
@@ -882,8 +905,10 @@ class GrandCanonicalKRKS:
         else:
             # The loop did not break; evaluate the just-accepted final state.
             if self._meets_convergence(state, previous):
-                converged, message = True, 'converged at maximum cycle'
-        density_change = (np.inf if previous is None else self._metrics(state, previous)[2])
+                consecutive += 1
+                if consecutive >= self.config.required_consecutive_conv:
+                    converged, message = True, 'converged at maximum cycle'
+        density_change = (0.0 if previous is None else self._metrics(state, previous)[2])
         return self._finalize(state, converged, message, niter, density_change)
 
     # ---- public state finalisation ----------------------------------------
