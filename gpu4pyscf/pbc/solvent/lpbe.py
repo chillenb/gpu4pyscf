@@ -345,6 +345,11 @@ class PeriodicLPBE(lib.StreamObject):
         solvation_potentialR = solution_phi_R - vac_coulomb_potentialR
 
         solvation_potentialG = pbc_tools.fft(solvation_potentialR.reshape(-1), mesh).reshape(-1) * weight
+        # vpplocG[0] is a fixed nuclear alignment.  The quadratic correction
+        # energy contains half of this one-body contribution, so its functional
+        # derivative contains half as well.  The density-dependent electrostatic
+        # response remains unchanged.
+        solvation_potentialG[0] += 0.5 * self.vpplocG.reshape(-1)[0]
 
         grad_solution_phiR = pbc_tools.ifft(gradient_recip(solution_phi_G, self.Gv), mesh).real / weight
 
@@ -370,15 +375,6 @@ class PeriodicLPBE(lib.StreamObject):
         # The coulomb correction energy is just the difference between the coulomb energy
         # in solution and in vacuum.
         E_coul_corr = 0.5 * cp.sum( (solution_phi_R - vac_coulomb_potentialR) * solute_chargeR ) * weight
-
-        # vpplocG[0] is a fixed nuclear one-body alignment added to the vacuum
-        # potential above.  The quadratic expression supplies only half of its
-        # electron-number derivative, whereas vcorr contains the full aligned
-        # potential.  Add the other half of the fixed electron--nuclear cross
-        # term.  Written in terms of qsol it vanishes for a neutral cell.
-        alignment_potential = self.vpplocG.reshape(-1)[0].real / vol
-        E_alignment = -0.5 * alignment_potential * qsol
-        E_coul_corr += E_alignment
 
         # Vacuum alignment in z-direction. This is important when there is no electrolyte.
         rhoG_smoothed = rhoG * cp.exp(-100.0 * (self.Gabs2) * 0.5)
@@ -462,7 +458,6 @@ class PeriodicLPBE(lib.StreamObject):
             'Ediel': Ediel,
             'Ecav': Ecav,
             'E_coul_corr': E_coul_corr,
-            'E_alignment': E_alignment,
         }
 
 
