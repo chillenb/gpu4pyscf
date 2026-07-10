@@ -595,7 +595,7 @@ class GrandCanonicalKRKS:
         if checkpoint_h is not None:
             return self._sanitize_h(checkpoint_h)
         if dm0 is None:
-            dm0 = self.mf.get_init_guess(self.mf.cell, self.mf.kpts)
+            dm0 = self.mf.get_init_guess(self.mf.cell)
         return self._initial_h_from_dm(dm0)
 
     def _checkpoint(self, state: _GCState, cycle: int) -> None:
