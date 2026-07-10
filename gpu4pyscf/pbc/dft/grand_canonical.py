@@ -531,6 +531,25 @@ class GrandCanonicalKRKS:
             output.append(0.5 * (transformed + transformed.conj().T))
         return output
 
+    def _fock_from_veff(self, dm: cp.ndarray, veff: Any) -> cp.ndarray:
+        """Build the full AO Fock matrix represented by a tagged potential.
+
+        Ordinary KRKS potentials are complete arrays, so ``hcore + veff`` is
+        authoritative.  Decorators such as PeriodicLPBE attach an additional
+        response potential and expose the matched assembly through get_fock.
+        Calling it at cycle=-1 bypasses DIIS, damping, and level shifting.
+        """
+        hcore = _stack_or_list(self.hcore_ao)
+        if getattr(veff, 'v_solvent', None) is not None:
+            if not hasattr(self.mf, 'get_fock'):
+                raise TypeError('tagged solvent potential requires mf.get_fock')
+            fock = self.mf.get_fock(
+                h1e=hcore, vhf=veff, dm=dm, cycle=-1, diis=None,
+                level_shift_factor=0.0, damp_factor=0.0)
+            return cp.stack(_blocks(fock, 'decorated Fock matrices'))
+        return cp.stack([hcore_k + cp.asarray(veff)[k]
+                         for k, hcore_k in enumerate(self.hcore_ao)])
+
     def _exact_gradient(self, h: Sequence, fock: Sequence, eigenvalues: Sequence,
                         eigenvectors: Sequence, occupations: Sequence) -> list:
         gradient = []
@@ -553,8 +572,7 @@ class GrandCanonicalKRKS:
         # not mutate or replace the tagged object.
         veff = self.mf.get_veff(self.mf.cell, dm, dm_last=None, vhf_last=None,
                                 hermi=1, kpts=self.mf.kpts, kpts_band=None)
-        fock_ao = cp.stack([hcore + cp.asarray(veff)[k]
-                            for k, hcore in enumerate(self.hcore_ao)])
+        fock_ao = self._fock_from_veff(dm, veff)
         # KRKS calls this argument ``vhf`` while KSCF-style decorators, such
         # as PeriodicLPBE, retain the older ``vhf_kpts`` spelling.  In either
         # case the exact tagged object returned above must be passed through.
@@ -595,8 +613,7 @@ class GrandCanonicalKRKS:
         dm_stack = cp.stack(self.hermitize_blocks(dm_blocks))
         veff = self.mf.get_veff(self.mf.cell, dm_stack, dm_last=None, vhf_last=None,
                                 hermi=1, kpts=self.mf.kpts, kpts_band=None)
-        fock = self._to_orth(cp.stack([hcore + cp.asarray(veff)[k]
-                                       for k, hcore in enumerate(self.hcore_ao)]))
+        fock = self._to_orth(self._fock_from_veff(dm_stack, veff))
         return self._sanitize_h(fock)
 
     def _load_checkpoint_h(self) -> Optional[list]:

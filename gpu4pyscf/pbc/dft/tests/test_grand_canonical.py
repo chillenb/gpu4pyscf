@@ -2,6 +2,7 @@ import cupy as cp
 import numpy as np
 from pyscf.pbc import gto
 
+from gpu4pyscf.lib.cupy_helper import tag_array
 from gpu4pyscf.pbc.dft.grand_canonical import (
     GrandCanonicalConfig, GrandCanonicalKRKS, fermi_divided_difference,
     fermi_entropy, fermi_occupations,
@@ -55,6 +56,32 @@ class _FixedFockKRKS:
         return 0.0
 
 
+class _TaggedSolventKRKS(_FixedFockKRKS):
+    """Mimic LPBE's tagged response potential and KSCF method signatures."""
+
+    def __init__(self, hcore, solvent_potential):
+        super().__init__(hcore)
+        self._solvent_potential = cp.stack(solvent_potential)
+
+    def get_veff(self, cell, dm, **kwargs):
+        self.last_dm = dm
+        self.veff_seen = tag_array(
+            cp.zeros_like(dm), v_solvent=self._solvent_potential,
+            e_solvent=0.0)
+        return self.veff_seen
+
+    def get_fock(self, h1e=None, vhf=None, dm=None, cycle=-1, diis=None,
+                 level_shift_factor=None, damp_factor=None, **kwargs):
+        assert cycle == -1 and diis is None
+        return h1e + vhf + vhf.v_solvent
+
+    def energy_elec(self, dm_kpts, h1e_kpts, vhf_kpts):
+        self.energy_veff_seen = vhf_kpts
+        fock = h1e_kpts + vhf_kpts.v_solvent
+        energy = cp.einsum('kij,kji->', fock, dm_kpts).real / len(dm_kpts)
+        return energy, 0.0
+
+
 def _solver(mu=-0.1, checkpoint_path=None):
     f0 = cp.asarray([[[-0.7, 0.12j], [-0.12j, 0.3]]], dtype=cp.complex128)
     mf = _FixedFockKRKS(f0)
@@ -101,6 +128,26 @@ def test_fixed_fock_gradient_and_evaluator_pairing():
     analytic = solver.inner(state.gradient, direction)
     assert abs(finite_difference - analytic) < 2.0e-6
     assert solver.inner(state.gradient, state.residual) <= 1.0e-12
+    assert mf.energy_veff_seen is mf.veff_seen
+
+
+def test_tagged_solvent_potential_is_included_in_fock_and_gradient():
+    hcore = [cp.asarray([[-0.6, 0.0], [0.0, 0.2]])]
+    v_solvent = [cp.asarray([[0.15, 0.04j], [-0.04j, -0.1]])]
+    mf = _TaggedSolventKRKS(hcore, v_solvent)
+    solver = GrandCanonicalKRKS(
+        mf, mu=-0.05, sigma=0.2,
+        config=GrandCanonicalConfig(check_time_reversal=False))
+    h = [cp.asarray([[-0.25, 0.03], [0.03, 0.1]])]
+    direction = [cp.asarray([[0.1, 0.02j], [-0.02j, -0.08]])]
+    state = solver.evaluate(h)
+    expected_fock = hcore[0] + v_solvent[0]
+    assert float(cp.max(cp.abs(state.fock_ao[0] - expected_fock)).item()) < 1.0e-13
+    epsilon = 1.0e-5
+    plus = solver.evaluate(solver.axpy(epsilon, direction, h))
+    minus = solver.evaluate(solver.axpy(-epsilon, direction, h))
+    finite_difference = (plus.grand_potential - minus.grand_potential) / (2.0 * epsilon)
+    assert abs(finite_difference - solver.inner(state.gradient, direction)) < 2.0e-6
     assert mf.energy_veff_seen is mf.veff_seen
 
 
