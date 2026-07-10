@@ -371,6 +371,15 @@ class PeriodicLPBE(lib.StreamObject):
         # in solution and in vacuum.
         E_coul_corr = 0.5 * cp.sum( (solution_phi_R - vac_coulomb_potentialR) * solute_chargeR ) * weight
 
+        # vpplocG[0] is a fixed nuclear one-body alignment added to the vacuum
+        # potential above.  The quadratic expression supplies only half of its
+        # electron-number derivative, whereas vcorr contains the full aligned
+        # potential.  Add the other half of the fixed electron--nuclear cross
+        # term.  Written in terms of qsol it vanishes for a neutral cell.
+        alignment_potential = self.vpplocG.reshape(-1)[0].real / vol
+        E_alignment = -0.5 * alignment_potential * qsol
+        E_coul_corr += E_alignment
+
         # Vacuum alignment in z-direction. This is important when there is no electrolyte.
         rhoG_smoothed = rhoG * cp.exp(-100.0 * (self.Gabs2) * 0.5)
         rhoR_smoothed = pbc_tools.ifft(rhoG_smoothed.reshape(-1), mesh).real.reshape(*mesh) * weight
@@ -452,7 +461,8 @@ class PeriodicLPBE(lib.StreamObject):
             'Eion': Eion,
             'Ediel': Ediel,
             'Ecav': Ecav,
-            'E_coul_corr': E_coul_corr
+            'E_coul_corr': E_coul_corr,
+            'E_alignment': E_alignment,
         }
 
 
