@@ -54,7 +54,7 @@ class _FixedFockKRKS:
         return 0.0
 
 
-def _solver():
+def _solver(mu=-0.1, checkpoint_path=None):
     f0 = cp.asarray([[[-0.7, 0.12j], [-0.12j, 0.3]]], dtype=cp.complex128)
     mf = _FixedFockKRKS(f0)
     config = GrandCanonicalConfig(
@@ -62,8 +62,9 @@ def _solver():
         conv_tol_omega=1.0e-10, conv_tol_grad_rms=1.0e-8,
         conv_tol_residual_rms=1.0e-7, conv_tol_density_rms=1.0e-9,
         conv_tol_nelec=1.0e-9, check_time_reversal=False,
+        checkpoint_path=checkpoint_path,
     )
-    return mf, GrandCanonicalKRKS(mf, mu=-0.1, sigma=0.15, config=config)
+    return mf, GrandCanonicalKRKS(mf, mu=mu, sigma=0.15, config=config)
 
 
 def test_stable_fermi_scalars_and_divided_difference():
@@ -112,3 +113,22 @@ def test_fixed_fock_direct_minimisation_and_final_density():
                for a, b in zip(solver.history, solver.history[1:]))
     reconstructed = (mf.mo_coeff * mf.mo_occ[:, None, :]) @ mf.mo_coeff.conj().transpose(0, 2, 1)
     assert float(cp.max(cp.abs(reconstructed - result.dm_ao)).item()) < 1.0e-10
+
+
+def test_restart_and_chemical_potential_sign(tmp_path):
+    checkpoint = str(tmp_path / 'gc.npz')
+    _, solver = _solver(checkpoint_path=checkpoint)
+    h0 = [cp.asarray([[-0.15, 0.11j], [-0.11j, 0.45]])]
+    first = solver.kernel(h0=h0)
+    assert first.converged
+    assert (tmp_path / 'gc.npz').exists()
+    _, resumed = _solver(checkpoint_path=checkpoint)
+    second = resumed.kernel()
+    assert second.converged
+    assert abs(second.grand_potential - first.grand_potential) < 1.0e-10
+
+    _, low_mu = _solver(mu=-0.25)
+    _, high_mu = _solver(mu=0.05)
+    low = low_mu.kernel(h0=h0)
+    high = high_mu.kernel(h0=h0)
+    assert high.electron_number > low.electron_number
