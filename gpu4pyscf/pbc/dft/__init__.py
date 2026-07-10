@@ -22,6 +22,7 @@ from . import krks
 from . import kuks
 from . import krkspu
 from . import kukspu
+from .grand_canonical import GrandCanonicalConfig, GrandCanonicalKRKS, GrandCanonicalResult
 from .rks import KohnShamDFT
 
 KRKS = krks.KRKS
