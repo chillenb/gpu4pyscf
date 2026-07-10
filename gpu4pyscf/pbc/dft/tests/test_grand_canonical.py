@@ -194,6 +194,22 @@ def test_low_temperature_restart_keeps_preconditioned_residual():
     assert float(cp.max(cp.abs(direction[0] - state.residual[0])).item()) < 1.0e-13
 
 
+def test_near_stationary_low_temperature_state_uses_exact_gradient():
+    mf = _FixedFockKRKS([cp.diag(cp.asarray([-1.0, 1.0e-5]))])
+    solver = GrandCanonicalKRKS(
+        mf, mu=0.0, sigma=0.001,
+        config=GrandCanonicalConfig(check_time_reversal=False),
+    )
+    state = solver.evaluate([cp.diag(cp.asarray([-1.0, 0.0]))])
+    assert state.residual_rms < solver.config.exact_gradient_polish_residual_rms
+
+    direction, restarted, reason = solver._ensure_descent(state, state.residual)
+    assert restarted
+    assert reason == 'exact-gradient final polishing'
+    expected = solver.scale_blocks(-1.0, state.gradient)
+    assert float(cp.max(cp.abs(direction[0] - expected[0])).item()) < 1.0e-13
+
+
 def test_restart_and_chemical_potential_sign(tmp_path):
     checkpoint = str(tmp_path / 'gc.npz')
     _, solver = _solver(checkpoint_path=checkpoint)
