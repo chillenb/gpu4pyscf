@@ -1,5 +1,6 @@
 import cupy as cp
 import numpy as np
+from pyscf.pbc import gto
 
 from gpu4pyscf.pbc.dft.grand_canonical import (
     GrandCanonicalConfig, GrandCanonicalKRKS, fermi_divided_difference,
@@ -132,3 +133,46 @@ def test_restart_and_chemical_potential_sign(tmp_path):
     low = low_mu.kernel(h0=h0)
     high = high_mu.kernel(h0=h0)
     assert high.electron_number > low.electron_number
+
+
+def _small_periodic_cell():
+    cell = gto.Cell()
+    cell.a = [[4.0, 0, 0], [0, 4.0, 0], [0, 0, 4.0]]
+    cell.atom = 'He 0 0 0'
+    cell.basis = 'gth-szv'
+    cell.pseudo = 'gth-pade'
+    cell.mesh = [15, 15, 15]
+    cell.verbose = 0
+    return cell.build()
+
+
+def test_real_multik_krks_evaluator_and_finalisation():
+    cell = _small_periodic_cell()
+    mf = cell.KRKS(kpts=cell.make_kpts([3, 1, 1])).to_gpu()
+    mf.xc = 'LDA,VWN'
+    config = GrandCanonicalConfig(
+        max_cycle=25, required_consecutive_conv=1, conv_tol_omega=1.0e-7,
+        conv_tol_grad_rms=1.0e-6, conv_tol_residual_rms=1.0e-5,
+        conv_tol_density_rms=1.0e-7, conv_tol_nelec=1.0e-7,
+        line_search_max_evals=10, line_search_zoom_evals=10,
+    )
+    solver = GrandCanonicalKRKS(mf, mu=-0.4, sigma=0.08, config=config)
+    result = solver.kernel()
+    assert result.converged, result.message
+    assert solver._time_reversal_enabled
+    assert all(b.grand_potential <= a.grand_potential + 1.0e-10
+               for a, b in zip(result.history, result.history[1:]))
+    reconstructed = mf.make_rdm1(mf.mo_coeff, mf.mo_occ)
+    assert float(cp.max(cp.abs(reconstructed - result.dm_ao)).item()) < 1.0e-9
+    assert abs(mf.e_tot - result.dft_total_energy) < 1.0e-12
+    assert abs(mf.grand_potential - result.grand_potential) < 1.0e-12
+
+
+def test_real_gga_evaluator_is_supported():
+    cell = _small_periodic_cell()
+    mf = cell.KRKS(kpts=cell.make_kpts([1, 1, 1])).to_gpu()
+    mf.xc = 'PBE'
+    solver = GrandCanonicalKRKS(mf, mu=-0.4, sigma=0.08)
+    state = solver.evaluate(solver._initial_h())
+    assert np.isfinite(state.grand_potential)
+    assert state.grad_rms >= 0.0
