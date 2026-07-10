@@ -178,7 +178,7 @@ def test_initial_auxiliary_electron_number_selects_requested_basin():
         assert float(cp.max(cp.abs(difference - scalar * identity)).item()) < 1.0e-13
 
 
-def test_low_temperature_restart_keeps_preconditioned_residual():
+def test_low_temperature_restart_blends_residual_and_exact_gradient():
     mf = _FixedFockKRKS([cp.diag(cp.asarray([10.0, 0.01]))])
     solver = GrandCanonicalKRKS(
         mf, mu=0.0, sigma=0.001,
@@ -190,8 +190,13 @@ def test_low_temperature_restart_keeps_preconditioned_residual():
     assert 0.0 < cosine < 0.05
 
     direction, reason = solver._restart_direction(state)
-    assert reason == 'restarted with preconditioned residual'
-    assert float(cp.max(cp.abs(direction[0] - state.residual[0])).item()) < 1.0e-13
+    assert reason == 'restarted with blended residual/exact gradient'
+    new_cosine = -solver.inner(state.gradient, direction)
+    new_cosine /= solver.norm(state.gradient) * solver.norm(direction)
+    assert new_cosine > cosine
+    # The exact gradient is saturated in the first orbital, so its residual
+    # component must be retained by the blend rather than discarded.
+    assert abs(float((direction[0][0, 0] - state.residual[0][0, 0]).item())) < 1.0e-13
 
 
 def test_near_stationary_low_temperature_state_uses_exact_gradient():
