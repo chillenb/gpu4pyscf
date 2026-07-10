@@ -375,6 +375,7 @@ def test_real_multik_krks_evaluator_and_finalisation():
 
 
 def test_real_multik_fixed_electron_number_minimisation():
+    target = 1.6
     cell = _small_periodic_cell()
     mf = cell.KRKS(kpts=cell.make_kpts([3, 1, 1])).to_gpu()
     mf.xc = 'LDA,VWN'
@@ -385,11 +386,11 @@ def test_real_multik_fixed_electron_number_minimisation():
         line_search_max_evals=10, line_search_zoom_evals=10,
     )
     solver = GrandCanonicalKRKS(
-        mf, sigma=0.08, config=config, electron_number=2.0)
+        mf, sigma=0.08, config=config, electron_number=target)
     result = solver.kernel()
     assert result.converged, result.message
     assert result.fixed_electron_number
-    assert abs(result.electron_number - 2.0) < config.mu_electron_number_tol
+    assert abs(result.electron_number - target) < config.mu_electron_number_tol
     assert np.isfinite(result.mu)
     assert all(b.free_energy <= a.free_energy + 1.0e-10
                for a, b in zip(result.history, result.history[1:]))
