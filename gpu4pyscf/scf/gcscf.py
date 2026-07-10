@@ -637,9 +637,9 @@ def _line_minimize(haux_eval, haux, direction, state, alpha_t,
     if max_cycle <= 0:
         raise ValueError('auxh_line_max_cycle must be positive')
 
-    alpha_reduce_factor = 0.1
-    alpha_increase_factor = 3.0
-    objective_slop = 1e-12
+    alpha_reduce_factor = 0.7
+    alpha_increase_factor = 1.4
+    objective_slop = 1e-8
     objective0 = float(state.objective)
     gdotd = _vdot(state.haux_gradient, direction)
     identity = _identity_rotation(state.mo_energy)
