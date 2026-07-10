@@ -36,7 +36,7 @@ class _FixedFockKRKS:
     def check_linear_dependency(self, overlap, **kwargs):
         return cp.stack([cp.eye(s.shape[0], dtype=s.dtype) for s in overlap])
 
-    def get_init_guess(self, cell, kpts):
+    def get_init_guess(self, cell, kpts=None):
         return cp.stack([cp.eye(f.shape[0], dtype=f.dtype) for f in self._fock])
 
     def get_veff(self, cell, dm, **kwargs):
