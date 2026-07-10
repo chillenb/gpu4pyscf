@@ -45,6 +45,7 @@ class GrandCanonicalConfig:
     cg_restart_interval: int = 20
     cg_beta_max: float = 5.0
     descent_tolerance: float = 1.0e-12
+    preconditioned_descent_cosine_min: float = 0.05
 
     line_search_c1: float = 1.0e-4
     line_search_c2: float = 0.1
@@ -672,18 +673,37 @@ class GrandCanonicalKRKS:
             return False
         return self.inner(state.gradient, direction) < -self.config.descent_tolerance * gnorm * dnorm
 
+    def _descent_cosine(self, state: _GCState, direction: Sequence) -> float:
+        gnorm, dnorm = self.norm(state.gradient), self.norm(direction)
+        if gnorm == 0.0 or dnorm == 0.0:
+            return 0.0
+        return -self.inner(state.gradient, direction) / (gnorm * dnorm)
+
+    def _restart_direction(self, state: _GCState) -> tuple[list, str]:
+        residual = self.copy_blocks(state.residual)
+        if (self._is_descent(state, residual) and
+                self._descent_cosine(state, residual) >=
+                self.config.preconditioned_descent_cosine_min):
+            return residual, 'restarted with preconditioned residual'
+        gradient = self.scale_blocks(-1.0, state.gradient)
+        if self._is_descent(state, gradient):
+            return gradient, 'restarted with exact steepest descent'
+        return residual, 'no usable restart direction'
+
     def _ensure_descent(self, state: _GCState, direction: Sequence) -> tuple[list, bool, str]:
         direction = self.hermitize_blocks(direction)
         direction, projected_change = self.project_time_reversal(direction)
         if projected_change > self.config.hermiticity_tol * max(1.0, self.norm(direction)):
-            direction = self.copy_blocks(state.residual)
-            return direction, True, 'time-reversal projection changed CG direction'
-        if self._is_descent(state, direction):
+            direction, reason = self._restart_direction(state)
+            return direction, True, 'time-reversal projection changed CG direction; ' + reason
+        if (self._is_descent(state, direction) and
+                self._descent_cosine(state, direction) >=
+                self.config.preconditioned_descent_cosine_min):
             return direction, False, ''
-        direction = self.copy_blocks(state.residual)
+        direction, reason = self._restart_direction(state)
         if self._is_descent(state, direction):
-            return direction, True, 'lost descent; restarted CG'
-        return direction, True, 'residual is not a descent direction'
+            return direction, True, reason
+        return direction, True, 'restart direction is not downhill'
 
     def _alpha_cap(self, direction: Sequence) -> float:
         block_rms = self.max_block_rms(direction)
@@ -885,17 +905,18 @@ class GrandCanonicalKRKS:
                     message = 'persistent loss of descent'
                 break
             if self._alpha_cap(direction) < self.config.line_search_alpha_min:
-                direction = self.copy_blocks(state.residual)
+                direction, cap_reason = self._restart_direction(state)
                 if self._alpha_cap(direction) < self.config.line_search_alpha_min:
                     message = 'stagnation: step cap below minimum'
                     break
-                restarted, restart_reason = True, 'step cap restart'
+                restarted, restart_reason = True, 'step cap restart; ' + cap_reason
             dphi0 = self.inner(state.gradient, direction)
             line_search = self._line_search(state, direction)
             if not line_search.success:
-                direction = self.copy_blocks(state.residual)
+                direction, fallback_reason = self._restart_direction(state)
                 line_search = self._armijo_fallback(state, direction)
-                restarted, restart_reason = True, line_search.message
+                restarted = True
+                restart_reason = fallback_reason + '; ' + line_search.message
                 dphi0 = self.inner(state.gradient, direction)
             if not line_search.success or line_search.state is None:
                 message = 'line-search failure: ' + line_search.message
