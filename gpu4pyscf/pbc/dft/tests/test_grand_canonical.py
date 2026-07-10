@@ -82,7 +82,7 @@ class _TaggedSolventKRKS(_FixedFockKRKS):
         return energy, 0.0
 
 
-def _solver(mu=-0.1, checkpoint_path=None):
+def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None):
     f0 = cp.asarray([[[-0.7, 0.12j], [-0.12j, 0.3]]], dtype=cp.complex128)
     mf = _FixedFockKRKS(f0)
     config = GrandCanonicalConfig(
@@ -91,6 +91,7 @@ def _solver(mu=-0.1, checkpoint_path=None):
         conv_tol_residual_rms=1.0e-7, conv_tol_density_rms=1.0e-9,
         conv_tol_nelec=1.0e-9, check_time_reversal=False,
         checkpoint_path=checkpoint_path,
+        initial_electron_number=initial_electron_number,
     )
     return mf, GrandCanonicalKRKS(mf, mu=mu, sigma=0.15, config=config)
 
@@ -161,6 +162,20 @@ def test_fixed_fock_direct_minimisation_and_final_density():
                for a, b in zip(solver.history, solver.history[1:]))
     reconstructed = (mf.mo_coeff * mf.mo_occ[:, None, :]) @ mf.mo_coeff.conj().transpose(0, 2, 1)
     assert float(cp.max(cp.abs(reconstructed - result.dm_ao)).item()) < 1.0e-10
+
+
+def test_initial_auxiliary_electron_number_selects_requested_basin():
+    target = 1.25
+    _, solver = _solver(initial_electron_number=target)
+    h = solver._initial_h()
+    state = solver.evaluate(h)
+    assert abs(state.electron_number - target) < 1.0e-12
+
+    unshifted = solver._initial_h_from_dm(solver.mf.get_init_guess(solver.mf.cell))
+    differences = [shifted - original for shifted, original in zip(h, unshifted)]
+    for difference, identity in zip(differences, solver.identity):
+        scalar = cp.trace(difference).real / difference.shape[0]
+        assert float(cp.max(cp.abs(difference - scalar * identity)).item()) < 1.0e-13
 
 
 def test_restart_and_chemical_potential_sign(tmp_path):

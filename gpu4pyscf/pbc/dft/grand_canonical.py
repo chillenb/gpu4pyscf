@@ -47,6 +47,11 @@ class GrandCanonicalConfig:
     descent_tolerance: float = 1.0e-12
     preconditioned_descent_cosine_min: float = 0.05
 
+    # Optional branch selector for low-temperature calculations.  This shifts
+    # only the initial auxiliary Hamiltonian by a scalar; mu and every
+    # subsequently evaluated Fock matrix retain their physical energy zero.
+    initial_electron_number: Optional[float] = None
+
     line_search_c1: float = 1.0e-4
     line_search_c2: float = 0.1
     line_search_max_evals: int = 12
@@ -273,6 +278,18 @@ class GrandCanonicalKRKS:
         self.history: list[IterationRecord] = []
         self.nfev = 0
         self._prepare_fixed_basis_data()
+        if self.config.initial_electron_number is not None:
+            target = _as_float(
+                self.config.initial_electron_number,
+                'initial_electron_number',
+            )
+            maximum = 2.0 * sum(float(self.weights[k].item()) * n
+                                for k, n in enumerate(self.north))
+            if not 0.0 < target < maximum:
+                raise ValueError(
+                    'initial_electron_number must lie strictly between 0 and '
+                    f'the retained-basis capacity ({maximum:g})')
+            self.config.initial_electron_number = target
 
     # ---- fixed basis data and validation ---------------------------------
 
@@ -617,6 +634,48 @@ class GrandCanonicalKRKS:
         fock = self._to_orth(self._fock_from_veff(dm_stack, veff))
         return self._sanitize_h(fock)
 
+    def _shift_initial_h_to_nelec(self, h: Sequence, target: float) -> list:
+        """Select an initial occupation basin without changing physical ``mu``.
+
+        A scalar shift of the auxiliary Hamiltonian changes its initial Fermi
+        occupations but is still an ordinary point in the unconstrained
+        optimisation space.  This is useful when a very small ``sigma`` makes
+        the Fermi map effectively discontinuous and the unshifted initial Fock
+        matrix lands in a different integer-occupation basin.
+        """
+        h = self._sanitize_h(h)
+        eigenvalues = [cp.linalg.eigvalsh(hk) for hk in h]
+
+        def electron_number(shift: float) -> float:
+            return 2.0 * sum(
+                float((self.weights[k] * cp.sum(fermi_occupations(
+                    self.beta * (value + shift - self.mu)))).item())
+                for k, value in enumerate(eigenvalues))
+
+        spectral_radius = max(
+            [1.0, self.sigma]
+            + [float(cp.max(cp.abs(value - self.mu)).item())
+               for value in eigenvalues])
+        lower, upper = -spectral_radius, spectral_radius
+        while electron_number(lower) < target:
+            lower *= 2.0
+        while electron_number(upper) > target:
+            upper *= 2.0
+        for _ in range(100):
+            midpoint = 0.5 * (lower + upper)
+            if electron_number(midpoint) > target:
+                lower = midpoint
+            else:
+                upper = midpoint
+        shift = 0.5 * (lower + upper)
+        shifted = [hk + shift * identity
+                   for hk, identity in zip(h, self.identity)]
+        achieved = electron_number(shift)
+        self.log.info(
+            'GC initial auxiliary shift = %.12g Ha; N = %.12g (target %.12g)',
+            shift, achieved, target)
+        return self._sanitize_h(shifted)
+
     def _load_checkpoint_h(self) -> Optional[list]:
         filename = self.config.checkpoint_path
         if not filename:
@@ -645,7 +704,11 @@ class GrandCanonicalKRKS:
             return self._sanitize_h(checkpoint_h)
         if dm0 is None:
             dm0 = self.mf.get_init_guess(self.mf.cell)
-        return self._initial_h_from_dm(dm0)
+        h = self._initial_h_from_dm(dm0)
+        if self.config.initial_electron_number is not None:
+            h = self._shift_initial_h_to_nelec(
+                h, self.config.initial_electron_number)
+        return h
 
     def _checkpoint(self, state: _GCState, cycle: int) -> None:
         filename = self.config.checkpoint_path
