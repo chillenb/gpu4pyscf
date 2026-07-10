@@ -358,8 +358,10 @@ class PeriodicLPBE(lib.StreamObject):
         lambdalq_ion = - 1.0/(8*np.pi) * ebkappa2 * solution_phi_R.reshape(-1)**2
         lambdalq_diel = -1.0/(8*np.pi) * (self.rel_permittivity - 1.) * cp.einsum('ng, ng ->g', grad_solution_phiR, grad_solution_phiR)
 
-        vion_r = Sprime.reshape(-1) * lambdalq_ion
-        vdiel_r = Sprime.reshape(-1) * lambdalq_diel
+        # shape_function returns the positive magnitude -dS/drho.  The
+        # dielectric and ionic response terms require dS/drho itself.
+        vion_r = -Sprime.reshape(-1) * lambdalq_ion
+        vdiel_r = -Sprime.reshape(-1) * lambdalq_diel
 
         # These terms should not be added to the free energy.
         Eion = cp.einsum('g, g ->', lambdalq_ion, S.reshape(-1)) * vol / ngrids
