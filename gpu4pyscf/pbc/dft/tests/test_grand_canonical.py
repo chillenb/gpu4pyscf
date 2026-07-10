@@ -196,7 +196,8 @@ def test_low_temperature_restart_blends_residual_and_exact_gradient():
     assert new_cosine > cosine
     # The exact gradient is saturated in the first orbital, so its residual
     # component must be retained by the blend rather than discarded.
-    assert abs(float((direction[0][0, 0] - state.residual[0][0, 0]).item())) < 1.0e-13
+    difference = direction[0][0, 0] - state.residual[0][0, 0]
+    assert float(cp.abs(difference).item()) < 1.0e-13
 
 
 def test_near_stationary_low_temperature_state_uses_exact_gradient():
