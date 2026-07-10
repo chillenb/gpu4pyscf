@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import inspect
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -554,8 +555,16 @@ class GrandCanonicalKRKS:
                                 hermi=1, kpts=self.mf.kpts, kpts_band=None)
         fock_ao = cp.stack([hcore + cp.asarray(veff)[k]
                             for k, hcore in enumerate(self.hcore_ao)])
+        # KRKS calls this argument ``vhf`` while KSCF-style decorators, such
+        # as PeriodicLPBE, retain the older ``vhf_kpts`` spelling.  In either
+        # case the exact tagged object returned above must be passed through.
+        energy_parameters = inspect.signature(self.mf.energy_elec).parameters
+        vhf_keyword = 'vhf' if ('vhf' in energy_parameters or
+                                any(p.kind == inspect.Parameter.VAR_KEYWORD
+                                    for p in energy_parameters.values())) else 'vhf_kpts'
         electronic_energy, _ = self.mf.energy_elec(
-            dm_kpts=dm, h1e_kpts=_stack_or_list(self.hcore_ao), vhf=veff)
+            dm_kpts=dm, h1e_kpts=_stack_or_list(self.hcore_ao),
+            **{vhf_keyword: veff})
         electronic_energy = _as_float(electronic_energy, 'electronic energy')
         nuclear_energy = _as_float(self.mf.energy_nuc(), 'nuclear energy')
         dft_total_energy = electronic_energy + nuclear_energy
