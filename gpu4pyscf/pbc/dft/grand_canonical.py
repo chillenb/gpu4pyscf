@@ -45,7 +45,6 @@ class GrandCanonicalConfig:
     cg_restart_interval: int = 20
     cg_beta_max: float = 5.0
     descent_tolerance: float = 1.0e-12
-    preconditioned_descent_cosine_min: float = 0.05
 
     # Optional branch selector for low-temperature calculations.  This shifts
     # only the initial auxiliary Hamiltonian by a scalar; mu and every
@@ -736,17 +735,9 @@ class GrandCanonicalKRKS:
             return False
         return self.inner(state.gradient, direction) < -self.config.descent_tolerance * gnorm * dnorm
 
-    def _descent_cosine(self, state: _GCState, direction: Sequence) -> float:
-        gnorm, dnorm = self.norm(state.gradient), self.norm(direction)
-        if gnorm == 0.0 or dnorm == 0.0:
-            return 0.0
-        return -self.inner(state.gradient, direction) / (gnorm * dnorm)
-
     def _restart_direction(self, state: _GCState) -> tuple[list, str]:
         residual = self.copy_blocks(state.residual)
-        if (self._is_descent(state, residual) and
-                self._descent_cosine(state, residual) >=
-                self.config.preconditioned_descent_cosine_min):
+        if self._is_descent(state, residual):
             return residual, 'restarted with preconditioned residual'
         gradient = self.scale_blocks(-1.0, state.gradient)
         if self._is_descent(state, gradient):
@@ -759,9 +750,7 @@ class GrandCanonicalKRKS:
         if projected_change > self.config.hermiticity_tol * max(1.0, self.norm(direction)):
             direction, reason = self._restart_direction(state)
             return direction, True, 'time-reversal projection changed CG direction; ' + reason
-        if (self._is_descent(state, direction) and
-                self._descent_cosine(state, direction) >=
-                self.config.preconditioned_descent_cosine_min):
+        if self._is_descent(state, direction):
             return direction, False, ''
         direction, reason = self._restart_direction(state)
         if self._is_descent(state, direction):
