@@ -48,6 +48,8 @@ class GrandCanonicalConfig:
     descent_tolerance: float = 1.0e-12
     preconditioned_descent_cosine_min: float = 0.05
     exact_gradient_polish_residual_rms: float = 1.0e-4
+    mu_electron_number_tol: float = 1.0e-12
+    mu_max_cycle: int = 100
 
     # Optional branch selector for low-temperature calculations.  This shifts
     # only the initial auxiliary Hamiltonian by a scalar; mu and every
@@ -94,6 +96,10 @@ class IterationRecord:
     cg_beta: float
     restart_reason: str
     line_search_evals: int
+    free_energy: float = np.nan
+    chemical_potential: float = np.nan
+    objective: float = np.nan
+    delta_objective: float = np.nan
 
 
 @dataclass(frozen=True)
@@ -108,13 +114,18 @@ class _GCState:
     veff: Any
     fock_ao: cp.ndarray
     fock_orth: list
+    auxiliary_mu: float
+    chemical_potential: float
+    gauge_shift: float
     electronic_energy: float
     nuclear_energy: float
     dft_total_energy: float
     electron_number: float
     entropy: float
     entropy_energy: float
+    free_energy: float
     grand_potential: float
+    objective: float
     gradient: list
     z: list
     residual: list
@@ -167,6 +178,9 @@ class GrandCanonicalResult:
     history: list[IterationRecord]
     veff: Any = None
     checkpoint_path: Optional[str] = None
+    free_energy: float = np.nan
+    fixed_electron_number: bool = False
+    target_electron_number: Optional[float] = None
 
 
 def _as_float(value: Any, name: str = 'value') -> float:
@@ -265,13 +279,26 @@ class GrandCanonicalKRKS:
     never invokes orbital-rotation or CIAH machinery.
     """
 
-    def __init__(self, mf: Any, mu: float, sigma: float,
-                 config: Optional[GrandCanonicalConfig] = None):
+    def __init__(self, mf: Any, mu: Optional[float] = None,
+                 sigma: Optional[float] = None,
+                 config: Optional[GrandCanonicalConfig] = None,
+                 electron_number: Optional[float] = None):
         self.mf = mf
-        self.mu = _as_float(mu, 'mu')
+        if sigma is None:
+            raise TypeError('sigma is required')
         self.sigma = _as_float(sigma, 'sigma')
         if self.sigma <= 0.0:
             raise ValueError('sigma must be positive')
+        self.fixed_electron_number = electron_number is not None
+        self.target_electron_number = (
+            None if electron_number is None
+            else _as_float(electron_number, 'electron_number'))
+        if self.fixed_electron_number:
+            self.mu = None if mu is None else _as_float(mu, 'mu')
+        else:
+            if mu is None:
+                raise TypeError('mu is required unless electron_number is specified')
+            self.mu = _as_float(mu, 'mu')
         self.beta = 1.0 / self.sigma
         self.config = config or GrandCanonicalConfig()
         self.config.cg_update = self._canonical_cg_update(self.config.cg_update)
@@ -281,17 +308,26 @@ class GrandCanonicalKRKS:
         self.history: list[IterationRecord] = []
         self.nfev = 0
         self._prepare_fixed_basis_data()
+        capacity = 2.0 * sum(float(self.weights[k].item()) * n
+                             for k, n in enumerate(self.north))
+        if (self.fixed_electron_number and
+                not 0.0 < self.target_electron_number < capacity):
+            raise ValueError(
+                'electron_number must lie strictly between 0 and the '
+                f'retained-basis capacity ({capacity:g})')
+        if self.fixed_electron_number and self.config.initial_electron_number is not None:
+            raise ValueError(
+                'initial_electron_number is only meaningful at fixed mu; '
+                'electron_number already fixes every canonical density')
         if self.config.initial_electron_number is not None:
             target = _as_float(
                 self.config.initial_electron_number,
                 'initial_electron_number',
             )
-            maximum = 2.0 * sum(float(self.weights[k].item()) * n
-                                for k, n in enumerate(self.north))
-            if not 0.0 < target < maximum:
+            if not 0.0 < target < capacity:
                 raise ValueError(
                     'initial_electron_number must lie strictly between 0 and '
-                    f'the retained-basis capacity ({maximum:g})')
+                    f'the retained-basis capacity ({capacity:g})')
             self.config.initial_electron_number = target
 
     # ---- fixed basis data and validation ---------------------------------
@@ -501,6 +537,13 @@ class GrandCanonicalKRKS:
     def max_block_rms(self, a: Sequence) -> float:
         return max((float(cp.linalg.norm(x).item()) / x.shape[0] for x in a), default=0.0)
 
+    def trace_mean(self, blocks: Sequence) -> float:
+        numerator = sum(float((self.weights[k] * cp.trace(value).real).item())
+                        for k, value in enumerate(blocks))
+        denominator = sum(float(self.weights[k].item()) * value.shape[0]
+                          for k, value in enumerate(blocks))
+        return numerator / denominator
+
     # ---- state construction ------------------------------------------------
 
     def _sanitize_h(self, h_orth: Sequence) -> list:
@@ -518,14 +561,51 @@ class GrandCanonicalKRKS:
         h = self.hermitize_blocks(h)
         return h
 
-    def _thermal_density(self, h: Sequence) -> tuple[list, list, list, list, cp.ndarray]:
+    def _solve_chemical_potential(self, orbital_energies: Sequence) -> float:
+        """Find mu such that the Fermi occupations have the target electron count."""
+        target = self.target_electron_number
+        margin = max(1.0, 50.0 * self.sigma)
+        lower = min(float(cp.min(value).item()) for value in orbital_energies) - margin
+        upper = max(float(cp.max(value).item()) for value in orbital_energies) + margin
+
+        def electron_number(mu: float) -> float:
+            return 2.0 * sum(
+                float((self.weights[k] * cp.sum(fermi_occupations(
+                    self.beta * (value - mu)))).item())
+                for k, value in enumerate(orbital_energies))
+
+        midpoint = 0.5 * (lower + upper)
+        for _ in range(self.config.mu_max_cycle):
+            midpoint = 0.5 * (lower + upper)
+            nelec = electron_number(midpoint)
+            if abs(nelec - target) <= self.config.mu_electron_number_tol:
+                return midpoint
+            if nelec < target:
+                lower = midpoint
+            else:
+                upper = midpoint
+        nelec = electron_number(midpoint)
+        if abs(nelec - target) > self.config.mu_electron_number_tol:
+            raise RuntimeError(
+                'chemical-potential solve did not reach the target electron '
+                f'number: {nelec:.15g} vs {target:.15g}')
+        return midpoint
+
+    def _thermal_density(self, h: Sequence) -> tuple[list, list, list, list,
+                                                            list, cp.ndarray, float]:
         gamma_blocks, eigvals, eigenvectors, occupations, p_blocks = [], [], [], [], []
+        h_eigenpairs = [cp.linalg.eigh(hk) for hk in h]
+        orbital_energies = [pair[0] for pair in h_eigenpairs]
+        auxiliary_mu = (self._solve_chemical_potential(orbital_energies)
+                        if self.fixed_electron_number else self.mu)
         dm = cp.empty((self.nkpts, self.nao, self.nao),
                       dtype=cp.result_type(*[x.dtype for x in h], cp.complex128))
-        for k, (hk, x, identity) in enumerate(zip(h, self.x_ao2orth, self.identity)):
-            gamma = self.beta * (hk - self.mu * identity)
+        for k, (hk, x, identity, eigenpair) in enumerate(zip(
+                h, self.x_ao2orth, self.identity, h_eigenpairs)):
+            gamma = self.beta * (hk - auxiliary_mu * identity)
             gamma = 0.5 * (gamma + gamma.conj().T)
-            value, vector = cp.linalg.eigh(gamma)
+            energy, vector = eigenpair
+            value = self.beta * (energy - auxiliary_mu)
             q = fermi_occupations(value)
             p = (vector * q[None, :]) @ vector.conj().T
             p = 0.5 * (p + p.conj().T)
@@ -541,7 +621,8 @@ class GrandCanonicalKRKS:
         dm = cp.stack(self.hermitize_blocks(dm_blocks))
         if not self.all_finite(p_blocks) or not bool(cp.all(cp.isfinite(dm)).item()):
             raise FloatingPointError('thermal density contains nonfinite elements')
-        return gamma_blocks, eigvals, eigenvectors, occupations, p_blocks, dm
+        return (gamma_blocks, eigvals, eigenvectors, occupations, p_blocks, dm,
+                auxiliary_mu)
 
     def _electron_number(self, p_blocks: Sequence, dm: cp.ndarray) -> float:
         north = 2.0 * sum(float((self.weights[k] * cp.trace(p).real).item())
@@ -594,20 +675,41 @@ class GrandCanonicalKRKS:
 
     def _exact_gradient(self, h: Sequence, fock: Sequence, eigenvalues: Sequence,
                         eigenvectors: Sequence, occupations: Sequence) -> list:
-        gradient = []
+        gradient, occupation_response = [], []
         for hk, fk, gamma, vector, q in zip(h, fock, eigenvalues, eigenvectors, occupations):
             a_tilde = vector.conj().T @ (fk - hk) @ vector
             divided = fermi_divided_difference(gamma, q, self.config.fermi_divdiff_rtol)
             value = 2.0 * self.beta * vector @ (divided * a_tilde) @ vector.conj().T
             gradient.append(0.5 * (value + value.conj().T))
         gradient, _ = self.project_time_reversal(gradient)
-        return self.hermitize_blocks(gradient)
+        gradient = self.hermitize_blocks(gradient)
+        if self.fixed_electron_number:
+            for vector, q in zip(eigenvectors, occupations):
+                diagonal = -q * (1.0 - q)
+                response = (vector * diagonal[None, :]) @ vector.conj().T
+                occupation_response.append(0.5 * (response + response.conj().T))
+            occupation_response, _ = self.project_time_reversal(occupation_response)
+            occupation_response = self.hermitize_blocks(occupation_response)
+            response_trace = sum(
+                float((self.weights[k] * cp.trace(value).real).item())
+                for k, value in enumerate(occupation_response))
+            if abs(response_trace) < 1.0e-30:
+                raise RuntimeError('fixed-electron Fermi response is numerically singular')
+            gradient_trace = sum(
+                float((self.weights[k] * cp.trace(value).real).item())
+                for k, value in enumerate(gradient))
+            correction = gradient_trace / response_trace
+            gradient = [g - correction * response
+                        for g, response in zip(gradient, occupation_response)]
+            gradient, _ = self.project_time_reversal(gradient)
+            gradient = self.hermitize_blocks(gradient)
+        return gradient
 
     def evaluate(self, h_orth: Sequence) -> _GCState:
         """Fully evaluate a density, DFT energy, exact gradient, and residual."""
         self.nfev += 1
         h = self._sanitize_h(h_orth)
-        gamma, eigenvalues, vector, q, p, dm = self._thermal_density(h)
+        gamma, eigenvalues, vector, q, p, dm, auxiliary_mu = self._thermal_density(h)
         nelec = self._electron_number(p, dm)
         # Keep the tagged potential returned by get_veff alive and pass that
         # exact object to energy_elec.  Converting it for Fock construction does
@@ -630,20 +732,30 @@ class GrandCanonicalKRKS:
         dft_total_energy = electronic_energy + nuclear_energy
         fock = self._to_orth(fock_ao)
         entropy, entropy_energy = self._entropy(eigenvalues, q)
-        omega = dft_total_energy - self.mu * nelec + entropy_energy
-        if not np.isfinite(omega):
-            raise FloatingPointError('grand potential is nonfinite')
+        free_energy = dft_total_energy + entropy_energy
         gradient = self._exact_gradient(h, fock, eigenvalues, vector, q)
-        z = self.hermitize_blocks([0.5 * (hk - fk) for hk, fk in zip(h, fock)])
+        mismatch = self.hermitize_blocks([hk - fk for hk, fk in zip(h, fock)])
+        gauge_shift = self.trace_mean(mismatch) if self.fixed_electron_number else 0.0
+        if self.fixed_electron_number:
+            mismatch = [value - gauge_shift * identity
+                        for value, identity in zip(mismatch, self.identity)]
+        chemical_potential = auxiliary_mu - gauge_shift
+        omega = free_energy - chemical_potential * nelec
+        objective = free_energy if self.fixed_electron_number else omega
+        if not all(np.isfinite(value) for value in
+                   (free_energy, omega, objective, chemical_potential)):
+            raise FloatingPointError('finite-temperature objective is nonfinite')
+        z = self.hermitize_blocks([0.5 * value for value in mismatch])
         residual = self.scale_blocks(-1.0, z)
         descent = self.inner(gradient, residual)
         if descent > 1.0e-10 * max(1.0, self.norm(gradient) * self.norm(residual)):
             raise RuntimeError('exact gradient and residual have inconsistent descent signs')
         return _GCState(
             h, gamma, eigenvalues, vector, q, p, dm, veff, fock_ao, fock,
-            electronic_energy, nuclear_energy, dft_total_energy, nelec, entropy,
-            entropy_energy, omega, gradient, z, residual, self.rms(gradient),
-            self.rms([fk - hk for hk, fk in zip(h, fock)]))
+            auxiliary_mu, chemical_potential, gauge_shift, electronic_energy,
+            nuclear_energy, dft_total_energy, nelec, entropy, entropy_energy,
+            free_energy, omega, objective, gradient, z, residual,
+            self.rms(gradient), self.rms(mismatch))
 
     # ---- initialisation and checkpointing ---------------------------------
 
@@ -742,11 +854,16 @@ class GrandCanonicalKRKS:
             return
         values = {f'h_{k}': h.get() for k, h in enumerate(state.h_orth)}
         values.update({
-            'mu': self.mu, 'sigma': self.sigma, 'kpts': self.kpts,
+            'mu': state.chemical_potential, 'auxiliary_mu': state.auxiliary_mu,
+            'sigma': self.sigma, 'kpts': self.kpts,
             'weights': cp.asnumpy(self.weights), 'ranks': np.asarray(self.north),
             'x_dims': np.asarray([x.shape for x in self.x_ao2orth]),
             'fingerprint': self._checkpoint_fingerprint,
             'grand_potential': state.grand_potential,
+            'free_energy': state.free_energy,
+            'fixed_electron_number': self.fixed_electron_number,
+            'target_electron_number': (np.nan if self.target_electron_number is None
+                                       else self.target_electron_number),
             'electron_number': state.electron_number, 'cycle': cycle,
         })
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
@@ -888,9 +1005,9 @@ class GrandCanonicalKRKS:
               hi_state: Optional[_GCState], best: Optional[tuple[float, _GCState]],
               nfev: int) -> _LineSearchResult:
         c1, c2 = self.config.line_search_c1, self.config.line_search_c2
-        lo_phi = lo_state.grand_potential
+        lo_phi = lo_state.objective
         lo_dphi = self.inner(lo_state.gradient, direction)
-        hi_phi = np.inf if hi_state is None else hi_state.grand_potential
+        hi_phi = np.inf if hi_state is None else hi_state.objective
         hi_dphi = np.nan if hi_state is None else self.inner(hi_state.gradient, direction)
         for _ in range(self.config.line_search_zoom_evals):
             lower, upper = min(lo_a, hi_a), max(lo_a, hi_a)
@@ -902,13 +1019,13 @@ class GrandCanonicalKRKS:
                 break
             trial = self._trial(state0, direction, alpha)
             nfev += 1
-            phi = np.inf if trial is None else trial.grand_potential
+            phi = np.inf if trial is None else trial.objective
             if trial is None or phi > phi0 + c1 * alpha * dphi0 or phi >= lo_phi:
                 hi_a, hi_state, hi_phi, hi_dphi = alpha, trial, phi, np.nan if trial is None else self.inner(trial.gradient, direction)
                 continue
             dphi = self.inner(trial.gradient, direction)
             if phi <= phi0 + c1 * alpha * dphi0:
-                if best is None or phi < best[1].grand_potential:
+                if best is None or phi < best[1].objective:
                     best = (alpha, trial)
             if abs(dphi) <= c2 * abs(dphi0):
                 return _LineSearchResult(True, trial, alpha, nfev, True, False, 'strong Wolfe')
@@ -928,7 +1045,7 @@ class GrandCanonicalKRKS:
         if alpha_max < self.config.line_search_alpha_min:
             return _LineSearchResult(False, None, message='step cap below minimum')
         alpha = min(self.config.line_search_alpha_init, alpha_max)
-        phi0 = state.grand_potential
+        phi0 = state.objective
         c1, c2 = self.config.line_search_c1, self.config.line_search_c2
         previous_alpha, previous_state = 0.0, state
         best: Optional[tuple[float, _GCState]] = None
@@ -936,11 +1053,11 @@ class GrandCanonicalKRKS:
         for it in range(self.config.line_search_max_evals):
             trial = self._trial(state, direction, alpha)
             nfev += 1
-            phi = np.inf if trial is None else trial.grand_potential
+            phi = np.inf if trial is None else trial.objective
             armijo = trial is not None and phi <= phi0 + c1 * alpha * dphi0
-            if armijo and (best is None or phi < best[1].grand_potential):
+            if armijo and (best is None or phi < best[1].objective):
                 best = (alpha, trial)
-            if trial is None or not armijo or (it > 0 and phi >= previous_state.grand_potential):
+            if trial is None or not armijo or (it > 0 and phi >= previous_state.objective):
                 return self._zoom(state, direction, phi0, dphi0,
                                   previous_alpha, previous_state, alpha, trial, best, nfev)
             dphi = self.inner(trial.gradient, direction)
@@ -971,7 +1088,7 @@ class GrandCanonicalKRKS:
         for _ in range(self.config.line_search_max_evals):
             trial = self._trial(state, direction, alpha)
             nfev += 1
-            if trial is not None and trial.grand_potential <= state.grand_potential + self.config.line_search_c1 * alpha * dphi0:
+            if trial is not None and trial.objective <= state.objective + self.config.line_search_c1 * alpha * dphi0:
                 return _LineSearchResult(True, trial, alpha, nfev, False, True,
                                          'monotone Armijo fallback')
             alpha *= self.config.armijo_backtrack_factor
@@ -982,16 +1099,16 @@ class GrandCanonicalKRKS:
     def _metrics(self, state: _GCState, previous: Optional[_GCState]) -> tuple[float, float, float, float]:
         if previous is None:
             return np.inf, np.inf, np.inf, np.inf
-        delta_omega = state.grand_potential - previous.grand_potential
+        delta_objective = state.objective - previous.objective
         delta_nelec = abs(state.electron_number - previous.electron_number)
         density_change = self.rms(self.axpy(-1.0, previous.p_orth, state.p_orth))
-        return delta_omega, delta_nelec, density_change, abs(delta_omega)
+        return delta_objective, delta_nelec, density_change, abs(delta_objective)
 
     def _meets_convergence(self, state: _GCState, previous: Optional[_GCState]) -> bool:
         if previous is None:
             return state.grad_rms < self.config.conv_tol_grad_rms and state.residual_rms < self.config.conv_tol_residual_rms
-        delta_omega, delta_nelec, density_change, abs_delta_omega = self._metrics(state, previous)
-        return (abs_delta_omega < self.config.conv_tol_omega and
+        delta_objective, delta_nelec, density_change, abs_delta_objective = self._metrics(state, previous)
+        return (abs_delta_objective < self.config.conv_tol_omega and
                 state.grad_rms < self.config.conv_tol_grad_rms and
                 state.residual_rms < self.config.conv_tol_residual_rms and
                 density_change < self.config.conv_tol_density_rms and
@@ -1003,22 +1120,33 @@ class GrandCanonicalKRKS:
         mismatch = self.max_block_rms(self.axpy(-1.0, expected, accepted.h_orth))
         if mismatch > 1.0e-8:
             raise RuntimeError(f'accepted state is not the evaluated step (mismatch {mismatch:g})')
-        if accepted.grand_potential > state.grand_potential + self.config.line_search_c1 * alpha * dphi0 + 1.0e-12:
+        if accepted.objective > state.objective + self.config.line_search_c1 * alpha * dphi0 + 1.0e-12:
             raise RuntimeError('accepted line-search point does not satisfy Armijo decrease')
 
     def _record(self, cycle: int, old: _GCState, new: _GCState, line_search: _LineSearchResult,
                 dphi0: float, beta: float, restart_reason: str) -> None:
-        delta_omega, delta_nelec, density_change, _ = self._metrics(new, old)
+        delta_objective, delta_nelec, density_change, _ = self._metrics(new, old)
+        delta_omega = new.grand_potential - old.grand_potential
         self.history.append(IterationRecord(
-            cycle, new.grand_potential, new.dft_total_energy, -self.mu * new.electron_number,
+            cycle, new.grand_potential, new.dft_total_energy,
+            -new.chemical_potential * new.electron_number,
             new.entropy_energy, new.electron_number, delta_omega, delta_nelec,
             new.grad_rms, new.residual_rms, density_change, line_search.alpha, dphi0,
-            beta, restart_reason, line_search.nfev))
-        self.log.info('GC cycle %d  Omega = %.12g  E_DFT = %.12g  N = %.10g  '
-                      '|g|_rms = %.3g  |F-H|_rms = %.3g  alpha = %.3g',
-                      cycle, new.grand_potential, new.dft_total_energy,
-                      new.electron_number, new.grad_rms, new.residual_rms,
-                      line_search.alpha)
+            beta, restart_reason, line_search.nfev, new.free_energy,
+            new.chemical_potential, new.objective, delta_objective))
+        if self.fixed_electron_number:
+            self.log.info('Canonical cycle %d  A = %.12g  E_DFT = %.12g  '
+                          'N = %.10g  mu = %.12g  |g|_rms = %.3g  '
+                          '|F-H|_rms = %.3g  alpha = %.3g',
+                          cycle, new.free_energy, new.dft_total_energy,
+                          new.electron_number, new.chemical_potential,
+                          new.grad_rms, new.residual_rms, line_search.alpha)
+        else:
+            self.log.info('GC cycle %d  Omega = %.12g  E_DFT = %.12g  N = %.10g  '
+                          '|g|_rms = %.3g  |F-H|_rms = %.3g  alpha = %.3g',
+                          cycle, new.grand_potential, new.dft_total_energy,
+                          new.electron_number, new.grad_rms, new.residual_rms,
+                          line_search.alpha)
 
     def kernel(self, dm0: Any = None, h0: Any = None) -> GrandCanonicalResult:
         """Run safeguarded nonlinear-CG direct minimisation."""
@@ -1099,7 +1227,8 @@ class GrandCanonicalKRKS:
     def _finalize(self, state: _GCState, converged: bool, message: str,
                   niter: int, density_change: float) -> GrandCanonicalResult:
         coeff = [x @ u for x, u in zip(self.x_ao2orth, state.u)]
-        energy = [self.mu + value / self.beta for value in state.eigenvalues]
+        energy = [state.auxiliary_mu + value / self.beta - state.gauge_shift
+                  for value in state.eigenvalues]
         occ = [2.0 * q for q in state.occupations]
         mo_coeff = _stack_or_list(coeff)
         mo_energy = _stack_or_list(energy)
@@ -1109,30 +1238,38 @@ class GrandCanonicalKRKS:
         self.mf.mo_energy = mo_energy
         self.mf.mo_occ = mo_occ
         self.mf.e_tot = state.dft_total_energy
+        self.mf.free_energy = state.free_energy
         self.mf.grand_potential = state.grand_potential
         self.mf.electron_number_gc = state.electron_number
         self.mf.entropy_gc = state.entropy
         self.mf.entropy_energy_gc = state.entropy_energy
-        self.mf.mu_gc = self.mu
+        self.mu = state.chemical_potential
+        self.mf.mu_gc = state.chemical_potential
         self.mf.sigma_gc = self.sigma
+        self.mf.fixed_electron_number = self.fixed_electron_number
+        self.mf.target_electron_number = self.target_electron_number
         self.mf.h_aux_gc = self.copy_blocks(state.h_orth)
         self.mf.dm_gc = state.dm_ao
         if not hasattr(self.mf, 'scf_summary') or self.mf.scf_summary is None:
             self.mf.scf_summary = {}
         self.mf.scf_summary.update({
             'grand_potential': state.grand_potential,
+            'free_energy': state.free_energy,
             'electron_number_gc': state.electron_number,
             'entropy_gc': state.entropy,
             'entropy_energy_gc': state.entropy_energy,
-            'mu_gc': self.mu,
+            'mu_gc': state.chemical_potential,
             'sigma_gc': self.sigma,
+            'fixed_electron_number': self.fixed_electron_number,
         })
         return GrandCanonicalResult(
-            converged, message, niter, self.nfev, self.mu, self.sigma, self.beta,
+            converged, message, niter, self.nfev, state.chemical_potential,
+            self.sigma, self.beta,
             state.grand_potential, state.dft_total_energy, state.electronic_energy,
             state.nuclear_energy, state.entropy, state.entropy_energy,
             state.electron_number, self.copy_blocks(state.h_orth),
             self.copy_blocks(state.fock_orth), state.dm_ao, self.copy_blocks(state.p_orth),
             self.copy_blocks(state.occupations), mo_coeff, mo_occ, mo_energy,
             state.grad_rms, state.residual_rms, density_change, list(self.history),
-            state.veff, self.config.checkpoint_path)
+            state.veff, self.config.checkpoint_path, state.free_energy,
+            self.fixed_electron_number, self.target_electron_number)
