@@ -1,9 +1,10 @@
-"""Grand-canonical direct minimisation for periodic restricted Kohn--Sham DFT.
+"""Finite-temperature direct minimisation for periodic restricted Kohn--Sham DFT.
 
 This module deliberately does not hook into the ordinary SCF kernel.  The
 optimisation variables are Hermitian matrices in a fixed, orthonormal AO
-coordinate system and the supplied :class:`KRKS` object remains the
-authoritative evaluator of the DFT functional.
+coordinate system, the electron ensemble may be fixed-mu or fixed-N, and the
+supplied :class:`KRKS` object remains the authoritative evaluator of the DFT
+functional.
 """
 
 from __future__ import annotations
@@ -273,10 +274,12 @@ def fermi_divided_difference(gamma: cp.ndarray, occupations: cp.ndarray,
 
 
 class GrandCanonicalKRKS:
-    """Minimise the finite-temperature KRKS grand potential at fixed ``mu``.
+    """Minimise finite-temperature KRKS at fixed ``mu`` or electron number.
 
     The object composes a regular GPU4PySCF ``KRKS`` instance.  It intentionally
-    never invokes orbital-rotation or CIAH machinery.
+    never invokes orbital-rotation or CIAH machinery.  Pass ``electron_number``
+    instead of ``mu`` to minimize the Helmholtz free energy while solving for
+    the chemical potential at every evaluation.
     """
 
     def __init__(self, mf: Any, mu: Optional[float] = None,
@@ -1149,7 +1152,7 @@ class GrandCanonicalKRKS:
                           line_search.alpha)
 
     def kernel(self, dm0: Any = None, h0: Any = None) -> GrandCanonicalResult:
-        """Run safeguarded nonlinear-CG direct minimisation."""
+        """Run safeguarded fixed-mu or fixed-electron nonlinear-CG minimisation."""
         self.history = []
         self.nfev = 0
         state = self.evaluate(self._initial_h(dm0, h0))
