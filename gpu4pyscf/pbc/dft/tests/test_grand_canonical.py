@@ -96,7 +96,8 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             diis_max_delta_nelec=5.0e-2,
             line_search_nelec_guard_residual_rms=1.0e-2,
             line_search_max_delta_nelec=1.0,
-            line_search_nelec_guard_max_delta_nelec=5.0e-2):
+            line_search_nelec_guard_max_delta_nelec=5.0e-2,
+            canonical_continuation=False):
     f0 = cp.asarray([[[-0.7, 0.12j], [-0.12j, 0.3]]], dtype=cp.complex128)
     mf = _FixedFockKRKS(f0)
     config = GrandCanonicalConfig(
@@ -120,6 +121,7 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
         line_search_max_delta_nelec=line_search_max_delta_nelec,
         line_search_nelec_guard_max_delta_nelec=(
             line_search_nelec_guard_max_delta_nelec),
+        canonical_continuation=canonical_continuation,
     )
     return mf, GrandCanonicalKRKS(
         mf, mu=mu, sigma=0.15, config=config,
@@ -437,6 +439,17 @@ def test_residual_diis_trust_ratio_updates_next_damping():
     assert ratio == pytest.approx(0.16)
     assert next_damping == pytest.approx(0.125)
 
+    # A high agreement ratio alone must not expand a trust radius that made
+    # negligible absolute progress.
+    small_damping = 0.005
+    small_prediction = solver._diis_predicted_residual_rms(
+        state, small_damping)
+    stagnant = replace(state, residual_rms=0.99 * state.residual_rms)
+    next_damping, ratio = solver._next_diis_damping(
+        state, stagnant, small_prediction, small_damping, small_damping)
+    assert ratio == pytest.approx(2.0)
+    assert next_damping == pytest.approx(small_damping)
+
     with pytest.raises(ValueError, match='trust ratios'):
         config = GrandCanonicalConfig(
             diis_trust_shrink_ratio=0.8,
@@ -444,6 +457,29 @@ def test_residual_diis_trust_ratio_updates_next_damping():
         GrandCanonicalKRKS(_FixedFockKRKS([
             cp.eye(2, dtype=cp.complex128)]), mu=-0.1, sigma=0.15,
             config=config)
+
+
+def test_diis_backtracking_stops_when_local_secant_cannot_reduce_residual():
+    _, solver = _solver(diis_switch_residual_rms=1.0e-3)
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    target = solver.axpy(
+        0.1, [cp.eye(2, dtype=cp.complex128)], state.h_orth)
+    calls = []
+
+    def trial(current, direction, alpha):
+        calls.append(alpha)
+        factor = 1.01 if len(calls) == 1 else 1.005
+        return replace(current, residual_rms=factor * current.residual_rms)
+
+    solver._trial = trial
+    accepted, _, reason, rejected = solver._try_diis_target(
+        state, target, starting_damping=0.1, max_backtracks=8)
+    assert accepted is None
+    assert len(calls) == 2
+    assert 'secant predicts no acceptable residual' in reason
+    assert rejected is not None
 
 
 def test_residual_diis_repairs_rejected_model_by_pruning_oldest_vector():
@@ -597,6 +633,35 @@ def test_residual_diis_polishes_fixed_fock_for_both_direct_optimizers():
         assert result.residual_rms < solver.config.conv_tol_residual_rms
         if optimizer == 'lbfgs':
             assert solver._lbfgs_history == []
+
+
+def test_automatic_canonical_continuation_finds_fixed_mu_electron_number():
+    mf, solver = _solver(
+        mu=-0.1, optimizer='lbfgs', lbfgs_initial_metric='scalar',
+        canonical_continuation=True)
+    h0 = [cp.asarray([[0.25, 0.18 - 0.07j],
+                      [0.18 + 0.07j, -0.15]])]
+    expected_nelec = solver._electron_number_at_mu(solver.hcore_ao, solver.mu)
+    result = solver.kernel(h0=h0)
+    assert result.converged, result.message
+    assert not result.fixed_electron_number
+    assert result.canonical_continuation_steps >= 1
+    assert result.canonical_continuation_evaluations >= 1
+    assert np.isfinite(result.canonical_continuation_mu_error)
+    assert abs(result.canonical_continuation_delta_nelec) <= (
+        solver.config.canonical_continuation_handoff_delta_nelec)
+    assert abs(result.electron_number - expected_nelec) < 1.0e-10
+    assert result.nfev == mf.veff_calls
+    assert result.nfev > result.canonical_continuation_evaluations
+
+
+def test_fock_evaluation_count_includes_fresh_initial_guess_build():
+    mf, solver = _solver(canonical_continuation=True)
+    result = solver.kernel()
+    assert result.converged, result.message
+    assert result.nfev == mf.veff_calls
+    assert result.nfev == (
+        1 + result.canonical_continuation_evaluations + 1)
 
 
 def test_fermi_inverse_metric_maps_exact_gradient_to_z():
