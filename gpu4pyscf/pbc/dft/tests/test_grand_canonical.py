@@ -792,7 +792,7 @@ def test_lbfgs_projected_pair_requires_reliable_response_model():
         fallback,
         nelec_projection_response_fallback=False,
         nelec_trust_ratio=(
-            solver.config.line_search_nelec_trust_bad_ratio - 1.0e-3))
+            solver.config.line_search_nelec_trust_good_ratio - 1.0e-3))
     history = [object()]
     info = solver._update_lbfgs_history(
         history, state, state, unreliable)
