@@ -173,6 +173,15 @@ class GrandCanonicalConfig:
     nlcg_residual_filter_max_relative_increase: float = 0.0
     nlcg_residual_filter_min_relative_reduction: float = 2.0e-2
     nlcg_residual_filter_objective_noise: float = 1.0e-10
+    # Once the residual filter is active, a unit trial is usually much larger
+    # than the useful local step.  This opt-in warm start tries a modest first
+    # step, then reuses the last accepted step within conservative bounds.
+    # The separate evaluation cap applies only in this residual-polish regime.
+    nlcg_residual_filter_warm_start: bool = False
+    nlcg_residual_filter_initial_alpha: float = 1.0e-1
+    nlcg_residual_filter_alpha_min: float = 2.0e-2
+    nlcg_residual_filter_alpha_max: float = 2.0e-1
+    nlcg_residual_filter_max_evals: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -633,6 +642,7 @@ class GrandCanonicalKRKS:
         self.max_direction_projection_correction = 0.0
         self.nresidual_filter_acceptances = 0
         self.nresidual_filter_rejections = 0
+        self._nlcg_residual_previous_alpha: Optional[float] = None
         self._prepare_fixed_basis_data()
         bytes_per_pair = 2 * sum(
             n * n * int(x.dtype.itemsize)
@@ -840,7 +850,8 @@ class GrandCanonicalKRKS:
         for name in ('line_search_nelec_feasible_alpha',
                      'nlcg_exact_gradient_blend',
                      'nlcg_exact_gradient_polish',
-                     'nlcg_reset_on_preprojection'):
+                     'nlcg_reset_on_preprojection',
+                     'nlcg_residual_filter_warm_start'):
             if not isinstance(getattr(self.config, name), bool):
                 raise TypeError(f'{name} must be boolean')
         filter_rms = self.config.nlcg_residual_filter_rms
@@ -868,6 +879,36 @@ class GrandCanonicalKRKS:
             raise ValueError(
                 'nlcg_residual_filter_objective_noise must be finite and '
                 'nonnegative')
+        warm_alpha_names = (
+            'nlcg_residual_filter_initial_alpha',
+            'nlcg_residual_filter_alpha_min',
+            'nlcg_residual_filter_alpha_max',
+        )
+        for name in warm_alpha_names:
+            value = getattr(self.config, name)
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f'{name} must be finite and positive')
+        warm_min = self.config.nlcg_residual_filter_alpha_min
+        warm_initial = self.config.nlcg_residual_filter_initial_alpha
+        warm_max = self.config.nlcg_residual_filter_alpha_max
+        if not warm_min <= warm_initial <= warm_max:
+            raise ValueError(
+                'residual-filter alpha bounds must satisfy alpha_min <= '
+                'initial_alpha <= alpha_max')
+        filter_max_evals = self.config.nlcg_residual_filter_max_evals
+        if (filter_max_evals is not None and
+                (not isinstance(filter_max_evals, int) or
+                 isinstance(filter_max_evals, bool) or
+                 filter_max_evals < 1)):
+            raise ValueError(
+                'nlcg_residual_filter_max_evals must be a positive integer '
+                'or None')
+        if (filter_rms is None and
+                (self.config.nlcg_residual_filter_warm_start or
+                 filter_max_evals is not None)):
+            raise ValueError(
+                'residual-filter warm starts and evaluation caps require '
+                'nlcg_residual_filter_rms')
 
     def _validate_lbfgs_config(self) -> None:
         if (not isinstance(self.config.lbfgs_history_size, int) or
@@ -2845,6 +2886,21 @@ class GrandCanonicalKRKS:
                 trial.residual_rms <= strong_limit + tolerance,
                 ratio)
 
+    def _nlcg_residual_alpha_init(
+            self, state: _GCState) -> Optional[float]:
+        """Return the opt-in HZ warm start in the residual-polish regime."""
+        threshold = self.config.nlcg_residual_filter_rms
+        if (not self.config.nlcg_residual_filter_warm_start or
+                threshold is None or state.residual_rms > threshold):
+            return None
+        alpha = self._nlcg_residual_previous_alpha
+        if alpha is None or not np.isfinite(alpha) or alpha <= 0.0:
+            alpha = self.config.nlcg_residual_filter_initial_alpha
+        return float(np.clip(
+            alpha,
+            self.config.nlcg_residual_filter_alpha_min,
+            self.config.nlcg_residual_filter_alpha_max))
+
     def _finish_line_search(
             self, result: _LineSearchResult, start_nfev: int,
             cheap_start: int, reduction_start: int,
@@ -2993,6 +3049,12 @@ class GrandCanonicalKRKS:
         filter_active = (
             self.config.nlcg_residual_filter_rms is not None and
             state.residual_rms <= self.config.nlcg_residual_filter_rms)
+        maximum_evals = self.config.hager_zhang_max_evals
+        if (filter_active and
+                self.config.nlcg_residual_filter_max_evals is not None):
+            maximum_evals = min(
+                maximum_evals,
+                self.config.nlcg_residual_filter_max_evals)
 
         def finish(value: _LineSearchResult) -> _LineSearchResult:
             ratio = value.residual_filter_ratio
@@ -3055,8 +3117,7 @@ class GrandCanonicalKRKS:
             if alpha in cache:
                 return cache[alpha]
             if (trial_count >= self.config.line_search_max_trials or
-                    self.nfev - start_nfev >=
-                    self.config.hager_zhang_max_evals):
+                    self.nfev - start_nfev >= maximum_evals):
                 return None
             trial = self._trial(
                 state, direction, alpha, allow_nelec_projection=False,
@@ -3266,8 +3327,7 @@ class GrandCanonicalKRKS:
                         high.alpha == old_high.alpha):
                     break
                 if (trial_count >= self.config.line_search_max_trials or
-                        self.nfev - start_nfev >=
-                        self.config.hager_zhang_max_evals):
+                        self.nfev - start_nfev >= maximum_evals):
                     break
 
         if best_armijo is not None:
@@ -3413,6 +3473,7 @@ class GrandCanonicalKRKS:
 
     def _armijo_fallback(
             self, state: _GCState, direction: Sequence, *,
+            alpha_init: Optional[float] = None,
             alpha_cap_override: Optional[float] = None,
             allow_nelec_projection: bool = True,
             nelec_limit_override: Optional[float] = None
@@ -3460,7 +3521,13 @@ class GrandCanonicalKRKS:
         if dphi0 >= 0.0:
             return finish(_LineSearchResult(
                 False, None, message='fallback residual is not downhill'))
-        alpha = min(1.0, alpha_max)
+        if alpha_init is None:
+            alpha = min(1.0, alpha_max)
+        else:
+            if not np.isfinite(alpha_init) or alpha_init <= 0.0:
+                raise ValueError(
+                    'fallback initial alpha must be finite and positive')
+            alpha = min(float(alpha_init), alpha_max)
         trial_count = 0
         while (trial_count < self.config.line_search_max_trials and
                self.nfev - start_nfev <
@@ -4168,6 +4235,7 @@ class GrandCanonicalKRKS:
         self.history = []
         self.nfev = 0
         self._reset_run_diagnostics()
+        self._nlcg_residual_previous_alpha = None
         state = self.evaluate(self._initial_h(dm0, h0))
         previous: Optional[_GCState] = None
         direction = self.copy_blocks(state.residual)
@@ -4227,8 +4295,10 @@ class GrandCanonicalKRKS:
                 if fixed_direction_projection and
                 np.isfinite(prepared.trust_radius) else None)
             dphi0 = self.inner(state.gradient, direction)
+            alpha_init = self._nlcg_residual_alpha_init(state)
             line_search = self._line_search(
                 state, direction,
+                alpha_init=alpha_init,
                 alpha_cap_override=prepared.alpha_cap,
                 allow_nelec_projection=not fixed_direction_projection,
                 nelec_limit_override=nelec_limit)
@@ -4254,6 +4324,9 @@ class GrandCanonicalKRKS:
                     np.isfinite(prepared.trust_radius) else None)
                 fallback_line_search = self._armijo_fallback(
                     state, direction,
+                    alpha_init=(
+                        None if alpha_init is None else
+                        alpha_init * self.config.armijo_backtrack_factor),
                     alpha_cap_override=prepared.alpha_cap,
                     allow_nelec_projection=not fixed_direction_projection,
                     nelec_limit_override=nelec_limit)
@@ -4265,6 +4338,8 @@ class GrandCanonicalKRKS:
             if not line_search.success or line_search.state is None:
                 message = 'line-search failure: ' + line_search.message
                 break
+            if alpha_init is not None:
+                self._nlcg_residual_previous_alpha = line_search.alpha
             new_state = line_search.state
             line_search = self._decorate_direction_projection_result(
                 state, new_state, line_search, prepared)
