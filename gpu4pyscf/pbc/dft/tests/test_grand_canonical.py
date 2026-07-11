@@ -686,7 +686,8 @@ def test_lbfgs_opt_in_adds_actual_projected_secant_pair():
         'accepted occupation-projected Armijo point', True,
         actual_step=solver.copy_blocks(step),
         nelec_projection_applied=True,
-        nelec_projection_mode='fermi-response')
+        nelec_projection_mode='fermi-response',
+        nelec_trust_ratio=0.9)
 
     history = []
     info = solver._update_lbfgs_history(
@@ -728,7 +729,8 @@ def test_lbfgs_projected_bad_curvature_preserves_valid_history():
     projected = _LineSearchResult(
         True, good, 1.0, 1, False, True, 'projected', True,
         actual_step=solver.copy_blocks(step),
-        nelec_projection_applied=True)
+        nelec_projection_applied=True,
+        nelec_trust_ratio=0.9)
     history = []
     assert solver._update_lbfgs_history(
         history, old, good, projected)['pair_added']
@@ -767,6 +769,37 @@ def test_lbfgs_projected_bad_curvature_preserves_valid_history():
     assert 'lacks actual step' in info['action']
 
 
+def test_lbfgs_projected_pair_requires_reliable_response_model():
+    _, solver = _solver(
+        optimizer='lbfgs', lbfgs_use_projected_pairs=True)
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    fallback = _LineSearchResult(
+        True, state, 1.0, 1, False, True, 'projected', True,
+        actual_step=solver.zeros_like_blocks(state.h_orth),
+        nelec_projection_applied=True,
+        nelec_projection_mode='fermi-response',
+        nelec_trust_ratio=0.9,
+        nelec_projection_response_fallback=True)
+    history = [object()]
+    info = solver._update_lbfgs_history(
+        history, state, state, fallback)
+    assert history == []
+    assert 'response-fallback' in info['action']
+
+    unreliable = replace(
+        fallback,
+        nelec_projection_response_fallback=False,
+        nelec_trust_ratio=(
+            solver.config.line_search_nelec_trust_good_ratio - 1.0e-3))
+    history = [object()]
+    info = solver._update_lbfgs_history(
+        history, state, state, unreliable)
+    assert history == []
+    assert 'unreliable projected model' in info['action']
+
+
 def test_lbfgs_kernel_uses_projected_pair_on_next_cycle(monkeypatch):
     _, solver = _solver(
         optimizer='lbfgs', lbfgs_initial_metric='scalar',
@@ -795,7 +828,8 @@ def test_lbfgs_kernel_uses_projected_pair_on_next_cycle(monkeypatch):
             True, new, 1.0, 1, False, True, 'projected', True,
             actual_step=solver.copy_blocks(step),
             nelec_projection_applied=True,
-            nelec_projection_mode='fermi-response')
+            nelec_projection_mode='fermi-response',
+            nelec_trust_ratio=0.9)
 
     monkeypatch.setattr(solver, '_line_search', accepted_projected_step)
     result = solver._kernel_lbfgs(h0=h0)
