@@ -169,6 +169,10 @@ class GrandCanonicalConfig:
     nlcg_exact_gradient_blend: bool = True
     nlcg_exact_gradient_polish: bool = True
     nlcg_reset_on_preprojection: bool = True
+    nlcg_residual_filter_rms: Optional[float] = None
+    nlcg_residual_filter_max_relative_increase: float = 0.0
+    nlcg_residual_filter_min_relative_reduction: float = 2.0e-2
+    nlcg_residual_filter_objective_noise: float = 1.0e-10
 
 
 @dataclass(frozen=True)
@@ -239,6 +243,10 @@ class IterationRecord:
     direction_projection_response_fallback: bool = False
     direction_projection_trust_radius: float = np.nan
     direction_projection_trust_ratio: float = np.nan
+    residual_filter_active: bool = False
+    residual_filter_qualified: bool = False
+    residual_filter_ratio: float = np.nan
+    residual_filter_rejections: int = 0
 
 
 @dataclass(frozen=True)
@@ -309,6 +317,10 @@ class _LineSearchResult:
     direction_projection_response_fallback: bool = False
     direction_projection_trust_radius: float = np.nan
     direction_projection_trust_ratio: float = np.nan
+    residual_filter_active: bool = False
+    residual_filter_qualified: bool = False
+    residual_filter_ratio: float = np.nan
+    residual_filter_rejections: int = 0
 
 
 @dataclass(frozen=True)
@@ -428,6 +440,8 @@ class GrandCanonicalResult:
     direction_projection_acceptances: int = 0
     direction_projection_fallbacks: int = 0
     max_direction_projection_correction: float = 0.0
+    residual_filter_acceptances: int = 0
+    residual_filter_rejections: int = 0
 
 
 def _as_float(value: Any, name: str = 'value') -> float:
@@ -577,6 +591,14 @@ class GrandCanonicalKRKS:
                     'Hager-Zhang with occupation projection requires the '
                     'NLCG fixed-direction projection strategy; post-trial '
                     'projection is not a one-dimensional line search')
+        if self.config.nlcg_residual_filter_rms is not None:
+            if (self.config.optimizer != 'nlcg' or
+                    self.config.line_search_method != 'hager-zhang' or
+                    self.config.nlcg_nelec_projection_strategy !=
+                    'direction'):
+                raise ValueError(
+                    'the NLCG residual filter requires Hager-Zhang and the '
+                    'fixed-direction projection strategy')
         self.verbose = (getattr(mf, 'verbose', logger.NOTE)
                         if self.config.verbose is None else self.config.verbose)
         self.log = logger.new_logger(mf, self.verbose)
@@ -609,6 +631,8 @@ class GrandCanonicalKRKS:
         self.ndirection_projection_acceptances = 0
         self.ndirection_projection_fallbacks = 0
         self.max_direction_projection_correction = 0.0
+        self.nresidual_filter_acceptances = 0
+        self.nresidual_filter_rejections = 0
         self._prepare_fixed_basis_data()
         bytes_per_pair = 2 * sum(
             n * n * int(x.dtype.itemsize)
@@ -819,6 +843,31 @@ class GrandCanonicalKRKS:
                      'nlcg_reset_on_preprojection'):
             if not isinstance(getattr(self.config, name), bool):
                 raise TypeError(f'{name} must be boolean')
+        filter_rms = self.config.nlcg_residual_filter_rms
+        if filter_rms is not None:
+            filter_rms = _as_float(
+                filter_rms, 'nlcg_residual_filter_rms')
+            if filter_rms <= 0.0:
+                raise ValueError(
+                    'nlcg_residual_filter_rms must be positive when enabled')
+            self.config.nlcg_residual_filter_rms = filter_rms
+        increase = self.config.nlcg_residual_filter_max_relative_increase
+        if (not np.isfinite(increase) or
+                not 0.0 <= increase < 1.0):
+            raise ValueError(
+                'nlcg_residual_filter_max_relative_increase must lie in '
+                '[0, 1)')
+        reduction = self.config.nlcg_residual_filter_min_relative_reduction
+        if (not np.isfinite(reduction) or
+                not 0.0 < reduction < 1.0):
+            raise ValueError(
+                'nlcg_residual_filter_min_relative_reduction must lie '
+                'strictly between 0 and 1')
+        filter_noise = self.config.nlcg_residual_filter_objective_noise
+        if not np.isfinite(filter_noise) or filter_noise < 0.0:
+            raise ValueError(
+                'nlcg_residual_filter_objective_noise must be finite and '
+                'nonnegative')
 
     def _validate_lbfgs_config(self) -> None:
         if (not isinstance(self.config.lbfgs_history_size, int) or
@@ -2289,7 +2338,7 @@ class GrandCanonicalKRKS:
                 self.ncheap_nelec_evaluations += 1
             return cache[key]
 
-        if abs(delta_nelec(requested)) <= maximum:
+        if abs(delta_nelec(requested)) <= maximum + 1.0e-10:
             return requested, False
 
         high = requested
@@ -2300,7 +2349,7 @@ class GrandCanonicalKRKS:
             self.ncheap_nelec_alpha_reductions += 1
             if alpha < self.config.line_search_alpha_min:
                 return 0.0, True
-            if abs(delta_nelec(alpha)) <= maximum:
+            if abs(delta_nelec(alpha)) <= maximum + 1.0e-10:
                 low = alpha
                 break
             high = alpha
@@ -2353,7 +2402,7 @@ class GrandCanonicalKRKS:
             raw_delta = raw_nelec - state.electron_number
             self.max_raw_delta_nelec = max(
                 self.max_raw_delta_nelec, abs(raw_delta))
-            if abs(raw_delta) <= maximum:
+            if abs(raw_delta) <= maximum + 1.0e-10:
                 return _PreparedDirection(
                     direction=self.copy_blocks(direction),
                     alpha_cap=endpoint_scale,
@@ -2440,6 +2489,7 @@ class GrandCanonicalKRKS:
             if ratio < self.config.line_search_nelec_trust_bad_ratio:
                 self._shrink_nelec_trust_radius(prepared.trust_radius)
             elif (ratio >= self.config.line_search_nelec_trust_good_ratio and
+                  not result.residual_filter_qualified and
                   abs(accepted_delta) >= 0.8 * prepared.trust_radius and
                   self.config.line_search_nelec_trust_expand > 1.0):
                 self._nelec_trust_radius = min(
@@ -2671,7 +2721,8 @@ class GrandCanonicalKRKS:
                 state, use_adaptive_radius=projection_enabled)
                 if nelec_limit_override is None else
                 float(nelec_limit_override))
-            if abs(raw_delta) > maximum and projection_enabled:
+            if (abs(raw_delta) > maximum + 1.0e-10 and
+                    projection_enabled):
                 target = (state.electron_number +
                           np.copysign(maximum, raw_delta))
                 candidate, parameter, response_fallback = (
@@ -2723,7 +2774,7 @@ class GrandCanonicalKRKS:
                     return None
                 return self.evaluate(candidate)
 
-            if abs(raw_delta) > maximum:
+            if abs(raw_delta) > maximum + 1.0e-10:
                 self._last_trial_rejected_by_nelec = True
                 self.ncheap_nelec_reject += 1
                 self._last_trial_info = _TrialInfo(
@@ -2768,6 +2819,32 @@ class GrandCanonicalKRKS:
         except (FloatingPointError, ZeroDivisionError):
             return None
 
+    def _residual_filter_metrics(
+            self, old: _GCState,
+            trial: Optional[_GCState]) -> tuple[bool, bool, bool, float]:
+        threshold = self.config.nlcg_residual_filter_rms
+        active = (
+            threshold is not None and old.residual_rms <= threshold)
+        if not active or trial is None:
+            return active, not active, False, np.nan
+        ratio = (trial.residual_rms / old.residual_rms
+                 if old.residual_rms > 0.0 else np.inf)
+        tolerance = 32.0 * np.finfo(float).eps * max(
+            1.0, old.residual_rms, trial.residual_rms)
+        bounded_limit = min(
+            threshold,
+            (1.0 +
+             self.config.nlcg_residual_filter_max_relative_increase) *
+            old.residual_rms)
+        strong_limit = (
+            (1.0 -
+             self.config.nlcg_residual_filter_min_relative_reduction) *
+            old.residual_rms)
+        return (True,
+                trial.residual_rms <= bounded_limit + tolerance,
+                trial.residual_rms <= strong_limit + tolerance,
+                ratio)
+
     def _finish_line_search(
             self, result: _LineSearchResult, start_nfev: int,
             cheap_start: int, reduction_start: int,
@@ -2798,6 +2875,9 @@ class GrandCanonicalKRKS:
             cheap_nelec_alpha_reductions=(
                 primary.cheap_nelec_alpha_reductions +
                 fallback.cheap_nelec_alpha_reductions),
+            residual_filter_rejections=(
+                primary.residual_filter_rejections +
+                fallback.residual_filter_rejections),
             message=detail)
 
     def _zoom(
@@ -2909,8 +2989,23 @@ class GrandCanonicalKRKS:
         start_nfev = self.nfev
         cheap_start = self.ncheap_nelec_evaluations
         reduction_start = self.ncheap_nelec_alpha_reductions
+        filter_rejection_start = self.nresidual_filter_rejections
+        filter_active = (
+            self.config.nlcg_residual_filter_rms is not None and
+            state.residual_rms <= self.config.nlcg_residual_filter_rms)
 
         def finish(value: _LineSearchResult) -> _LineSearchResult:
+            ratio = value.residual_filter_ratio
+            if (value.state is not None and filter_active and
+                    not np.isfinite(ratio)):
+                ratio = (value.state.residual_rms / state.residual_rms
+                         if state.residual_rms > 0.0 else np.inf)
+            value = replace(
+                value, residual_filter_active=filter_active,
+                residual_filter_ratio=ratio,
+                residual_filter_rejections=(
+                    self.nresidual_filter_rejections -
+                    filter_rejection_start))
             return self._finish_line_search(
                 value, start_nfev, cheap_start, reduction_start,
                 'hager-zhang')
@@ -2951,6 +3046,7 @@ class GrandCanonicalKRKS:
                 0.0, state, phi0, dphi0, _TrialInfo(), False, False)}
         trial_count = 0
         best_armijo: Optional[_HZPoint] = None
+        residual_vetoed: set[float] = set()
 
         def evaluate(alpha: float) -> Optional[_HZPoint]:
             nonlocal trial_count, best_armijo
@@ -2977,8 +3073,11 @@ class GrandCanonicalKRKS:
             point = _HZPoint(
                 alpha, trial, phi, dphi, info, charge_boundary, failed)
             cache[alpha] = point
+            _, bounded, _, _ = self._residual_filter_metrics(
+                state, trial)
             if (not failed and
                     phi <= phi0 + delta * alpha * dphi0 and
+                    bounded and
                     (best_armijo is None or phi < best_armijo.phi)):
                 best_armijo = point
             return point
@@ -3004,18 +3103,40 @@ class GrandCanonicalKRKS:
                 noise > 0.0 and point.phi <= threshold and
                 point.dphi >= sigma * dphi0 and
                 point.dphi <= (2.0 * delta - 1.0) * dphi0)
+            active, bounded, strong, residual_ratio = (
+                self._residual_filter_metrics(state, point.state))
+            if active and (ordinary or approximate) and not bounded:
+                if point.alpha not in residual_vetoed:
+                    residual_vetoed.add(point.alpha)
+                    self.nresidual_filter_rejections += 1
+                ordinary = approximate = False
             if ordinary:
                 return finish(_LineSearchResult(
                     True, point.state, point.alpha,
                     weak_wolfe=True, curvature_qualified=True,
-                    message='Hager-Zhang ordinary weak Wolfe'))
+                    message='Hager-Zhang ordinary weak Wolfe',
+                    residual_filter_ratio=residual_ratio))
             if approximate:
                 return finish(_LineSearchResult(
                     True, point.state, point.alpha,
                     weak_wolfe=True, approximate_wolfe=True,
                     curvature_qualified=True,
                     objective_allowance=noise,
-                    message='Hager-Zhang approximate Wolfe'))
+                    message='Hager-Zhang approximate Wolfe',
+                    residual_filter_ratio=residual_ratio))
+            if (active and strong and
+                    point.phi <= phi0 +
+                    self.config.nlcg_residual_filter_objective_noise):
+                self.nresidual_filter_acceptances += 1
+                return finish(_LineSearchResult(
+                    True, point.state, point.alpha,
+                    force_restart=True,
+                    objective_allowance=(
+                        self.config.nlcg_residual_filter_objective_noise),
+                    message='accepted residual-qualified Hager-Zhang point',
+                    residual_filter_active=True,
+                    residual_filter_qualified=True,
+                    residual_filter_ratio=residual_ratio))
             return None
 
         def refine_interval(
@@ -3299,8 +3420,23 @@ class GrandCanonicalKRKS:
         start_nfev = self.nfev
         cheap_start = self.ncheap_nelec_evaluations
         reduction_start = self.ncheap_nelec_alpha_reductions
+        filter_rejection_start = self.nresidual_filter_rejections
+        filter_active = (
+            self.config.nlcg_residual_filter_rms is not None and
+            state.residual_rms <= self.config.nlcg_residual_filter_rms)
 
         def finish(value: _LineSearchResult) -> _LineSearchResult:
+            ratio = value.residual_filter_ratio
+            if (value.state is not None and filter_active and
+                    not np.isfinite(ratio)):
+                ratio = (value.state.residual_rms / state.residual_rms
+                         if state.residual_rms > 0.0 else np.inf)
+            value = replace(
+                value, residual_filter_active=filter_active,
+                residual_filter_ratio=ratio,
+                residual_filter_rejections=(
+                    self.nresidual_filter_rejections -
+                    filter_rejection_start))
             return self._finish_line_search(
                 value, start_nfev, cheap_start, reduction_start, 'armijo')
 
@@ -3351,12 +3487,31 @@ class GrandCanonicalKRKS:
                 if alpha < self.config.line_search_alpha_min:
                     break
                 continue
-            if (trial is not None and
-                    trial.objective <= state.objective +
-                    self.config.line_search_c1 * alpha * dphi0):
+            armijo = (
+                trial is not None and
+                trial.objective <= state.objective +
+                self.config.line_search_c1 * alpha * dphi0)
+            active, bounded, strong, residual_ratio = (
+                self._residual_filter_metrics(state, trial))
+            if active and armijo and not bounded:
+                self.nresidual_filter_rejections += 1
+            elif armijo:
                 return finish(_LineSearchResult(
                     True, trial, alpha, force_restart=True,
-                    message='monotone Armijo fallback'))
+                    message='monotone Armijo fallback',
+                    residual_filter_ratio=residual_ratio))
+            elif (active and strong and trial is not None and
+                  trial.objective <= state.objective +
+                  self.config.nlcg_residual_filter_objective_noise):
+                self.nresidual_filter_acceptances += 1
+                return finish(_LineSearchResult(
+                    True, trial, alpha, force_restart=True,
+                    objective_allowance=(
+                        self.config.nlcg_residual_filter_objective_noise),
+                    message='residual-qualified Armijo fallback',
+                    residual_filter_active=True,
+                    residual_filter_qualified=True,
+                    residual_filter_ratio=residual_ratio))
             alpha *= self.config.armijo_backtrack_factor
             if alpha < self.config.line_search_alpha_min:
                 break
@@ -3400,7 +3555,19 @@ class GrandCanonicalKRKS:
         mismatch = self.max_block_rms(self.axpy(-1.0, expected, accepted.h_orth))
         if mismatch > 1.0e-8:
             raise RuntimeError(f'accepted state is not the evaluated step (mismatch {mismatch:g})')
-        if line_search.approximate_wolfe:
+        if line_search.residual_filter_qualified:
+            active, _, strong, _ = self._residual_filter_metrics(
+                state, accepted)
+            if not active or not strong:
+                raise RuntimeError(
+                    'accepted residual-qualified point does not meet its '
+                    'residual reduction')
+            if (accepted.objective > state.objective +
+                    line_search.objective_allowance + 1.0e-12):
+                raise RuntimeError(
+                    'accepted residual-qualified point exceeds its absolute '
+                    'objective allowance')
+        elif line_search.approximate_wolfe:
             if (accepted.objective > state.objective +
                     line_search.objective_allowance + 1.0e-12):
                 raise RuntimeError(
@@ -3500,7 +3667,13 @@ class GrandCanonicalKRKS:
             direction_projection_trust_radius=(
                 line_search.direction_projection_trust_radius),
             direction_projection_trust_ratio=(
-                line_search.direction_projection_trust_ratio)))
+                line_search.direction_projection_trust_ratio),
+            residual_filter_active=line_search.residual_filter_active,
+            residual_filter_qualified=(
+                line_search.residual_filter_qualified),
+            residual_filter_ratio=line_search.residual_filter_ratio,
+            residual_filter_rejections=(
+                line_search.residual_filter_rejections)))
         if self.fixed_electron_number:
             self.log.info('Canonical cycle %d  A = %.12g  E_DFT = %.12g  '
                           'N = %.10g  mu = %.12g  |g|_rms = %.3g  '
@@ -3597,6 +3770,8 @@ class GrandCanonicalKRKS:
         self.ndirection_projection_acceptances = 0
         self.ndirection_projection_fallbacks = 0
         self.max_direction_projection_correction = 0.0
+        self.nresidual_filter_acceptances = 0
+        self.nresidual_filter_rejections = 0
 
     def _canonical_continuation_config(
             self, residual_tolerance: float,
@@ -4367,6 +4542,10 @@ class GrandCanonicalKRKS:
             self.ndirection_projection_fallbacks)
         self.mf.max_direction_projection_correction_gc = (
             self.max_direction_projection_correction)
+        self.mf.residual_filter_acceptances_gc = (
+            self.nresidual_filter_acceptances)
+        self.mf.residual_filter_rejections_gc = (
+            self.nresidual_filter_rejections)
         self.mf.fixed_electron_number = self.fixed_electron_number
         self.mf.target_electron_number = self.target_electron_number
         self.mf.h_aux_gc = self.copy_blocks(state.h_orth)
@@ -4407,6 +4586,10 @@ class GrandCanonicalKRKS:
                 self.ndirection_projection_fallbacks),
             'max_direction_projection_correction_gc': (
                 self.max_direction_projection_correction),
+            'residual_filter_acceptances_gc': (
+                self.nresidual_filter_acceptances),
+            'residual_filter_rejections_gc': (
+                self.nresidual_filter_rejections),
             'fixed_electron_number': self.fixed_electron_number,
         })
         return GrandCanonicalResult(
@@ -4441,4 +4624,8 @@ class GrandCanonicalKRKS:
             direction_projection_fallbacks=(
                 self.ndirection_projection_fallbacks),
             max_direction_projection_correction=(
-                self.max_direction_projection_correction))
+                self.max_direction_projection_correction),
+            residual_filter_acceptances=(
+                self.nresidual_filter_acceptances),
+            residual_filter_rejections=(
+                self.nresidual_filter_rejections))
