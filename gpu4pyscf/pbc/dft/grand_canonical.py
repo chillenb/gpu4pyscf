@@ -149,6 +149,27 @@ class GrandCanonicalConfig:
     diis_preserve_accepted_history: bool = False
     lbfgs_use_projected_pairs: bool = False
 
+    # Experimental low-temperature NLCG controls.  These fields are appended
+    # to retain positional compatibility with earlier GrandCanonicalConfig
+    # construction.  ``trial`` preserves the original post-trial occupation
+    # projection; ``direction`` projects one endpoint before line search and
+    # then follows the resulting fixed one-dimensional path.
+    line_search_method: str = 'strong-wolfe'
+    line_search_max_trials: int = 64
+    line_search_nelec_feasible_alpha: bool = True
+    line_search_nelec_alpha_bisections: int = 24
+    hager_zhang_delta: float = 1.0e-1
+    hager_zhang_sigma: float = 9.0e-1
+    hager_zhang_expansion: float = 5.0
+    hager_zhang_shrinkage: float = 6.6e-1
+    hager_zhang_max_evals: int = 20
+    hager_zhang_objective_noise: float = 1.0e-10
+    hager_zhang_theta: float = 2.0
+    nlcg_nelec_projection_strategy: str = 'trial'
+    nlcg_exact_gradient_blend: bool = True
+    nlcg_exact_gradient_polish: bool = True
+    nlcg_reset_on_preprojection: bool = True
+
 
 @dataclass(frozen=True)
 class IterationRecord:
@@ -201,6 +222,23 @@ class IterationRecord:
     nelec_projection_response_fallback: bool = False
     nelec_projection_correction_rms: float = np.nan
     fock_evaluations: int = 0
+    line_search_method: str = 'strong-wolfe'
+    weak_wolfe: bool = False
+    approximate_wolfe: bool = False
+    curvature_qualified: bool = False
+    line_search_objective_allowance: float = 0.0
+    cheap_nelec_evaluations: int = 0
+    cheap_nelec_alpha_reductions: int = 0
+    direction_preprojected: bool = False
+    direction_projection_mode: str = 'reject'
+    direction_raw_endpoint_scale: float = np.nan
+    direction_raw_delta_nelec: float = np.nan
+    direction_projected_delta_nelec: float = np.nan
+    direction_accepted_delta_nelec: float = np.nan
+    direction_projection_correction_rms: float = np.nan
+    direction_projection_response_fallback: bool = False
+    direction_projection_trust_radius: float = np.nan
+    direction_projection_trust_ratio: float = np.nan
 
 
 @dataclass(frozen=True)
@@ -254,6 +292,23 @@ class _LineSearchResult:
     nelec_trust_ratio: float = np.nan
     nelec_projection_response_fallback: bool = False
     nelec_projection_correction_rms: float = np.nan
+    weak_wolfe: bool = False
+    approximate_wolfe: bool = False
+    curvature_qualified: bool = False
+    objective_allowance: float = 0.0
+    line_search_method: str = 'strong-wolfe'
+    cheap_nelec_evaluations: int = 0
+    cheap_nelec_alpha_reductions: int = 0
+    direction_preprojected: bool = False
+    direction_projection_mode: str = 'reject'
+    direction_raw_endpoint_scale: float = np.nan
+    direction_raw_delta_nelec: float = np.nan
+    direction_projected_delta_nelec: float = np.nan
+    direction_accepted_delta_nelec: float = np.nan
+    direction_projection_correction_rms: float = np.nan
+    direction_projection_response_fallback: bool = False
+    direction_projection_trust_radius: float = np.nan
+    direction_projection_trust_ratio: float = np.nan
 
 
 @dataclass(frozen=True)
@@ -269,6 +324,34 @@ class _TrialInfo:
     response_fallback: bool = False
     rejection_reason: str = ''
     correction_rms: float = np.nan
+
+
+@dataclass(frozen=True)
+class _PreparedDirection:
+    direction: list
+    success: bool = True
+    message: str = ''
+    alpha_cap: Optional[float] = None
+    preprojected: bool = False
+    mode: str = 'reject'
+    raw_endpoint_scale: float = np.nan
+    raw_delta_nelec: float = np.nan
+    projected_delta_nelec: float = np.nan
+    correction_rms: float = np.nan
+    response_fallback: bool = False
+    trust_radius: float = np.nan
+    reset_memory: bool = False
+
+
+@dataclass(frozen=True)
+class _HZPoint:
+    alpha: float
+    state: Optional[_GCState]
+    phi: float
+    dphi: float
+    trial_info: _TrialInfo
+    charge_boundary: bool = False
+    failed: bool = False
 
 
 @dataclass
@@ -339,6 +422,12 @@ class GrandCanonicalResult:
     max_nelec_projection_correction: float = 0.0
     final_nelec_trust_radius: float = np.nan
     last_nelec_trust_ratio: float = np.nan
+    cheap_nelec_evaluations: int = 0
+    cheap_nelec_alpha_reductions: int = 0
+    direction_projection_attempts: int = 0
+    direction_projection_acceptances: int = 0
+    direction_projection_fallbacks: int = 0
+    max_direction_projection_correction: float = 0.0
 
 
 def _as_float(value: Any, name: str = 'value') -> float:
@@ -468,6 +557,12 @@ class GrandCanonicalKRKS:
         self.config.line_search_nelec_guard_mode = (
             self._canonical_nelec_guard_mode(
                 self.config.line_search_nelec_guard_mode))
+        self.config.line_search_method = self._canonical_line_search_method(
+            self.config.line_search_method)
+        self.config.nlcg_nelec_projection_strategy = (
+            self._canonical_nlcg_projection_strategy(
+                self.config.nlcg_nelec_projection_strategy))
+        self._validate_line_search_config()
         self._validate_lbfgs_config()
         self._validate_diis_config()
         self._validate_nelec_guard_config()
@@ -498,6 +593,12 @@ class GrandCanonicalKRKS:
         self.max_projected_delta_nelec = 0.0
         self.max_nelec_projection_correction = 0.0
         self.last_nelec_trust_ratio = np.nan
+        self.ncheap_nelec_evaluations = 0
+        self.ncheap_nelec_alpha_reductions = 0
+        self.ndirection_projection_attempts = 0
+        self.ndirection_projection_acceptances = 0
+        self.ndirection_projection_fallbacks = 0
+        self.max_direction_projection_correction = 0.0
         self._prepare_fixed_basis_data()
         bytes_per_pair = 2 * sum(
             n * n * int(x.dtype.itemsize)
@@ -545,12 +646,15 @@ class GrandCanonicalKRKS:
             'polak-ribiere': 'polak-ribiere',
             'hs': 'hestenes-stiefel',
             'hestenes-stiefel': 'hestenes-stiefel',
+            'hz': 'hager-zhang',
+            'hager-zhang': 'hager-zhang',
+            'cg-descent': 'hager-zhang',
         }
         try:
             return aliases[key]
         except KeyError as error:
             choices = ', '.join(('fletcher-reeves', 'polak-ribiere',
-                                 'hestenes-stiefel'))
+                                 'hestenes-stiefel', 'hager-zhang'))
             raise ValueError(
                 f'unsupported cg_update {value!r}; choose one of {choices}') from error
 
@@ -610,6 +714,101 @@ class GrandCanonicalKRKS:
             raise ValueError(
                 'line_search_nelec_guard_mode must be reject, scalar-shift, '
                 'or fermi-response') from error
+
+    @staticmethod
+    def _canonical_line_search_method(value: str) -> str:
+        if not isinstance(value, str):
+            raise TypeError('line_search_method must be a string')
+        key = value.strip().lower().replace('_', '-').replace(' ', '-')
+        aliases = {
+            'strong': 'strong-wolfe',
+            'wolfe': 'strong-wolfe',
+            'strong-wolfe': 'strong-wolfe',
+            'hz': 'hager-zhang',
+            'hager-zhang': 'hager-zhang',
+            'cg-descent': 'hager-zhang',
+        }
+        try:
+            return aliases[key]
+        except KeyError as error:
+            raise ValueError(
+                'line_search_method must be strong-wolfe or hager-zhang') from error
+
+    @staticmethod
+    def _canonical_nlcg_projection_strategy(value: str) -> str:
+        if not isinstance(value, str):
+            raise TypeError('nlcg_nelec_projection_strategy must be a string')
+        key = value.strip().lower().replace('_', '-').replace(' ', '-')
+        aliases = {
+            'trial': 'trial',
+            'post-trial': 'trial',
+            'direction': 'direction',
+            'preproject': 'direction',
+            'preprojected': 'direction',
+            'fixed-direction': 'direction',
+        }
+        try:
+            return aliases[key]
+        except KeyError as error:
+            raise ValueError(
+                'nlcg_nelec_projection_strategy must be trial or direction') from error
+
+    def _validate_line_search_config(self) -> None:
+        c1 = self.config.line_search_c1
+        c2 = self.config.line_search_c2
+        if (not np.isfinite(c1) or not np.isfinite(c2) or
+                not 0.0 < c1 < c2 < 1.0):
+            raise ValueError(
+                'line-search constants must satisfy 0 < line_search_c1 < '
+                'line_search_c2 < 1')
+        for name in ('line_search_max_evals', 'line_search_zoom_evals',
+                     'line_search_max_trials',
+                     'line_search_nelec_alpha_bisections',
+                     'hager_zhang_max_evals'):
+            value = getattr(self.config, name)
+            if (not isinstance(value, int) or isinstance(value, bool) or
+                    value < 1):
+                raise ValueError(f'{name} must be a positive integer')
+        for name in ('line_search_alpha_init', 'line_search_alpha_cap',
+                     'line_search_alpha_min', 'line_search_growth',
+                     'line_search_max_h_rms_step'):
+            value = getattr(self.config, name)
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f'{name} must be finite and positive')
+        if self.config.line_search_growth <= 1.0:
+            raise ValueError('line_search_growth must exceed 1')
+        backtrack = self.config.armijo_backtrack_factor
+        if not np.isfinite(backtrack) or not 0.0 < backtrack < 1.0:
+            raise ValueError(
+                'armijo_backtrack_factor must lie strictly between 0 and 1')
+        delta = self.config.hager_zhang_delta
+        sigma = self.config.hager_zhang_sigma
+        if (not np.isfinite(delta) or not np.isfinite(sigma) or
+                not 0.0 < delta < 0.5 or not delta < sigma < 1.0):
+            raise ValueError(
+                'Hager-Zhang constants must satisfy 0 < delta < 0.5 and '
+                'delta < sigma < 1')
+        expansion = self.config.hager_zhang_expansion
+        shrinkage = self.config.hager_zhang_shrinkage
+        if not np.isfinite(expansion) or expansion <= 1.0:
+            raise ValueError('hager_zhang_expansion must exceed 1')
+        if (not np.isfinite(shrinkage) or
+                not 0.0 < shrinkage < 1.0):
+            raise ValueError(
+                'hager_zhang_shrinkage must lie strictly between 0 and 1')
+        noise = self.config.hager_zhang_objective_noise
+        if not np.isfinite(noise) or noise < 0.0:
+            raise ValueError(
+                'hager_zhang_objective_noise must be finite and nonnegative')
+        theta = self.config.hager_zhang_theta
+        if not np.isfinite(theta) or theta <= 0.25:
+            raise ValueError('hager_zhang_theta must exceed 0.25')
+        for name in ('line_search_nelec_feasible_alpha',
+                     'nlcg_exact_gradient_blend',
+                     'nlcg_exact_gradient_polish',
+                     'nlcg_reset_on_preprojection'):
+            if not isinstance(getattr(self.config, name), bool):
+                raise TypeError(f'{name} must be boolean')
 
     def _validate_lbfgs_config(self) -> None:
         if (not isinstance(self.config.lbfgs_history_size, int) or
@@ -1368,10 +1567,12 @@ class GrandCanonicalKRKS:
     def _restart_direction(self, state: _GCState) -> tuple[list, str]:
         residual = self.copy_blocks(state.residual)
         if self._is_descent(state, residual):
-            residual, blended = self._blend_poorly_aligned_direction(
-                state, residual)
-            if blended:
-                return residual, 'restarted with blended residual/exact gradient'
+            if self.config.nlcg_exact_gradient_blend:
+                residual, blended = self._blend_poorly_aligned_direction(
+                    state, residual)
+                if blended:
+                    return residual, (
+                        'restarted with blended residual/exact gradient')
             return residual, 'restarted with preconditioned residual'
         gradient = self.scale_blocks(-1.0, state.gradient)
         if self._is_descent(state, gradient):
@@ -1384,15 +1585,19 @@ class GrandCanonicalKRKS:
         if projected_change > self.config.hermiticity_tol * max(1.0, self.norm(direction)):
             direction, reason = self._restart_direction(state)
             return direction, True, 'time-reversal projection changed CG direction; ' + reason
-        if state.residual_rms <= self.config.exact_gradient_polish_residual_rms:
+        if (self.config.nlcg_exact_gradient_polish and
+                state.residual_rms <=
+                self.config.exact_gradient_polish_residual_rms):
             gradient = self.scale_blocks(-1.0, state.gradient)
             if self._is_descent(state, gradient):
                 return gradient, True, 'exact-gradient final polishing'
         if self._is_descent(state, direction):
-            direction, blended = self._blend_poorly_aligned_direction(
-                state, direction)
-            if blended:
-                return direction, True, 'blended poorly aligned direction with exact gradient'
+            if self.config.nlcg_exact_gradient_blend:
+                direction, blended = self._blend_poorly_aligned_direction(
+                    state, direction)
+                if blended:
+                    return direction, True, (
+                        'blended poorly aligned direction with exact gradient')
             return direction, False, ''
         direction, reason = self._restart_direction(state)
         if self._is_descent(state, direction):
@@ -1411,6 +1616,27 @@ class GrandCanonicalKRKS:
         if update == 'fletcher-reeves':
             numerator = self.inner(new.gradient, new.z)
             denominator = old_gz
+        elif update == 'hager-zhang':
+            delta_gradient = self.axpy(
+                -1.0, old.gradient, new.gradient)
+            delta_z = self.axpy(-1.0, old.z, new.z)
+            denominator = self.inner(old_direction, delta_gradient)
+            if (not np.isfinite(denominator) or
+                    abs(denominator) <= 1.0e-30):
+                return 0.0, 'ill-conditioned Hager Zhang denominator'
+            preconditioned_curvature = self.inner(
+                delta_gradient, delta_z)
+            if (not np.isfinite(preconditioned_curvature) or
+                    preconditioned_curvature <= 1.0e-30):
+                return 0.0, (
+                    'nonpositive flexible Hager Zhang preconditioned curvature')
+            first = self.inner(delta_gradient, new.z) / denominator
+            second = (
+                self.config.hager_zhang_theta *
+                preconditioned_curvature *
+                self.inner(old_direction, new.gradient) /
+                (denominator * denominator))
+            numerator = first - second
         else:
             delta_z = self.axpy(-1.0, old.z, new.z)
             numerator = self.inner(new.gradient, delta_z)
@@ -1422,11 +1648,13 @@ class GrandCanonicalKRKS:
 
         label = update.replace('-', ' ').title()
         finite = np.isfinite(numerator) and np.isfinite(denominator)
-        valid_denominator = (abs(denominator) > 1.0e-30 if update == 'hestenes-stiefel'
+        valid_denominator = (abs(denominator) > 1.0e-30
+                             if update in ('hestenes-stiefel', 'hager-zhang')
                              else denominator > 1.0e-30)
         if not finite or not valid_denominator:
             return 0.0, f'ill-conditioned {label} denominator'
-        candidate = numerator / denominator
+        candidate = (numerator if update == 'hager-zhang'
+                     else numerator / denominator)
         if not np.isfinite(candidate) or abs(candidate) > self.config.cg_beta_max:
             return 0.0, f'invalid {label} beta'
         return candidate, ''
@@ -1581,7 +1809,8 @@ class GrandCanonicalKRKS:
                     'history cleared after unreliable projected model')
                 return info
         if not projected_pair:
-            non_wolfe = fallback_used or not line_search.strong_wolfe
+            non_wolfe = (
+                fallback_used or not line_search.curvature_qualified)
             if ((line_search.force_restart or non_wolfe) and
                     not line_search.trust_boundary):
                 if (line_search.force_restart or
@@ -2014,6 +2243,201 @@ class GrandCanonicalKRKS:
             maximum = min(maximum, self._nelec_trust_radius)
         return maximum
 
+    def _charge_feasible_alpha_cap(
+            self, state: _GCState, direction: Sequence, requested: float,
+            maximum: Optional[float] = None) -> tuple[float, bool]:
+        """Return a cheaply charge-feasible upper step on a fixed line.
+
+        Fermi occupations require only Hermitian diagonalizations, so rejected
+        charge proposals must not consume the expensive Fock-evaluation
+        budget.  The feasible set need not be globally monotone in ``alpha``;
+        this routine only locates the first local boundary between a feasible
+        smaller step and an infeasible requested step.  Every later trial is
+        still checked independently by :meth:`_trial`.
+        """
+        requested = float(requested)
+        if (self.fixed_electron_number or
+                not self.config.line_search_nelec_feasible_alpha or
+                requested <= 0.0):
+            return requested, False
+        if maximum is None:
+            maximum = self._active_nelec_limit(
+                state, use_adaptive_radius=False)
+        maximum = float(maximum)
+        cache: dict[float, float] = {0.0: 0.0}
+
+        def delta_nelec(alpha: float) -> float:
+            key = float(alpha)
+            if key not in cache:
+                candidate = self._sanitize_h(
+                    self.axpy(key, direction, state.h_orth))
+                value = (self._cheap_fixed_mu_electron_number(candidate) -
+                         state.electron_number)
+                cache[key] = value
+                self.ncheap_nelec_evaluations += 1
+            return cache[key]
+
+        if abs(delta_nelec(requested)) <= maximum:
+            return requested, False
+
+        high = requested
+        low = 0.0
+        alpha = requested
+        for _ in range(self.config.line_search_max_trials):
+            alpha *= self.config.armijo_backtrack_factor
+            self.ncheap_nelec_alpha_reductions += 1
+            if alpha < self.config.line_search_alpha_min:
+                return 0.0, True
+            if abs(delta_nelec(alpha)) <= maximum:
+                low = alpha
+                break
+            high = alpha
+        else:
+            return 0.0, True
+
+        for _ in range(self.config.line_search_nelec_alpha_bisections):
+            if high - low <= self.config.line_search_alpha_min:
+                break
+            midpoint = 0.5 * (low + high)
+            self.ncheap_nelec_alpha_reductions += 1
+            error = abs(delta_nelec(midpoint)) - maximum
+            if error <= 0.0:
+                low = midpoint
+                if abs(error) <= 1.0e-10:
+                    break
+            else:
+                high = midpoint
+        return low, True
+
+    def _prepare_nlcg_direction(
+            self, state: _GCState,
+            direction: Sequence) -> _PreparedDirection:
+        """Optionally occupation-limit one endpoint before line search.
+
+        Projecting the endpoint once and searching along ``P(H+d)-H`` keeps
+        every accepted trial on a single line.  This makes Wolfe derivative
+        conditions meaningful, unlike applying a different nonlinear
+        occupation correction after each trial.
+        """
+        direction = self.hermitize_blocks(direction)
+        if (self.fixed_electron_number or
+                self.config.nlcg_nelec_projection_strategy != 'direction' or
+                self.config.line_search_nelec_guard_mode == 'reject'):
+            return _PreparedDirection(direction=self.copy_blocks(direction))
+
+        endpoint_scale = min(1.0, self._alpha_cap(direction))
+        if endpoint_scale < self.config.line_search_alpha_min:
+            return _PreparedDirection(
+                direction=self.copy_blocks(direction), success=False,
+                message='direction endpoint lies below the minimum step')
+
+        maximum = self._active_nelec_limit(
+            state, use_adaptive_radius=True)
+        for _ in range(8):
+            raw_candidate = self._sanitize_h(
+                self.axpy(endpoint_scale, direction, state.h_orth))
+            raw_nelec = self._cheap_fixed_mu_electron_number(raw_candidate)
+            self.ncheap_nelec_evaluations += 1
+            raw_delta = raw_nelec - state.electron_number
+            self.max_raw_delta_nelec = max(
+                self.max_raw_delta_nelec, abs(raw_delta))
+            scaled_direction = self.hermitize_blocks(
+                self.axpy(-1.0, state.h_orth, raw_candidate))
+            if abs(raw_delta) <= maximum:
+                return _PreparedDirection(
+                    direction=scaled_direction, alpha_cap=1.0,
+                    raw_endpoint_scale=endpoint_scale,
+                    raw_delta_nelec=raw_delta,
+                    projected_delta_nelec=raw_delta,
+                    trust_radius=maximum)
+
+            target = (state.electron_number +
+                      np.copysign(maximum, raw_delta))
+            self.ndirection_projection_attempts += 1
+            try:
+                projected, _, response_fallback = (
+                    self._project_trial_electron_number(
+                        raw_candidate, target))
+            except (ArithmeticError, FloatingPointError, ValueError,
+                    RuntimeError, cp.linalg.LinAlgError):
+                endpoint_scale *= self.config.armijo_backtrack_factor
+                continue
+            if response_fallback:
+                self.ndirection_projection_fallbacks += 1
+            projected_nelec = self._cheap_fixed_mu_electron_number(projected)
+            self.ncheap_nelec_evaluations += 1
+            projected_delta = projected_nelec - state.electron_number
+            projected_direction = self.hermitize_blocks(
+                self.axpy(-1.0, state.h_orth, projected))
+            correction = self.max_block_rms(
+                self.axpy(-1.0, raw_candidate, projected))
+            self.max_projected_delta_nelec = max(
+                self.max_projected_delta_nelec, abs(projected_delta))
+            self.max_direction_projection_correction = max(
+                self.max_direction_projection_correction, correction)
+            if (abs(projected_nelec - target) <= 1.0e-10 and
+                    self.max_block_rms(projected_direction) <=
+                    self.config.line_search_max_h_rms_step and
+                    self._is_descent(state, projected_direction)):
+                return _PreparedDirection(
+                    direction=projected_direction, alpha_cap=1.0,
+                    preprojected=True,
+                    mode=self.config.line_search_nelec_guard_mode,
+                    raw_endpoint_scale=endpoint_scale,
+                    raw_delta_nelec=raw_delta,
+                    projected_delta_nelec=projected_delta,
+                    correction_rms=correction,
+                    response_fallback=response_fallback,
+                    trust_radius=maximum,
+                    reset_memory=(
+                        self.config.nlcg_reset_on_preprojection))
+            endpoint_scale *= self.config.armijo_backtrack_factor
+            if endpoint_scale < self.config.line_search_alpha_min:
+                break
+        return _PreparedDirection(
+            direction=self.copy_blocks(direction), success=False,
+            message='failed to construct a downhill charge-limited direction',
+            raw_endpoint_scale=endpoint_scale, trust_radius=maximum)
+
+    def _decorate_direction_projection_result(
+            self, old: _GCState, new: _GCState,
+            result: _LineSearchResult,
+            prepared: _PreparedDirection) -> _LineSearchResult:
+        """Attach fixed-direction diagnostics and update its charge radius."""
+        accepted_delta = new.electron_number - old.electron_number
+        ratio = np.nan
+        if prepared.preprojected:
+            predicted = -result.alpha * self.inner(
+                old.gradient, prepared.direction)
+            actual = old.objective - new.objective
+            ratio = actual / predicted if predicted > 0.0 else -np.inf
+            if ratio < self.config.line_search_nelec_trust_bad_ratio:
+                self._shrink_nelec_trust_radius(prepared.trust_radius)
+            elif (ratio >= self.config.line_search_nelec_trust_good_ratio and
+                  abs(accepted_delta) >= 0.8 * prepared.trust_radius and
+                  self.config.line_search_nelec_trust_expand > 1.0):
+                self._nelec_trust_radius = min(
+                    self.config.line_search_max_delta_nelec,
+                    self.config.line_search_nelec_trust_expand *
+                    min(self._nelec_trust_radius,
+                        prepared.trust_radius))
+            self.ndirection_projection_acceptances += 1
+            self.last_nelec_trust_ratio = ratio
+        return replace(
+            result,
+            direction_preprojected=prepared.preprojected,
+            direction_projection_mode=prepared.mode,
+            direction_raw_endpoint_scale=prepared.raw_endpoint_scale,
+            direction_raw_delta_nelec=prepared.raw_delta_nelec,
+            direction_projected_delta_nelec=(
+                prepared.projected_delta_nelec),
+            direction_accepted_delta_nelec=accepted_delta,
+            direction_projection_correction_rms=prepared.correction_rms,
+            direction_projection_response_fallback=(
+                prepared.response_fallback),
+            direction_projection_trust_radius=prepared.trust_radius,
+            direction_projection_trust_ratio=ratio)
+
     def _spectral_charge_root(
             self, eigenvalues: Sequence, response: Sequence,
             target_nelec: float) -> float:
@@ -2181,8 +2605,9 @@ class GrandCanonicalKRKS:
 
     def _projected_line_search_result(
             self, old_state: _GCState, new_state: _GCState,
-            alpha: float, nfev: int, message: str) -> _LineSearchResult:
-        info = self._last_trial_info
+            alpha: float, nfev: int, message: str,
+            info: Optional[_TrialInfo] = None) -> _LineSearchResult:
+        info = self._last_trial_info if info is None else info
         ratio = self._accept_projected_trial(old_state, new_state, info)
         return _LineSearchResult(
             True, new_state, alpha, nfev, False, True, message, True,
@@ -2192,7 +2617,9 @@ class GrandCanonicalKRKS:
             info.response_fallback, info.correction_rms)
 
     def _trial(self, state: _GCState, direction: Sequence, alpha: float,
-               allow_nelec_projection: bool = True) -> Optional[_GCState]:
+               allow_nelec_projection: bool = True,
+               nelec_limit_override: Optional[float] = None
+               ) -> Optional[_GCState]:
         self._last_trial_rejected_by_nelec = False
         self._last_trial_info = _TrialInfo()
         try:
@@ -2207,14 +2634,17 @@ class GrandCanonicalKRKS:
                 return self.evaluate(raw_candidate)
 
             raw_nelec = self._cheap_fixed_mu_electron_number(raw_candidate)
+            self.ncheap_nelec_evaluations += 1
             raw_delta = raw_nelec - state.electron_number
             self.max_raw_delta_nelec = max(
                 self.max_raw_delta_nelec, abs(raw_delta))
             projection_enabled = (
                 allow_nelec_projection and
                 self.config.line_search_nelec_guard_mode != 'reject')
-            maximum = self._active_nelec_limit(
+            maximum = (self._active_nelec_limit(
                 state, use_adaptive_radius=projection_enabled)
+                if nelec_limit_override is None else
+                float(nelec_limit_override))
             if abs(raw_delta) > maximum and projection_enabled:
                 target = (state.electron_number +
                           np.copysign(maximum, raw_delta))
@@ -2223,6 +2653,7 @@ class GrandCanonicalKRKS:
                         raw_candidate, target))
                 projected_nelec = self._cheap_fixed_mu_electron_number(
                     candidate)
+                self.ncheap_nelec_evaluations += 1
                 actual_step = self.hermitize_blocks(
                     self.axpy(-1.0, state.h_orth, candidate))
                 actual_slope = self.inner(state.gradient, actual_step)
@@ -2311,99 +2742,445 @@ class GrandCanonicalKRKS:
         except (FloatingPointError, ZeroDivisionError):
             return None
 
-    def _zoom(self, state0: _GCState, direction: Sequence, phi0: float, dphi0: float,
-              lo_a: float, lo_state: _GCState, hi_a: float,
-              hi_state: Optional[_GCState], best: Optional[tuple[float, _GCState]],
-              nfev: int, c2: Optional[float] = None) -> _LineSearchResult:
+    def _finish_line_search(
+            self, result: _LineSearchResult, start_nfev: int,
+            cheap_start: int, reduction_start: int,
+            method: str) -> _LineSearchResult:
+        return replace(
+            result, nfev=self.nfev - start_nfev,
+            line_search_method=method,
+            cheap_nelec_evaluations=(
+                self.ncheap_nelec_evaluations - cheap_start),
+            cheap_nelec_alpha_reductions=(
+                self.ncheap_nelec_alpha_reductions - reduction_start))
+
+    def _zoom(
+            self, state0: _GCState, direction: Sequence, phi0: float,
+            dphi0: float, lo_a: float, lo_state: _GCState, hi_a: float,
+            hi_state: Optional[_GCState],
+            best: Optional[tuple[float, _GCState]], nfev: int,
+            c2: Optional[float] = None, *,
+            start_nfev: Optional[int] = None, trial_count: int = 0,
+            cheap_start: Optional[int] = None,
+            reduction_start: Optional[int] = None,
+            allow_nelec_projection: bool = True,
+            nelec_limit_override: Optional[float] = None
+            ) -> _LineSearchResult:
         c1 = self.config.line_search_c1
         c2 = self.config.line_search_c2 if c2 is None else c2
+        start_nfev = (self.nfev - nfev if start_nfev is None
+                      else start_nfev)
+        cheap_start = (self.ncheap_nelec_evaluations if cheap_start is None
+                       else cheap_start)
+        reduction_start = (
+            self.ncheap_nelec_alpha_reductions
+            if reduction_start is None else reduction_start)
+
+        def finish(value: _LineSearchResult) -> _LineSearchResult:
+            return self._finish_line_search(
+                value, start_nfev, cheap_start, reduction_start,
+                'strong-wolfe')
+
         lo_phi = lo_state.objective
         lo_dphi = self.inner(lo_state.gradient, direction)
         hi_phi = np.inf if hi_state is None else hi_state.objective
-        hi_dphi = np.nan if hi_state is None else self.inner(hi_state.gradient, direction)
-        for _ in range(self.config.line_search_zoom_evals):
+        hi_dphi = (np.nan if hi_state is None else
+                   self.inner(hi_state.gradient, direction))
+        zoom_steps = 0
+        while (zoom_steps < self.config.line_search_zoom_evals and
+               trial_count < self.config.line_search_max_trials and
+               self.nfev - start_nfev <
+               self.config.line_search_max_evals):
+            zoom_steps += 1
             lower, upper = min(lo_a, hi_a), max(lo_a, hi_a)
-            alpha = self._cubic_minimizer(lo_a, lo_phi, lo_dphi, hi_a, hi_phi, hi_dphi)
+            alpha = self._cubic_minimizer(
+                lo_a, lo_phi, lo_dphi, hi_a, hi_phi, hi_dphi)
             margin = 0.1 * (upper - lower)
             if alpha is None or not (lower + margin < alpha < upper - margin):
                 alpha = 0.5 * (lo_a + hi_a)
             if abs(hi_a - lo_a) < self.config.line_search_alpha_min:
                 break
-            trial = self._trial(state0, direction, alpha)
-            nfev += 1
+            trial = self._trial(
+                state0, direction, alpha,
+                allow_nelec_projection=allow_nelec_projection,
+                nelec_limit_override=nelec_limit_override)
+            trial_count += 1
             trial_info = self._last_trial_info
             if trial_info.projected:
                 if (trial is not None and
                         trial.objective <= phi0 +
                         c1 * trial_info.actual_slope):
-                    return self._projected_line_search_result(
-                        state0, trial, alpha, nfev,
-                        'accepted occupation-projected Armijo zoom point')
+                    return finish(self._projected_line_search_result(
+                        state0, trial, alpha, 0,
+                        'accepted occupation-projected Armijo zoom point',
+                        info=trial_info))
                 if trial is not None:
                     self._shrink_nelec_trust_radius(
                         trial_info.trust_radius)
-                # The projected state is not on the original one-dimensional
-                # line, so it cannot supply a cubic derivative/value model.
                 hi_a, hi_state, hi_phi, hi_dphi = (
                     alpha, None, np.inf, np.nan)
                 continue
             nelec_boundary = (
                 trial is None and self._last_trial_rejected_by_nelec)
             phi = np.inf if trial is None else trial.objective
-            if trial is None or phi > phi0 + c1 * alpha * dphi0 or phi >= lo_phi:
-                hi_a, hi_state, hi_phi, hi_dphi = alpha, trial, phi, np.nan if trial is None else self.inner(trial.gradient, direction)
-                # A charge guard is a genuine trust-region boundary, not an
-                # unknown objective value.  Once an Armijo point exists on
-                # the feasible side, accept it instead of repeatedly building
-                # expensive Fock matrices while zooming toward the boundary.
+            if (trial is None or phi > phi0 + c1 * alpha * dphi0 or
+                    phi >= lo_phi):
+                hi_a, hi_state, hi_phi = alpha, trial, phi
+                hi_dphi = (np.nan if trial is None else
+                            self.inner(trial.gradient, direction))
                 if nelec_boundary and best is not None:
-                    return _LineSearchResult(
-                        True, best[1], best[0], nfev, False, True,
-                        'accepted Armijo point at electron-number trust '
-                        'boundary', True)
+                    return finish(_LineSearchResult(
+                        True, best[1], best[0], force_restart=True,
+                        message=('accepted Armijo point at electron-number '
+                                 'trust boundary'), trust_boundary=True))
                 continue
             dphi = self.inner(trial.gradient, direction)
             if phi <= phi0 + c1 * alpha * dphi0:
                 if best is None or phi < best[1].objective:
                     best = (alpha, trial)
             if abs(dphi) <= c2 * abs(dphi0):
-                return _LineSearchResult(True, trial, alpha, nfev, True, False, 'strong Wolfe')
+                return finish(_LineSearchResult(
+                    True, trial, alpha, strong_wolfe=True,
+                    curvature_qualified=True, message='strong Wolfe'))
             if dphi * (hi_a - lo_a) >= 0.0:
-                hi_a, hi_state, hi_phi, hi_dphi = lo_a, lo_state, lo_phi, lo_dphi
+                hi_a, hi_state, hi_phi, hi_dphi = (
+                    lo_a, lo_state, lo_phi, lo_dphi)
             lo_a, lo_state, lo_phi, lo_dphi = alpha, trial, phi, dphi
         if best is not None:
-            return _LineSearchResult(True, best[1], best[0], nfev, False, True,
-                                     'accepted best Armijo point after zoom')
-        return _LineSearchResult(False, None, nfev=nfev, message='zoom found no Armijo point')
+            return finish(_LineSearchResult(
+                True, best[1], best[0], force_restart=True,
+                message='accepted best Armijo point after zoom'))
+        return finish(_LineSearchResult(
+            False, None, message='zoom found no Armijo point'))
 
-    def _line_search(self, state: _GCState, direction: Sequence,
-                     c2: Optional[float] = None,
-                     alpha_init: Optional[float] = None,
-                     alpha_cap_override: Optional[float] = None) -> _LineSearchResult:
+    def _hager_zhang_line_search(
+            self, state: _GCState, direction: Sequence,
+            alpha_init: Optional[float] = None,
+            alpha_cap_override: Optional[float] = None,
+            nelec_limit_override: Optional[float] = None
+            ) -> _LineSearchResult:
+        """Cached Hager--Zhang weak/approximate-Wolfe line search."""
+        start_nfev = self.nfev
+        cheap_start = self.ncheap_nelec_evaluations
+        reduction_start = self.ncheap_nelec_alpha_reductions
+
+        def finish(value: _LineSearchResult) -> _LineSearchResult:
+            return self._finish_line_search(
+                value, start_nfev, cheap_start, reduction_start,
+                'hager-zhang')
+
+        phi0 = state.objective
         dphi0 = self.inner(state.gradient, direction)
         if dphi0 >= 0.0:
-            return _LineSearchResult(False, None, message='line search called with non-descent direction')
+            return finish(_LineSearchResult(
+                False, None,
+                message='Hager-Zhang search called with non-descent direction'))
         alpha_max = self._alpha_cap(direction)
         if alpha_cap_override is not None:
-            if not np.isfinite(alpha_cap_override) or alpha_cap_override <= 0.0:
-                raise ValueError('alpha_cap_override must be finite and positive')
+            if (not np.isfinite(alpha_cap_override) or
+                    alpha_cap_override <= 0.0):
+                raise ValueError(
+                    'alpha_cap_override must be finite and positive')
             alpha_max = min(alpha_max, alpha_cap_override)
+        maximum = (self._active_nelec_limit(
+            state, use_adaptive_radius=False)
+            if nelec_limit_override is None else
+            float(nelec_limit_override))
+        alpha_max, _ = self._charge_feasible_alpha_cap(
+            state, direction, alpha_max, maximum=maximum)
         if alpha_max < self.config.line_search_alpha_min:
-            return _LineSearchResult(False, None, message='step cap below minimum')
+            return finish(_LineSearchResult(
+                False, None, message='Hager-Zhang step cap below minimum'))
         alpha_start = (self.config.line_search_alpha_init
                        if alpha_init is None else alpha_init)
         if not np.isfinite(alpha_start) or alpha_start <= 0.0:
-            raise ValueError('line-search initial alpha must be finite and positive')
+            raise ValueError(
+                'line-search initial alpha must be finite and positive')
+        delta = self.config.hager_zhang_delta
+        sigma = self.config.hager_zhang_sigma
+        noise = self.config.hager_zhang_objective_noise
+        threshold = phi0 + noise
+        cache: dict[float, _HZPoint] = {
+            0.0: _HZPoint(
+                0.0, state, phi0, dphi0, _TrialInfo(), False, False)}
+        trial_count = 0
+        best_armijo: Optional[_HZPoint] = None
+
+        def evaluate(alpha: float) -> Optional[_HZPoint]:
+            nonlocal trial_count, best_armijo
+            alpha = min(alpha_max, max(0.0, float(alpha)))
+            alpha = 0.0 if alpha == 0.0 else alpha
+            if alpha in cache:
+                return cache[alpha]
+            if (trial_count >= self.config.line_search_max_trials or
+                    self.nfev - start_nfev >=
+                    self.config.hager_zhang_max_evals):
+                return None
+            trial = self._trial(
+                state, direction, alpha, allow_nelec_projection=False,
+                nelec_limit_override=maximum)
+            trial_count += 1
+            info = self._last_trial_info
+            charge_boundary = (
+                trial is None and self._last_trial_rejected_by_nelec)
+            phi = np.inf if trial is None else trial.objective
+            dphi = (np.nan if trial is None else
+                     self.inner(trial.gradient, direction))
+            failed = (trial is None or info.projected or
+                      not np.isfinite(phi) or not np.isfinite(dphi))
+            point = _HZPoint(
+                alpha, trial, phi, dphi, info, charge_boundary, failed)
+            cache[alpha] = point
+            if (not failed and
+                    phi <= phi0 + delta * alpha * dphi0 and
+                    (best_armijo is None or phi < best_armijo.phi)):
+                best_armijo = point
+            return point
+
+        def accepted(point: Optional[_HZPoint]
+                     ) -> Optional[_LineSearchResult]:
+            if point is None or point.state is None:
+                return None
+            if point.trial_info.projected:
+                info = point.trial_info
+                if point.phi <= phi0 + self.config.line_search_c1 * info.actual_slope:
+                    return finish(self._projected_line_search_result(
+                        state, point.state, point.alpha, 0,
+                        'accepted off-line projected Armijo Hager-Zhang point',
+                        info=info))
+                return None
+            if point.failed:
+                return None
+            ordinary = (
+                point.phi <= phi0 + delta * point.alpha * dphi0 and
+                point.dphi >= sigma * dphi0)
+            approximate = (
+                noise > 0.0 and point.phi <= threshold and
+                point.dphi >= sigma * dphi0 and
+                point.dphi <= (2.0 * delta - 1.0) * dphi0)
+            if ordinary:
+                return finish(_LineSearchResult(
+                    True, point.state, point.alpha,
+                    weak_wolfe=True, curvature_qualified=True,
+                    message='Hager-Zhang ordinary weak Wolfe'))
+            if approximate:
+                return finish(_LineSearchResult(
+                    True, point.state, point.alpha,
+                    weak_wolfe=True, approximate_wolfe=True,
+                    curvature_qualified=True,
+                    objective_allowance=noise,
+                    message='Hager-Zhang approximate Wolfe'))
+            return None
+
+        def refine_interval(
+                low: _HZPoint, right: float
+                ) -> tuple[_HZPoint, Optional[_HZPoint],
+                           Optional[_LineSearchResult]]:
+            """Implement the HZ update U3 until the bracket is valid."""
+            high: Optional[_HZPoint] = None
+            while (right - low.alpha >
+                   self.config.line_search_alpha_min):
+                middle = 0.5 * (low.alpha + right)
+                point = evaluate(middle)
+                result = accepted(point)
+                if result is not None:
+                    return low, high, result
+                if point is None:
+                    break
+                if point.failed:
+                    right = middle
+                elif point.dphi >= 0.0:
+                    high = point
+                    break
+                elif point.phi <= threshold:
+                    low = point
+                else:
+                    right = middle
+            return low, high, None
+
+        def update_bracket(
+                low: _HZPoint, high: _HZPoint, alpha: float
+                ) -> tuple[_HZPoint, Optional[_HZPoint],
+                           Optional[_LineSearchResult], Optional[_HZPoint]]:
+            point = evaluate(alpha)
+            result = accepted(point)
+            if result is not None:
+                return low, high, result, point
+            if point is None:
+                return low, high, None, None
+            if point.failed:
+                low, refined, result = refine_interval(low, point.alpha)
+                return low, refined, result, point
+            if point.dphi >= 0.0:
+                return low, point, None, point
+            if point.phi <= threshold:
+                return point, high, None, point
+            low, refined, result = refine_interval(low, point.alpha)
+            return low, refined, result, point
+
+        def secant(left: _HZPoint, right: _HZPoint) -> float:
+            denominator = right.dphi - left.dphi
+            if (not np.isfinite(denominator) or
+                    abs(denominator) <= 1.0e-30):
+                return 0.5 * (left.alpha + right.alpha)
+            alpha = ((left.alpha * right.dphi -
+                      right.alpha * left.dphi) / denominator)
+            if (not np.isfinite(alpha) or
+                    not left.alpha < alpha < right.alpha):
+                return 0.5 * (left.alpha + right.alpha)
+            return alpha
+
+        low = cache[0.0]
+        high: Optional[_HZPoint] = None
+        alpha = min(alpha_start, alpha_max)
+        while True:
+            point = evaluate(alpha)
+            result = accepted(point)
+            if result is not None:
+                return result
+            if point is None:
+                break
+            if point.failed:
+                low, high, result = refine_interval(low, point.alpha)
+                if result is not None:
+                    return result
+                break
+            if point.dphi >= 0.0:
+                high = point
+                break
+            if point.phi > threshold:
+                low, high, result = refine_interval(low, point.alpha)
+                if result is not None:
+                    return result
+                break
+            low = point
+            grown = min(
+                self.config.hager_zhang_expansion * alpha, alpha_max)
+            if grown <= alpha:
+                break
+            alpha = grown
+
+        if high is not None:
+            while (high.alpha - low.alpha >
+                   self.config.line_search_alpha_min):
+                old_low, old_high = low, high
+                old_width = high.alpha - low.alpha
+                alpha = secant(low, high)
+                low, high, result, point = update_bracket(
+                    low, high, alpha)
+                if result is not None:
+                    return result
+                if high is None or point is None:
+                    break
+                second = None
+                if point.alpha == low.alpha and point.alpha != old_low.alpha:
+                    second = secant(old_low, point)
+                elif (point.alpha == high.alpha and
+                      point.alpha != old_high.alpha):
+                    second = secant(point, old_high)
+                if (second is not None and
+                        low.alpha < second < high.alpha):
+                    low, high, result, _ = update_bracket(
+                        low, high, second)
+                    if result is not None:
+                        return result
+                    if high is None:
+                        break
+                if (high.alpha - low.alpha >
+                        self.config.hager_zhang_shrinkage * old_width):
+                    midpoint = 0.5 * (low.alpha + high.alpha)
+                    low, high, result, _ = update_bracket(
+                        low, high, midpoint)
+                    if result is not None:
+                        return result
+                    if high is None:
+                        break
+                if (low.alpha == old_low.alpha and
+                        high.alpha == old_high.alpha):
+                    break
+                if (trial_count >= self.config.line_search_max_trials or
+                        self.nfev - start_nfev >=
+                        self.config.hager_zhang_max_evals):
+                    break
+
+        if best_armijo is not None:
+            return finish(_LineSearchResult(
+                True, best_armijo.state, best_armijo.alpha,
+                force_restart=True,
+                message=('accepted best Armijo point after Hager-Zhang '
+                         'search')))
+        return finish(_LineSearchResult(
+            False, None,
+            message='Hager-Zhang search found no acceptable point'))
+
+    def _line_search(
+            self, state: _GCState, direction: Sequence,
+            c2: Optional[float] = None,
+            alpha_init: Optional[float] = None,
+            alpha_cap_override: Optional[float] = None, *,
+            allow_nelec_projection: bool = True,
+            nelec_limit_override: Optional[float] = None
+            ) -> _LineSearchResult:
+        if self.config.line_search_method == 'hager-zhang':
+            return self._hager_zhang_line_search(
+                state, direction, alpha_init=alpha_init,
+                alpha_cap_override=alpha_cap_override,
+                nelec_limit_override=nelec_limit_override)
+
+        start_nfev = self.nfev
+        cheap_start = self.ncheap_nelec_evaluations
+        reduction_start = self.ncheap_nelec_alpha_reductions
+
+        def finish(value: _LineSearchResult) -> _LineSearchResult:
+            return self._finish_line_search(
+                value, start_nfev, cheap_start, reduction_start,
+                'strong-wolfe')
+
+        dphi0 = self.inner(state.gradient, direction)
+        if dphi0 >= 0.0:
+            return finish(_LineSearchResult(
+                False, None,
+                message='line search called with non-descent direction'))
+        alpha_max = self._alpha_cap(direction)
+        if alpha_cap_override is not None:
+            if (not np.isfinite(alpha_cap_override) or
+                    alpha_cap_override <= 0.0):
+                raise ValueError(
+                    'alpha_cap_override must be finite and positive')
+            alpha_max = min(alpha_max, alpha_cap_override)
+        projection_enabled = (
+            allow_nelec_projection and
+            self.config.line_search_nelec_guard_mode != 'reject')
+        if not projection_enabled:
+            maximum = (self._active_nelec_limit(
+                state, use_adaptive_radius=False)
+                if nelec_limit_override is None else
+                float(nelec_limit_override))
+            alpha_max, _ = self._charge_feasible_alpha_cap(
+                state, direction, alpha_max, maximum=maximum)
+        if alpha_max < self.config.line_search_alpha_min:
+            return finish(_LineSearchResult(
+                False, None, message='step cap below minimum'))
+        alpha_start = (self.config.line_search_alpha_init
+                       if alpha_init is None else alpha_init)
+        if not np.isfinite(alpha_start) or alpha_start <= 0.0:
+            raise ValueError(
+                'line-search initial alpha must be finite and positive')
         alpha = min(alpha_start, alpha_max)
         phi0 = state.objective
         c1 = self.config.line_search_c1
         c2 = self.config.line_search_c2 if c2 is None else c2
         previous_alpha, previous_state = 0.0, state
         best: Optional[tuple[float, _GCState]] = None
-        nfev = 0
-        for it in range(self.config.line_search_max_evals):
-            trial = self._trial(state, direction, alpha)
-            nfev += 1
+        trial_count = 0
+        while (trial_count < self.config.line_search_max_trials and
+               self.nfev - start_nfev <
+               self.config.line_search_max_evals):
+            trial = self._trial(
+                state, direction, alpha,
+                allow_nelec_projection=allow_nelec_projection,
+                nelec_limit_override=nelec_limit_override)
+            trial_count += 1
             trial_info = self._last_trial_info
             if trial_info.projected:
                 projected_armijo = (
@@ -2411,9 +3188,10 @@ class GrandCanonicalKRKS:
                     trial.objective <=
                     phi0 + c1 * trial_info.actual_slope)
                 if projected_armijo:
-                    return self._projected_line_search_result(
-                        state, trial, alpha, nfev,
-                        'accepted occupation-projected Armijo point')
+                    return finish(self._projected_line_search_result(
+                        state, trial, alpha, 0,
+                        'accepted occupation-projected Armijo point',
+                        info=trial_info))
                 if trial is not None:
                     self._shrink_nelec_trust_radius(
                         trial_info.trust_radius)
@@ -2422,51 +3200,104 @@ class GrandCanonicalKRKS:
                     break
                 continue
             phi = np.inf if trial is None else trial.objective
-            armijo = trial is not None and phi <= phi0 + c1 * alpha * dphi0
+            armijo = (
+                trial is not None and
+                phi <= phi0 + c1 * alpha * dphi0)
             if armijo and (best is None or phi < best[1].objective):
                 best = (alpha, trial)
-            if trial is None or not armijo or (it > 0 and phi >= previous_state.objective):
-                return self._zoom(state, direction, phi0, dphi0,
-                                  previous_alpha, previous_state, alpha, trial,
-                                  best, nfev, c2)
+            if (trial is None or not armijo or
+                    (previous_alpha > 0.0 and
+                     phi >= previous_state.objective)):
+                return self._zoom(
+                    state, direction, phi0, dphi0,
+                    previous_alpha, previous_state, alpha, trial,
+                    best, self.nfev - start_nfev, c2,
+                    start_nfev=start_nfev, trial_count=trial_count,
+                    cheap_start=cheap_start,
+                    reduction_start=reduction_start,
+                    allow_nelec_projection=allow_nelec_projection,
+                    nelec_limit_override=nelec_limit_override)
             dphi = self.inner(trial.gradient, direction)
             if abs(dphi) <= c2 * abs(dphi0):
-                return _LineSearchResult(True, trial, alpha, nfev, True, False, 'strong Wolfe')
+                return finish(_LineSearchResult(
+                    True, trial, alpha, strong_wolfe=True,
+                    curvature_qualified=True, message='strong Wolfe'))
             if dphi >= 0.0:
-                return self._zoom(state, direction, phi0, dphi0,
-                                  alpha, trial, previous_alpha, previous_state,
-                                  best, nfev, c2)
+                return self._zoom(
+                    state, direction, phi0, dphi0,
+                    alpha, trial, previous_alpha, previous_state,
+                    best, self.nfev - start_nfev, c2,
+                    start_nfev=start_nfev, trial_count=trial_count,
+                    cheap_start=cheap_start,
+                    reduction_start=reduction_start,
+                    allow_nelec_projection=allow_nelec_projection,
+                    nelec_limit_override=nelec_limit_override)
             previous_alpha, previous_state = alpha, trial
             grown = min(self.config.line_search_growth * alpha, alpha_max)
             if grown <= alpha:
                 break
             alpha = grown
         if best is not None:
-            return _LineSearchResult(True, best[1], best[0], nfev, False, True,
-                                     'accepted best Armijo point')
-        return _LineSearchResult(False, None, nfev=nfev, message='no Armijo point')
+            return finish(_LineSearchResult(
+                True, best[1], best[0], force_restart=True,
+                message='accepted best Armijo point'))
+        return finish(_LineSearchResult(
+            False, None, message='no Armijo point'))
 
-    def _armijo_fallback(self, state: _GCState, direction: Sequence) -> _LineSearchResult:
+    def _armijo_fallback(
+            self, state: _GCState, direction: Sequence, *,
+            alpha_cap_override: Optional[float] = None,
+            allow_nelec_projection: bool = True,
+            nelec_limit_override: Optional[float] = None
+            ) -> _LineSearchResult:
+        start_nfev = self.nfev
+        cheap_start = self.ncheap_nelec_evaluations
+        reduction_start = self.ncheap_nelec_alpha_reductions
+
+        def finish(value: _LineSearchResult) -> _LineSearchResult:
+            return self._finish_line_search(
+                value, start_nfev, cheap_start, reduction_start, 'armijo')
+
         alpha_max = self._alpha_cap(direction)
+        if alpha_cap_override is not None:
+            alpha_max = min(alpha_max, alpha_cap_override)
+        projection_enabled = (
+            allow_nelec_projection and
+            self.config.line_search_nelec_guard_mode != 'reject')
+        if not projection_enabled:
+            maximum = (self._active_nelec_limit(
+                state, use_adaptive_radius=False)
+                if nelec_limit_override is None else
+                float(nelec_limit_override))
+            alpha_max, _ = self._charge_feasible_alpha_cap(
+                state, direction, alpha_max, maximum=maximum)
         if alpha_max < self.config.line_search_alpha_min:
-            return _LineSearchResult(False, None, message='fallback step cap below minimum')
+            return finish(_LineSearchResult(
+                False, None, message='fallback step cap below minimum'))
         dphi0 = self.inner(state.gradient, direction)
         if dphi0 >= 0.0:
-            return _LineSearchResult(False, None, message='fallback residual is not downhill')
+            return finish(_LineSearchResult(
+                False, None, message='fallback residual is not downhill'))
         alpha = min(1.0, alpha_max)
-        nfev = 0
-        for _ in range(self.config.line_search_max_evals):
-            trial = self._trial(state, direction, alpha)
-            nfev += 1
+        trial_count = 0
+        while (trial_count < self.config.line_search_max_trials and
+               self.nfev - start_nfev <
+               self.config.line_search_max_evals):
+            trial = self._trial(
+                state, direction, alpha,
+                allow_nelec_projection=allow_nelec_projection,
+                nelec_limit_override=nelec_limit_override)
+            trial_count += 1
             trial_info = self._last_trial_info
             if trial_info.projected:
                 if (trial is not None and
                         trial.objective <= state.objective +
                         self.config.line_search_c1 *
                         trial_info.actual_slope):
-                    return self._projected_line_search_result(
-                        state, trial, alpha, nfev,
-                        'accepted occupation-projected Armijo fallback')
+                    return finish(self._projected_line_search_result(
+                        state, trial, alpha, 0,
+                        'accepted occupation-projected Armijo fallback',
+                        info=trial_info))
                 if trial is not None:
                     self._shrink_nelec_trust_radius(
                         trial_info.trust_radius)
@@ -2474,13 +3305,17 @@ class GrandCanonicalKRKS:
                 if alpha < self.config.line_search_alpha_min:
                     break
                 continue
-            if trial is not None and trial.objective <= state.objective + self.config.line_search_c1 * alpha * dphi0:
-                return _LineSearchResult(True, trial, alpha, nfev, False, True,
-                                         'monotone Armijo fallback')
+            if (trial is not None and
+                    trial.objective <= state.objective +
+                    self.config.line_search_c1 * alpha * dphi0):
+                return finish(_LineSearchResult(
+                    True, trial, alpha, force_restart=True,
+                    message='monotone Armijo fallback'))
             alpha *= self.config.armijo_backtrack_factor
             if alpha < self.config.line_search_alpha_min:
                 break
-        return _LineSearchResult(False, None, nfev=nfev, message='fallback found no Armijo point')
+        return finish(_LineSearchResult(
+            False, None, message='fallback found no Armijo point'))
 
     def _metrics(self, state: _GCState, previous: Optional[_GCState]) -> tuple[float, float, float, float]:
         if previous is None:
@@ -2519,9 +3354,26 @@ class GrandCanonicalKRKS:
         mismatch = self.max_block_rms(self.axpy(-1.0, expected, accepted.h_orth))
         if mismatch > 1.0e-8:
             raise RuntimeError(f'accepted state is not the evaluated step (mismatch {mismatch:g})')
-        if (accepted.objective > state.objective +
-                self.config.line_search_c1 * armijo_slope + 1.0e-12):
-            raise RuntimeError('accepted line-search point does not satisfy Armijo decrease')
+        if line_search.approximate_wolfe:
+            if (accepted.objective > state.objective +
+                    line_search.objective_allowance + 1.0e-12):
+                raise RuntimeError(
+                    'accepted approximate-Wolfe point exceeds its absolute '
+                    'objective allowance')
+            dphi = self.inner(accepted.gradient, direction)
+            lower = self.config.hager_zhang_sigma * dphi0
+            upper = ((2.0 * self.config.hager_zhang_delta - 1.0) *
+                     dphi0)
+            tolerance = 1.0e-12 * max(
+                1.0, abs(dphi0), abs(dphi))
+            if dphi < lower - tolerance or dphi > upper + tolerance:
+                raise RuntimeError(
+                    'accepted approximate-Wolfe point violates derivative '
+                    'bounds')
+        elif (accepted.objective > state.objective +
+              self.config.line_search_c1 * armijo_slope + 1.0e-12):
+            raise RuntimeError(
+                'accepted line-search point does not satisfy Armijo decrease')
 
     def _record(self, cycle: int, old: _GCState, new: _GCState, line_search: _LineSearchResult,
                 dphi0: float, beta: float, restart_reason: str,
@@ -2566,7 +3418,36 @@ class GrandCanonicalKRKS:
             line_search.nelec_trust_ratio,
             line_search.nelec_projection_response_fallback,
             line_search.nelec_projection_correction_rms,
-            self.nfev))
+            self.nfev,
+            line_search_method=line_search.line_search_method,
+            weak_wolfe=line_search.weak_wolfe,
+            approximate_wolfe=line_search.approximate_wolfe,
+            curvature_qualified=line_search.curvature_qualified,
+            line_search_objective_allowance=(
+                line_search.objective_allowance),
+            cheap_nelec_evaluations=(
+                line_search.cheap_nelec_evaluations),
+            cheap_nelec_alpha_reductions=(
+                line_search.cheap_nelec_alpha_reductions),
+            direction_preprojected=line_search.direction_preprojected,
+            direction_projection_mode=(
+                line_search.direction_projection_mode),
+            direction_raw_endpoint_scale=(
+                line_search.direction_raw_endpoint_scale),
+            direction_raw_delta_nelec=(
+                line_search.direction_raw_delta_nelec),
+            direction_projected_delta_nelec=(
+                line_search.direction_projected_delta_nelec),
+            direction_accepted_delta_nelec=(
+                line_search.direction_accepted_delta_nelec),
+            direction_projection_correction_rms=(
+                line_search.direction_projection_correction_rms),
+            direction_projection_response_fallback=(
+                line_search.direction_projection_response_fallback),
+            direction_projection_trust_radius=(
+                line_search.direction_projection_trust_radius),
+            direction_projection_trust_ratio=(
+                line_search.direction_projection_trust_ratio)))
         if self.fixed_electron_number:
             self.log.info('Canonical cycle %d  A = %.12g  E_DFT = %.12g  '
                           'N = %.10g  mu = %.12g  |g|_rms = %.3g  '
@@ -2612,7 +3493,8 @@ class GrandCanonicalKRKS:
         self.log.info(
             'L-BFGS history = %d  direction = %s  Wolfe = %s  '
             'metric scale = %.4g  %s',
-            history_size, direction_source, line_search.strong_wolfe,
+            history_size, direction_source,
+            line_search.curvature_qualified,
             self._last_lbfgs_metric_scale, pair_info['action'])
 
     def _record_diis(
@@ -2656,6 +3538,12 @@ class GrandCanonicalKRKS:
         self.max_projected_delta_nelec = 0.0
         self.max_nelec_projection_correction = 0.0
         self.last_nelec_trust_ratio = np.nan
+        self.ncheap_nelec_evaluations = 0
+        self.ncheap_nelec_alpha_reductions = 0
+        self.ndirection_projection_attempts = 0
+        self.ndirection_projection_acceptances = 0
+        self.ndirection_projection_fallbacks = 0
+        self.max_direction_projection_correction = 0.0
 
     def _canonical_continuation_config(
             self, residual_tolerance: float,
@@ -3088,11 +3976,48 @@ class GrandCanonicalKRKS:
                     message = 'stagnation: step cap below minimum'
                     break
                 restarted, restart_reason = True, 'step cap restart; ' + cap_reason
+            prepared = self._prepare_nlcg_direction(state, direction)
+            if not prepared.success:
+                direction, prepare_reason = self._restart_direction(state)
+                prepared = self._prepare_nlcg_direction(state, direction)
+                restarted = True
+                restart_reason = (
+                    prepare_reason + '; ' + prepared.message)
+            if not prepared.success:
+                message = 'direction preparation failure: ' + prepared.message
+                break
+            direction = prepared.direction
+            fixed_direction_projection = (
+                not self.fixed_electron_number and
+                self.config.nlcg_nelec_projection_strategy == 'direction')
+            nelec_limit = (
+                prepared.trust_radius
+                if fixed_direction_projection and
+                np.isfinite(prepared.trust_radius) else None)
             dphi0 = self.inner(state.gradient, direction)
-            line_search = self._line_search(state, direction)
+            line_search = self._line_search(
+                state, direction,
+                alpha_cap_override=prepared.alpha_cap,
+                allow_nelec_projection=not fixed_direction_projection,
+                nelec_limit_override=nelec_limit)
             if not line_search.success:
                 direction, fallback_reason = self._restart_direction(state)
-                line_search = self._armijo_fallback(state, direction)
+                prepared = self._prepare_nlcg_direction(state, direction)
+                if not prepared.success:
+                    message = (
+                        'fallback direction preparation failure: ' +
+                        prepared.message)
+                    break
+                direction = prepared.direction
+                nelec_limit = (
+                    prepared.trust_radius
+                    if fixed_direction_projection and
+                    np.isfinite(prepared.trust_radius) else None)
+                line_search = self._armijo_fallback(
+                    state, direction,
+                    alpha_cap_override=prepared.alpha_cap,
+                    allow_nelec_projection=not fixed_direction_projection,
+                    nelec_limit_override=nelec_limit)
                 restarted = True
                 restart_reason = fallback_reason + '; ' + line_search.message
                 dphi0 = self.inner(state.gradient, direction)
@@ -3100,10 +4025,18 @@ class GrandCanonicalKRKS:
                 message = 'line-search failure: ' + line_search.message
                 break
             new_state = line_search.state
+            line_search = self._decorate_direction_projection_result(
+                state, new_state, line_search, prepared)
             self._verify_accepted_step(
                 state, new_state, direction, line_search, dphi0)
             beta = 0.0
-            if force_restart or restarted or line_search.force_restart:
+            if (force_restart or restarted or line_search.force_restart or
+                    prepared.reset_memory):
+                if prepared.reset_memory:
+                    restart_reason = (
+                        restart_reason or
+                        'memory reset after fixed-direction occupation '
+                        'projection')
                 restart_reason = restart_reason or line_search.message
             elif cycle > 0 and cycle % self.config.cg_restart_interval != 0:
                 beta, beta_reason = self._cg_beta(state, new_state, direction)
@@ -3353,6 +4286,18 @@ class GrandCanonicalKRKS:
             self.max_nelec_projection_correction)
         self.mf.final_nelec_trust_radius_gc = self._nelec_trust_radius
         self.mf.last_nelec_trust_ratio_gc = self.last_nelec_trust_ratio
+        self.mf.cheap_nelec_evaluations_gc = (
+            self.ncheap_nelec_evaluations)
+        self.mf.cheap_nelec_alpha_reductions_gc = (
+            self.ncheap_nelec_alpha_reductions)
+        self.mf.direction_projection_attempts_gc = (
+            self.ndirection_projection_attempts)
+        self.mf.direction_projection_acceptances_gc = (
+            self.ndirection_projection_acceptances)
+        self.mf.direction_projection_fallbacks_gc = (
+            self.ndirection_projection_fallbacks)
+        self.mf.max_direction_projection_correction_gc = (
+            self.max_direction_projection_correction)
         self.mf.fixed_electron_number = self.fixed_electron_number
         self.mf.target_electron_number = self.target_electron_number
         self.mf.h_aux_gc = self.copy_blocks(state.h_orth)
@@ -3381,6 +4326,18 @@ class GrandCanonicalKRKS:
                 self.max_nelec_projection_correction),
             'final_nelec_trust_radius_gc': self._nelec_trust_radius,
             'last_nelec_trust_ratio_gc': self.last_nelec_trust_ratio,
+            'cheap_nelec_evaluations_gc': (
+                self.ncheap_nelec_evaluations),
+            'cheap_nelec_alpha_reductions_gc': (
+                self.ncheap_nelec_alpha_reductions),
+            'direction_projection_attempts_gc': (
+                self.ndirection_projection_attempts),
+            'direction_projection_acceptances_gc': (
+                self.ndirection_projection_acceptances),
+            'direction_projection_fallbacks_gc': (
+                self.ndirection_projection_fallbacks),
+            'max_direction_projection_correction_gc': (
+                self.max_direction_projection_correction),
             'fixed_electron_number': self.fixed_electron_number,
         })
         return GrandCanonicalResult(
@@ -3404,4 +4361,15 @@ class GrandCanonicalKRKS:
             max_nelec_projection_correction=(
                 self.max_nelec_projection_correction),
             final_nelec_trust_radius=self._nelec_trust_radius,
-            last_nelec_trust_ratio=self.last_nelec_trust_ratio)
+            last_nelec_trust_ratio=self.last_nelec_trust_ratio,
+            cheap_nelec_evaluations=self.ncheap_nelec_evaluations,
+            cheap_nelec_alpha_reductions=(
+                self.ncheap_nelec_alpha_reductions),
+            direction_projection_attempts=(
+                self.ndirection_projection_attempts),
+            direction_projection_acceptances=(
+                self.ndirection_projection_acceptances),
+            direction_projection_fallbacks=(
+                self.ndirection_projection_fallbacks),
+            max_direction_projection_correction=(
+                self.max_direction_projection_correction))
