@@ -1567,6 +1567,19 @@ class GrandCanonicalKRKS:
             history.clear()
             info['action'] = 'history cleared after occupation projection'
             return info
+        if projected_pair:
+            if line_search.nelec_projection_response_fallback:
+                history.clear()
+                info['action'] = (
+                    'history cleared after response-fallback projection')
+                return info
+            ratio = line_search.nelec_trust_ratio
+            if (not np.isfinite(ratio) or
+                    ratio < self.config.line_search_nelec_trust_good_ratio):
+                history.clear()
+                info['action'] = (
+                    'history cleared after unreliable projected model')
+                return info
         if not projected_pair:
             non_wolfe = fallback_used or not line_search.strong_wolfe
             if ((line_search.force_restart or non_wolfe) and
