@@ -653,6 +653,25 @@ def test_automatic_canonical_continuation_finds_fixed_mu_electron_number():
     assert abs(result.electron_number - expected_nelec) < 1.0e-10
     assert result.nfev == mf.veff_calls
     assert result.nfev > result.canonical_continuation_evaluations
+    assert solver.config.diis_max_coefficient_l1 == pytest.approx(10.0)
+
+
+def test_unbracketed_canonical_continuation_uses_screened_secant():
+    _, solver = _solver(canonical_continuation=True)
+    inner_config = solver._canonical_continuation_config(1.0e-4, 0.125)
+    assert inner_config.diis_max_coefficient_l1 == pytest.approx(50.0)
+    proposal = solver._canonical_continuation_proposal(
+        [(1.0, -0.04), (1.03, -0.03)], solver.hcore_ao,
+        current_nelec=1.03, maximum_step=0.1)
+    assert proposal == pytest.approx(1.12)
+
+
+def test_canonical_continuation_default_handoff_charge_is_conservative():
+    _, solver = _solver(canonical_continuation=True)
+    assert (solver.config.canonical_continuation_handoff_delta_nelec ==
+            pytest.approx(0.05))
+    assert (solver.config.canonical_continuation_interpolation_refine_width ==
+            pytest.approx(0.05))
 
 
 def test_fock_evaluation_count_includes_fresh_initial_guess_build():
