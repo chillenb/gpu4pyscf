@@ -146,6 +146,7 @@ class GrandCanonicalConfig:
     line_search_nelec_trust_expand: float = 2.0
     line_search_nelec_trust_bad_ratio: float = 2.5e-1
     line_search_nelec_trust_good_ratio: float = 7.5e-1
+    diis_preserve_accepted_history: bool = False
 
 
 @dataclass(frozen=True)
@@ -640,6 +641,8 @@ class GrandCanonicalKRKS:
                 raise TypeError(f'{name} must be boolean')
 
     def _validate_diis_config(self) -> None:
+        if not isinstance(self.config.diis_preserve_accepted_history, bool):
+            raise TypeError('diis_preserve_accepted_history must be boolean')
         switch = self.config.diis_switch_residual_rms
         if switch is not None:
             switch = _as_float(switch, 'diis_switch_residual_rms')
@@ -1841,6 +1844,9 @@ class GrandCanonicalKRKS:
         action_parts = []
         model_repairs = 0
         while True:
+            accepted_history = (
+                list(history)
+                if self.config.diis_preserve_accepted_history else None)
             coefficients, condition, coefficient_l1, coefficient_action = (
                 self._diis_coefficients(history))
             if coefficient_action:
@@ -1854,6 +1860,31 @@ class GrandCanonicalKRKS:
                 residual_target_rms=residual_target_rms,
                 allow_restoration=allow_restoration,
                 best_residual_rms=best_residual_rms)
+            if accepted_history is not None:
+                model_history_size = len(history)
+                history[:] = accepted_history
+                if trial is not None:
+                    if len(accepted_history) != model_history_size:
+                        action_parts.append(
+                            'restored accepted DIIS history after temporary '
+                            'coefficient pruning')
+                    break
+                if model_history_size > 1:
+                    fallback_target = self.copy_blocks(history[-1].fock)
+                    (trial, damping, fallback_rejection,
+                     _) = self._try_diis_target(
+                         state, fallback_target, starting_damping,
+                         self.config.diis_max_backtracks,
+                         residual_target_rms=residual_target_rms,
+                         allow_restoration=allow_restoration,
+                         best_residual_rms=best_residual_rms)
+                    action_parts.append(
+                        'preserved accepted DIIS history; tried latest-Fock '
+                        'fallback after rejected model')
+                    if trial is not None:
+                        break
+                    rejection = fallback_rejection
+                break
             if trial is not None:
                 break
             if (rejected_state is not None and
