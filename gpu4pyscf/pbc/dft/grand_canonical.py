@@ -98,12 +98,15 @@ class GrandCanonicalConfig:
     canonical_continuation_max_outer: int = 16
     canonical_continuation_coarse_residual_tol: float = 4.0e-6
     canonical_continuation_bracketed_residual_tol: float = 1.0e-7
-    canonical_continuation_handoff_delta_nelec: float = 1.0e-3
+    canonical_continuation_handoff_delta_nelec: float = 5.0e-2
+    canonical_continuation_unbracketed_handoff_delta_nelec: float = 1.0e-3
     canonical_continuation_initial_delta_nelec: float = 3.0e-2
     canonical_continuation_max_delta_nelec: float = 1.0
     canonical_continuation_min_delta_nelec: float = 1.0e-5
     canonical_continuation_initial_damping: float = 0.125
     canonical_continuation_final_damping: float = 1.0 / 256.0
+    canonical_continuation_diis_max_coefficient_l1: float = 50.0
+    canonical_continuation_interpolation_refine_width: float = 5.0e-2
 
     # Optional branch selector for low-temperature calculations.  This shifts
     # only the initial auxiliary Hamiltonian by a scalar; mu and every
@@ -655,11 +658,14 @@ class GrandCanonicalKRKS:
             'canonical_continuation_coarse_residual_tol',
             'canonical_continuation_bracketed_residual_tol',
             'canonical_continuation_handoff_delta_nelec',
+            'canonical_continuation_unbracketed_handoff_delta_nelec',
             'canonical_continuation_initial_delta_nelec',
             'canonical_continuation_max_delta_nelec',
             'canonical_continuation_min_delta_nelec',
             'canonical_continuation_initial_damping',
             'canonical_continuation_final_damping',
+            'canonical_continuation_diis_max_coefficient_l1',
+            'canonical_continuation_interpolation_refine_width',
         )
         for name in positive:
             value = getattr(self.config, name)
@@ -675,6 +681,11 @@ class GrandCanonicalKRKS:
             raise ValueError(
                 'canonical_continuation_min_delta_nelec may not exceed '
                 'canonical_continuation_initial_delta_nelec')
+        if (self.config.canonical_continuation_unbracketed_handoff_delta_nelec >
+                self.config.canonical_continuation_handoff_delta_nelec):
+            raise ValueError(
+                'canonical_continuation_unbracketed_handoff_delta_nelec may '
+                'not exceed canonical_continuation_handoff_delta_nelec')
         if (self.config.canonical_continuation_initial_delta_nelec >
                 self.config.canonical_continuation_max_delta_nelec):
             raise ValueError(
@@ -2096,6 +2107,9 @@ class GrandCanonicalKRKS:
             # objective line searches to discover the same local model.
             diis_switch_residual_rms=max(1.0, residual_tolerance),
             diis_initial_damping=initial_damping,
+            diis_max_coefficient_l1=max(
+                self.config.diis_max_coefficient_l1,
+                self.config.canonical_continuation_diis_max_coefficient_l1),
             required_consecutive_conv=1,
         )
 
@@ -2151,7 +2165,24 @@ class GrandCanonicalKRKS:
             else:
                 proposal = 0.5 * (lo + hi)
         elif proposal is None:
-            proposal = self._electron_number_at_mu(h_orth, self.mu)
+            # Before a bracket exists, use the measured screened dmu/dN once
+            # two canonical states are available.  The frozen-H Fermi
+            # projection is useful for the first move but can be extremely
+            # aggressive at low temperature; a positive local secant avoids
+            # geometrically growing past a distant target mu.
+            current_n, current_error = samples[-1]
+            previous = next(
+                ((n, error) for n, error in reversed(samples[:-1])
+                 if abs(n - current_n) >= minimum_step), None)
+            if previous is not None:
+                slope = ((current_error - previous[1]) /
+                         (current_n - previous[0]))
+                if np.isfinite(slope) and slope > 0.0:
+                    local = current_n - current_error / slope
+                    if np.isfinite(local):
+                        proposal = local
+            if proposal is None:
+                proposal = self._electron_number_at_mu(h_orth, self.mu)
             if abs(proposal - current_nelec) < minimum_step:
                 error = samples[-1][1]
                 proposal = current_nelec - np.sign(error) * minimum_step
@@ -2191,6 +2222,7 @@ class GrandCanonicalKRKS:
         initialization_evaluations = self.nfev
         current_nelec = self._electron_number_at_mu(h, self.mu)
         samples: list[tuple[float, float]] = []
+        state_samples: list[tuple[float, float, list]] = []
         continuation_history: list[IterationRecord] = []
         continuation_evaluations = 0
         continuation_iterations = 0
@@ -2198,16 +2230,20 @@ class GrandCanonicalKRKS:
         best_handoff_delta_nelec = np.inf
         best_h = self.copy_blocks(h)
         outer_steps = 0
+        interpolated_refinement_used = False
+        next_is_interpolated_refinement = False
         outer_trust_radius = (
             self.config.canonical_continuation_initial_delta_nelec)
 
         for outer in range(self.config.canonical_continuation_max_outer):
+            is_interpolated_refinement = next_is_interpolated_refinement
+            next_is_interpolated_refinement = False
             had_bracket = (
                 any(value < 0.0 for _, value in samples) and
                 any(value > 0.0 for _, value in samples))
             residual_tolerance = (
                 self.config.canonical_continuation_bracketed_residual_tol
-                if had_bracket else
+                if had_bracket and not is_interpolated_refinement else
                 self.config.canonical_continuation_coarse_residual_tol)
             # A conservative fixed-point seed is cheaper than trying and
             # rejecting several over-aggressive full DIIS extrapolations.
@@ -2232,31 +2268,115 @@ class GrandCanonicalKRKS:
             target_nelec = self._electron_number_at_mu(h, self.mu)
             handoff_delta_nelec = target_nelec - current_nelec
             samples.append((current_nelec, error))
+            state_samples.append(
+                (current_nelec, error, self.copy_blocks(h)))
+            bracketed = (
+                any(value < 0.0 for _, value in samples) and
+                any(value > 0.0 for _, value in samples))
             self.log.info(
                 'Canonical continuation %d: N = %.12g, optimized mu = '
                 '%.12g, target mu = %.12g, delta mu = %.3g, residual = %.3g, '
-                'Fock evaluations = %d',
+                'frozen delta N = %.3g, Fock evaluations = %d',
                 outer, current_nelec, canonical_result.mu, self.mu, error,
-                canonical_result.residual_rms, canonical_result.nfev)
+                canonical_result.residual_rms, handoff_delta_nelec,
+                canonical_result.nfev)
 
             if abs(handoff_delta_nelec) < abs(best_handoff_delta_nelec):
                 best_handoff_delta_nelec = handoff_delta_nelec
                 best_error = error
                 best_h = self.copy_blocks(h)
 
+            # A sign-changing pair of converged canonical Fock matrices also
+            # supplies a cheap approximation to the fixed-mu solution.  The
+            # auxiliary Hamiltonian is smooth in N even when the frozen-H
+            # Fermi response is very sharp.  Interpolate it to zero mu error,
+            # then require that its fixed-mu electron number agree with the
+            # same secant interpolation.  This can avoid another accurately
+            # converged fixed-N solve without relaxing the charge safeguard.
+            interpolated_h = None
+            interpolated_delta_nelec = np.inf
+            interpolated_bracket_width = np.inf
+            if bracketed:
+                negative_states = [item for item in state_samples
+                                   if item[1] < 0.0]
+                positive_states = [item for item in state_samples
+                                   if item[1] > 0.0]
+                lower, upper = min(
+                    ((lo, hi) for lo in negative_states
+                     for hi in positive_states),
+                    key=lambda pair: abs(pair[0][0] - pair[1][0]))
+                denominator = upper[1] - lower[1]
+                if denominator != 0.0:
+                    interpolated_bracket_width = abs(upper[0] - lower[0])
+                    fraction = -lower[1] / denominator
+                    interpolated_nelec = (
+                        (1.0 - fraction) * lower[0] +
+                        fraction * upper[0])
+                    interpolated_h = self.hermitize_blocks([
+                        (1.0 - fraction) * hlo + fraction * hhi
+                        for hlo, hhi in zip(lower[2], upper[2])])
+                    interpolated_delta_nelec = (
+                        self._electron_number_at_mu(
+                            interpolated_h, self.mu) -
+                        interpolated_nelec)
+                    if (abs(interpolated_delta_nelec) <
+                            abs(best_handoff_delta_nelec)):
+                        best_handoff_delta_nelec = interpolated_delta_nelec
+                        best_error = 0.0
+                        best_h = self.copy_blocks(interpolated_h)
+
             # Continuation is a globalization device, not the final solver.
             # Measure handoff safety by the frozen-H Fermi response rather
             # than an absolute mu window: the same delta mu is benign in a
             # gap but can move many electrons when sigma is small.  This
             # projection is cheap and does not require knowing the final N.
+            unbracketed_handoff_limit = (
+                self.config.canonical_continuation_unbracketed_handoff_delta_nelec)
+            handoff_limit = (
+                self.config.canonical_continuation_handoff_delta_nelec
+                if bracketed else unbracketed_handoff_limit)
             if (canonical_result.converged and
-                    abs(handoff_delta_nelec) <=
-                    self.config.canonical_continuation_handoff_delta_nelec):
+                    abs(handoff_delta_nelec) <= handoff_limit):
+                best_h = self.copy_blocks(h)
+                best_handoff_delta_nelec = handoff_delta_nelec
+                best_error = error
                 self.log.info(
                     'Canonical continuation reached the fixed-mu handoff '
-                    'window (delta N = %.3g, delta mu = %.3g); starting '
-                    'fixed-mu polish', handoff_delta_nelec, error)
+                    'window (delta N = %.3g, delta mu = %.3g, bracketed = '
+                    '%s); starting fixed-mu polish', handoff_delta_nelec,
+                    error, bracketed)
                 break
+            if (canonical_result.converged and interpolated_h is not None and
+                    abs(interpolated_delta_nelec) <= handoff_limit):
+                if (not interpolated_refinement_used and
+                        interpolated_bracket_width >
+                        self.config.
+                        canonical_continuation_interpolation_refine_width):
+                    self.log.info(
+                        'Canonical continuation secant interpolation is '
+                        'inside the charge window (delta N = %.3g); using '
+                        'it to seed one fixed-N refinement',
+                        interpolated_delta_nelec)
+                    h = interpolated_h
+                    current_nelec = interpolated_nelec
+                    interpolated_refinement_used = True
+                    next_is_interpolated_refinement = True
+                    continue
+                if not interpolated_refinement_used:
+                    self.log.info(
+                        'Canonical continuation secant-interpolated handoff '
+                        '(delta N = %.3g); starting fixed-mu polish',
+                        interpolated_delta_nelec)
+                    best_h = self.copy_blocks(interpolated_h)
+                    best_handoff_delta_nelec = interpolated_delta_nelec
+                    best_error = 0.0
+                    break
+                # After a broad bracket required canonical refinement, keep
+                # solving the cheap scalar N root until an actual canonical
+                # state reaches the handoff window.  A second interpolation
+                # can have a tiny charge mismatch yet a noisy fixed-mu DIIS
+                # model, causing far more Fock trials than one final fixed-N
+                # solve.
             if not canonical_result.converged:
                 self.log.warn(
                     'Canonical continuation inner solve did not converge: %s; '
@@ -2264,9 +2384,6 @@ class GrandCanonicalKRKS:
                     canonical_result.message)
                 break
 
-            bracketed = (
-                any(value < 0.0 for _, value in samples) and
-                any(value > 0.0 for _, value in samples))
             if (not bracketed and len(samples) >= 2 and
                     np.sign(samples[-1][1]) == np.sign(samples[-2][1])):
                 outer_trust_radius = min(
@@ -2289,9 +2406,13 @@ class GrandCanonicalKRKS:
         pre_evaluations = initialization_evaluations + continuation_evaluations
         pre_iterations = continuation_iterations
         saved_initial_damping = self.config.diis_initial_damping
+        saved_max_coefficient_l1 = self.config.diis_max_coefficient_l1
         self.config.diis_initial_damping = min(
             saved_initial_damping,
             self.config.canonical_continuation_final_damping)
+        self.config.diis_max_coefficient_l1 = max(
+            saved_max_coefficient_l1,
+            self.config.canonical_continuation_diis_max_coefficient_l1)
         try:
             if self.config.optimizer == 'nlcg':
                 final_result = self._kernel_nlcg(h0=h)
@@ -2301,6 +2422,7 @@ class GrandCanonicalKRKS:
                 raise AssertionError('validated optimizer is unreachable')
         finally:
             self.config.diis_initial_damping = saved_initial_damping
+            self.config.diis_max_coefficient_l1 = saved_max_coefficient_l1
 
         final_history = self._continuation_history(
             final_result.history, pre_iterations, final_result.electron_number)
