@@ -934,6 +934,14 @@ def test_residual_diis_trust_ratio_updates_next_damping():
     assert ratio == pytest.approx(2.0)
     assert next_damping == pytest.approx(small_damping)
 
+    # Experiments may opt into the standard ratio-only expansion rule while
+    # the default retains the extra 2% progress floor above.
+    solver.config.diis_trust_expand_min_relative_reduction = 0.0
+    next_damping, ratio = solver._next_diis_damping(
+        state, stagnant, small_prediction, small_damping, small_damping)
+    assert ratio == pytest.approx(2.0)
+    assert next_damping == pytest.approx(2.0 * small_damping)
+
     with pytest.raises(ValueError, match='trust ratios'):
         config = GrandCanonicalConfig(
             diis_trust_shrink_ratio=0.8,
@@ -965,6 +973,31 @@ def test_diis_backtracking_stops_when_local_secant_cannot_reduce_residual():
     assert len(calls) == 2
     assert 'secant predicts no acceptable residual' in reason
     assert rejected is not None
+
+
+def test_diis_secant_does_not_extrapolate_grossly_nonlinear_trials():
+    _, solver = _solver(diis_switch_residual_rms=1.0e-3)
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    target = solver.axpy(
+        0.1, [cp.eye(2, dtype=cp.complex128)], state.h_orth)
+    factors = iter((3.0, 2.0, 0.99))
+    calls = []
+
+    def trial(current, direction, alpha, allow_nelec_projection=True):
+        assert not allow_nelec_projection
+        calls.append(alpha)
+        return replace(
+            current, residual_rms=next(factors) * current.residual_rms)
+
+    solver._trial = trial
+    accepted, damping, reason, _ = solver._try_diis_target(
+        state, target, starting_damping=0.1, max_backtracks=8)
+    assert accepted is not None
+    assert damping == pytest.approx(0.025)
+    assert reason == ''
+    assert calls == pytest.approx([0.1, 0.05, 0.025])
 
 
 def test_residual_diis_repairs_rejected_model_by_pruning_oldest_vector():
