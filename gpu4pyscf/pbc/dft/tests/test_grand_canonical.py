@@ -267,6 +267,11 @@ def test_hager_zhang_configuration_validation():
             config=config)
     with pytest.raises(ValueError, match='objective_noise'):
         _solver(hager_zhang_objective_noise=-1.0)
+    with pytest.raises(ValueError, match='fixed-direction'):
+        _solver(
+            line_search_method='hager-zhang',
+            line_search_nelec_guard_mode='fermi-response',
+            nlcg_nelec_projection_strategy='trial')
 
 
 def test_scalar_shift_projection_hits_charge_boundary_and_is_identity():
@@ -577,6 +582,49 @@ def test_fixed_direction_projection_is_bypassed_at_fixed_n():
         prepared.direction[0] - direction[0])).item()) < 1.0e-14
 
 
+def test_charge_feasible_fixed_direction_preserves_cg_normalization():
+    _, solver = _solver(
+        line_search_nelec_guard_mode='scalar-shift',
+        line_search_nelec_guard_residual_rms=None,
+        line_search_max_delta_nelec=10.0,
+        line_search_nelec_guard_max_delta_nelec=10.0,
+        line_search_nelec_trust_initial=10.0,
+        nlcg_nelec_projection_strategy='direction')
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    direction = [100.0 * cp.asarray(
+        [[0.0, 1.0j], [-1.0j, 0.0]], dtype=cp.complex128)]
+
+    prepared = solver._prepare_nlcg_direction(state, direction)
+
+    assert prepared.success
+    assert not prepared.preprojected
+    assert prepared.alpha_cap < 1.0
+    assert float(cp.max(cp.abs(
+        prepared.direction[0] - direction[0])).item()) < 1.0e-13
+
+
+def test_fallback_line_search_work_is_combined():
+    primary = _LineSearchResult(
+        False, None, nfev=3, message='no bracket',
+        line_search_method='hager-zhang', cheap_nelec_evaluations=7,
+        cheap_nelec_alpha_reductions=2)
+    fallback = _LineSearchResult(
+        True, None, nfev=2, message='Armijo',
+        line_search_method='armijo', cheap_nelec_evaluations=5,
+        cheap_nelec_alpha_reductions=4)
+
+    combined = GrandCanonicalKRKS._combine_line_search_work(
+        primary, fallback)
+
+    assert combined.nfev == 5
+    assert combined.cheap_nelec_evaluations == 12
+    assert combined.cheap_nelec_alpha_reductions == 6
+    assert combined.line_search_method == 'armijo'
+    assert 'Hager-Zhang'.lower() in combined.message.lower()
+
+
 def test_charge_guard_checks_interior_of_endpoint_safe_line():
     h = cp.diag(cp.asarray([0.2, -0.6], dtype=cp.float64))
     solver = GrandCanonicalKRKS(
@@ -751,6 +799,37 @@ def test_zoom_accepts_armijo_point_at_electron_number_trust_boundary():
     assert result.trust_boundary
     assert result.force_restart
     assert 'trust boundary' in result.message
+
+
+def test_zoom_cheap_rejections_do_not_consume_expensive_budget(monkeypatch):
+    _, solver = _solver()
+    solver.config.line_search_zoom_evals = 1
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    direction = solver.scale_blocks(-1.0, state.gradient)
+    dphi0 = solver.inner(state.gradient, direction)
+    calls = []
+
+    def delayed_feasible(unused_state, unused_direction, alpha,
+                         **unused_kwargs):
+        calls.append(alpha)
+        solver._last_trial_info = _TrialInfo()
+        if len(calls) <= 5:
+            solver._last_trial_rejected_by_nelec = True
+            return None
+        solver._last_trial_rejected_by_nelec = False
+        solver.nfev += 1
+        return replace(state, objective=state.objective - 1.0)
+
+    monkeypatch.setattr(solver, '_trial', delayed_feasible)
+    result = solver._zoom(
+        state, direction, state.objective, dphi0,
+        0.0, state, 1.0, None, None, 0)
+
+    assert result.success
+    assert result.nfev == 1
+    assert len(calls) == 6
 
 
 def test_hager_zhang_weak_wolfe_caches_complex_fixed_fock_trials(
