@@ -6,8 +6,9 @@ from pyscf.pbc import gto
 
 from gpu4pyscf.lib.cupy_helper import tag_array
 from gpu4pyscf.pbc.dft.grand_canonical import (
-    GrandCanonicalConfig, GrandCanonicalKRKS, _LBFGSPair, _LineSearchResult,
-    fermi_divided_difference, fermi_entropy, fermi_occupations,
+    GrandCanonicalConfig, GrandCanonicalKRKS, _DIISItem, _LBFGSPair,
+    _LineSearchResult, fermi_divided_difference, fermi_entropy,
+    fermi_occupations,
 )
 
 
@@ -30,6 +31,7 @@ class _FixedFockKRKS:
         self.verbose = 0
         self.veff_seen = None
         self.energy_veff_seen = None
+        self.veff_calls = 0
 
     def get_ovlp(self, cell, kpts):
         return cp.stack([cp.eye(f.shape[0], dtype=f.dtype) for f in self._fock])
@@ -44,6 +46,7 @@ class _FixedFockKRKS:
         return cp.stack([cp.eye(f.shape[0], dtype=f.dtype) for f in self._fock])
 
     def get_veff(self, cell, dm, **kwargs):
+        self.veff_calls += 1
         self.last_dm = dm
         self.veff_seen = cp.zeros_like(dm)
         return self.veff_seen
@@ -88,7 +91,12 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             cg_update='fletcher-reeves', cg_beta_max=5.0,
             electron_number=None, optimizer='nlcg',
             lbfgs_initial_metric='fermi', lbfgs_history_size=5,
-            lbfgs_line_search_c2=0.9):
+            lbfgs_line_search_c2=0.9, diis_switch_residual_rms=None,
+            diis_max_objective_increase=1.0e-5,
+            diis_max_delta_nelec=5.0e-2,
+            line_search_nelec_guard_residual_rms=1.0e-2,
+            line_search_max_delta_nelec=1.0,
+            line_search_nelec_guard_max_delta_nelec=5.0e-2):
     f0 = cp.asarray([[[-0.7, 0.12j], [-0.12j, 0.3]]], dtype=cp.complex128)
     mf = _FixedFockKRKS(f0)
     config = GrandCanonicalConfig(
@@ -104,6 +112,14 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
         lbfgs_initial_metric=lbfgs_initial_metric,
         lbfgs_history_size=lbfgs_history_size,
         lbfgs_line_search_c2=lbfgs_line_search_c2,
+        diis_switch_residual_rms=diis_switch_residual_rms,
+        diis_max_objective_increase=diis_max_objective_increase,
+        diis_max_delta_nelec=diis_max_delta_nelec,
+        line_search_nelec_guard_residual_rms=(
+            line_search_nelec_guard_residual_rms),
+        line_search_max_delta_nelec=line_search_max_delta_nelec,
+        line_search_nelec_guard_max_delta_nelec=(
+            line_search_nelec_guard_max_delta_nelec),
     )
     return mf, GrandCanonicalKRKS(
         mf, mu=mu, sigma=0.15, config=config,
@@ -144,6 +160,65 @@ def test_fixed_fock_gradient_and_evaluator_pairing():
     assert abs(finite_difference - analytic) < 2.0e-6
     assert solver.inner(state.gradient, state.residual) <= 1.0e-12
     assert mf.energy_veff_seen is mf.veff_seen
+
+
+def test_cheap_fixed_mu_electron_number_matches_full_evaluation():
+    _, solver = _solver()
+    h = [cp.asarray([[-0.3, 0.08 + 0.03j],
+                     [0.08 - 0.03j, 0.2]])]
+    direction = [cp.asarray([[0.02, 0.01j], [-0.01j, -0.015]])]
+    candidate = solver._sanitize_h(solver.axpy(0.2, direction, h))
+    cheap = solver._cheap_fixed_mu_electron_number(candidate)
+    full = solver.evaluate(candidate)
+    assert abs(cheap - full.electron_number) < 1.0e-12
+
+
+def test_electron_number_prescreen_rejects_without_fock_build():
+    mf, solver = _solver(
+        line_search_nelec_guard_residual_rms=None,
+        line_search_max_delta_nelec=1.0e-3,
+        line_search_nelec_guard_max_delta_nelec=1.0e-3)
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    direction = [cp.eye(2, dtype=cp.complex128)]
+    nfev_before = solver.nfev
+    veff_before = mf.veff_calls
+    trial = solver._trial(state, direction, 1.0)
+    assert trial is None
+    assert solver.nfev == nfev_before
+    assert mf.veff_calls == veff_before
+    assert solver.ncheap_nelec_reject == 1
+
+
+def test_electron_number_prescreen_is_bypassed_at_fixed_n():
+    mf, solver = _solver(
+        electron_number=1.25,
+        line_search_nelec_guard_residual_rms=1.0,
+        line_search_max_delta_nelec=1.0e-12,
+        line_search_nelec_guard_max_delta_nelec=1.0e-12)
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    direction = [cp.eye(2, dtype=cp.complex128)]
+    nfev_before = solver.nfev
+    veff_before = mf.veff_calls
+    trial = solver._trial(state, direction, 1.0)
+    assert trial is not None
+    assert solver.nfev == nfev_before + 1
+    assert mf.veff_calls == veff_before + 1
+    assert solver.ncheap_nelec_reject == 0
+
+
+def test_electron_number_prescreen_configuration_validation():
+    with pytest.raises(ValueError, match='guard_residual_rms'):
+        _solver(line_search_nelec_guard_residual_rms=0.0)
+    with pytest.raises(ValueError, match='max_delta_nelec'):
+        _solver(line_search_max_delta_nelec=0.0)
+    with pytest.raises(ValueError, match='may not exceed'):
+        _solver(
+            line_search_max_delta_nelec=0.5,
+            line_search_nelec_guard_max_delta_nelec=0.6)
 
 
 def test_fixed_electron_number_gradient_and_mu_constraint():
@@ -291,6 +366,76 @@ def test_lbfgs_configuration_aliases_validation_and_fixed_n_metric():
         _solver(optimizer='not-an-optimizer')
     with pytest.raises(ValueError, match='lbfgs_history_size'):
         _solver(optimizer='lbfgs', lbfgs_history_size=-1)
+
+
+def test_residual_diis_configuration_and_pulay_coefficients():
+    _, solver = _solver(diis_switch_residual_rms=1.0e-3)
+    assert solver.config.diis_switch_residual_rms == 1.0e-3
+    with pytest.raises(ValueError, match='may not be smaller'):
+        _solver(diis_switch_residual_rms=1.0e-8)
+
+    fock = [cp.zeros((2, 2), dtype=cp.complex128)]
+    history = [
+        _DIISItem(fock, fock, [cp.diag(cp.asarray([1.0, 0.0]))]),
+        _DIISItem(fock, fock, [cp.diag(cp.asarray([0.0, 1.0]))]),
+    ]
+    coefficients, condition, coefficient_l1, action = (
+        solver._diis_coefficients(history))
+    assert action == ''
+    assert condition == pytest.approx(1.0)
+    assert coefficient_l1 == pytest.approx(1.0)
+    assert np.allclose(coefficients, [0.5, 0.5])
+
+
+def test_residual_diis_accepts_noise_scale_objective_change_but_not_charge_jump():
+    _, solver = _solver(
+        diis_switch_residual_rms=1.0e-3,
+        diis_max_objective_increase=1.0e-5,
+        diis_max_delta_nelec=5.0e-2)
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    trial = replace(
+        state, residual_rms=0.5 * state.residual_rms,
+        objective=state.objective + 5.0e-6,
+        electron_number=state.electron_number + 1.0e-2)
+    acceptable, reason = solver._diis_trial_acceptable(state, trial)
+    assert acceptable
+    assert reason == ''
+
+    large_charge_change = replace(
+        trial, electron_number=state.electron_number + 1.0e-1)
+    acceptable, reason = solver._diis_trial_acceptable(
+        state, large_charge_change)
+    assert not acceptable
+    assert 'electron-number' in reason
+
+    large_objective_change = replace(
+        trial, objective=state.objective + 2.0e-5)
+    acceptable, reason = solver._diis_trial_acceptable(
+        state, large_objective_change)
+    assert not acceptable
+    assert 'objective increase' in reason
+
+
+def test_residual_diis_polishes_fixed_fock_for_both_direct_optimizers():
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j],
+                      [0.19 + 0.11j, 0.6]])]
+    for optimizer in ('nlcg', 'lbfgs'):
+        _, solver = _solver(
+            optimizer=optimizer, diis_switch_residual_rms=1.0,
+            diis_max_delta_nelec=2.0)
+        result = solver.kernel(h0=h0)
+        assert result.converged, f'{optimizer}: {result.message}'
+        assert result.message == 'converged residual-DIIS fixed point'
+        assert result.niter == 1
+        assert result.history[0].optimizer == 'diis'
+        assert result.history[0].search_direction_source == 'residual-diis'
+        assert result.history[0].diis_history_size == 1
+        assert result.history[0].diis_damping == 1.0
+        assert result.residual_rms < solver.config.conv_tol_residual_rms
+        if optimizer == 'lbfgs':
+            assert solver._lbfgs_history == []
 
 
 def test_fermi_inverse_metric_maps_exact_gradient_to_z():
