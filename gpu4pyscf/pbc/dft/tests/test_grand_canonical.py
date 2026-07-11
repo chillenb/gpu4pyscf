@@ -1,12 +1,13 @@
 import cupy as cp
 import numpy as np
 import pytest
+from dataclasses import replace
 from pyscf.pbc import gto
 
 from gpu4pyscf.lib.cupy_helper import tag_array
 from gpu4pyscf.pbc.dft.grand_canonical import (
-    GrandCanonicalConfig, GrandCanonicalKRKS, fermi_divided_difference,
-    fermi_entropy, fermi_occupations,
+    GrandCanonicalConfig, GrandCanonicalKRKS, _LBFGSPair, _LineSearchResult,
+    fermi_divided_difference, fermi_entropy, fermi_occupations,
 )
 
 
@@ -85,7 +86,9 @@ class _TaggedSolventKRKS(_FixedFockKRKS):
 
 def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             cg_update='fletcher-reeves', cg_beta_max=5.0,
-            electron_number=None):
+            electron_number=None, optimizer='nlcg',
+            lbfgs_initial_metric='fermi', lbfgs_history_size=5,
+            lbfgs_line_search_c2=0.9):
     f0 = cp.asarray([[[-0.7, 0.12j], [-0.12j, 0.3]]], dtype=cp.complex128)
     mf = _FixedFockKRKS(f0)
     config = GrandCanonicalConfig(
@@ -97,6 +100,10 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
         initial_electron_number=initial_electron_number,
         cg_update=cg_update,
         cg_beta_max=cg_beta_max,
+        optimizer=optimizer,
+        lbfgs_initial_metric=lbfgs_initial_metric,
+        lbfgs_history_size=lbfgs_history_size,
+        lbfgs_line_search_c2=lbfgs_line_search_c2,
     )
     return mf, GrandCanonicalKRKS(
         mf, mu=mu, sigma=0.15, config=config,
@@ -270,6 +277,201 @@ def test_all_cg_updates_converge_fixed_fock_problem():
         assert result.converged, f'{update}: {result.message}'
 
 
+def test_lbfgs_configuration_aliases_validation_and_fixed_n_metric():
+    _, solver = _solver(optimizer='L-BFGS', lbfgs_initial_metric='fermi_response')
+    assert solver.config.optimizer == 'lbfgs'
+    assert solver.config.lbfgs_initial_metric == 'fermi'
+
+    _, canonical = _solver(
+        optimizer='limited memory bfgs', electron_number=1.2)
+    assert canonical.config.optimizer == 'lbfgs'
+    assert canonical.config.lbfgs_initial_metric == 'scalar'
+
+    with pytest.raises(ValueError, match='unsupported optimizer'):
+        _solver(optimizer='not-an-optimizer')
+    with pytest.raises(ValueError, match='lbfgs_history_size'):
+        _solver(optimizer='lbfgs', lbfgs_history_size=-1)
+
+
+def test_fermi_inverse_metric_maps_exact_gradient_to_z():
+    _, solver = _solver(optimizer='lbfgs')
+    solver.config.lbfgs_inverse_metric_cap = 1.0e6
+    h = [cp.asarray([[-0.3, 0.08 + 0.03j],
+                     [0.08 - 0.03j, 0.2]])]
+    state = solver.evaluate(h)
+    metric_gradient = solver._apply_fermi_inverse_metric(
+        state, state.gradient)
+    assert float(cp.max(cp.abs(metric_gradient[0] - state.z[0])).item()) < 1.0e-11
+
+
+def test_lbfgs_two_loop_matches_dense_inverse_bfgs_complex_blocks():
+    _, solver = _solver(
+        optimizer='lbfgs', lbfgs_initial_metric='scalar')
+
+    def block(vector):
+        off_diagonal = (vector[2] + 1j * vector[3]) / np.sqrt(2.0)
+        return [cp.asarray([[vector[0], off_diagonal],
+                            [off_diagonal.conjugate(), vector[1]]])]
+
+    hessian = np.asarray([
+        [3.0, 0.2, 0.1, 0.0],
+        [0.2, 2.0, 0.0, -0.1],
+        [0.1, 0.0, 1.5, 0.15],
+        [0.0, -0.1, 0.15, 1.0],
+    ])
+    steps = [
+        np.asarray([0.2, -0.1, 0.15, 0.05]),
+        np.asarray([-0.05, 0.12, 0.08, -0.09]),
+    ]
+    pairs = []
+    for step in steps:
+        gradient_change = hessian @ step
+        sy = float(step @ gradient_change)
+        pairs.append(_LBFGSPair(
+            block(step), block(gradient_change), 1.0 / sy, sy,
+            float(np.linalg.norm(step)),
+            float(np.linalg.norm(gradient_change)),
+            sy / (np.linalg.norm(step) * np.linalg.norm(gradient_change))))
+
+    gradient = np.asarray([0.3, -0.25, 0.11, 0.07])
+    base = solver.evaluate([cp.diag(cp.asarray([-0.2, 0.1]))])
+    state = replace(base, gradient=block(gradient))
+    direction, used_history, reason = solver._lbfgs_direction(state, pairs)
+    assert used_history
+    assert reason == ''
+
+    gamma = pairs[-1].sy / float(
+        cp.asnumpy(cp.vdot(pairs[-1].y[0], pairs[-1].y[0]).real))
+    gamma = np.clip(
+        gamma, solver.config.lbfgs_scalar_h0_min,
+        solver.config.lbfgs_scalar_h0_max)
+    inverse = gamma * np.eye(4)
+    for step, pair in zip(steps, pairs):
+        gradient_change = hessian @ step
+        transform = np.eye(4) - pair.rho * np.outer(step, gradient_change)
+        inverse = (transform @ inverse @ transform.T +
+                   pair.rho * np.outer(step, step))
+    expected = block(-inverse @ gradient)
+    assert float(cp.max(cp.abs(direction[0] - expected[0])).item()) < 1.0e-12
+
+
+def test_lbfgs_fixed_fock_step_and_exact_gradient_pair():
+    _, solver = _solver(
+        optimizer='lbfgs', lbfgs_line_search_c2=0.1)
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j],
+                      [0.19 + 0.11j, 0.6]])]
+    initial = solver.evaluate(h0)
+    result = solver.kernel(h0=h0)
+    assert result.converged, result.message
+    assert result.history[0].optimizer == 'lbfgs'
+    assert result.history[0].search_direction_source == 'residual'
+    assert result.history[0].strong_wolfe
+    assert abs(result.history[0].alpha - 2.0) < 1.0e-10
+    assert result.history[0].lbfgs_pair_added
+    assert result.history[0].lbfgs_sy > 0.0
+    assert len(solver._lbfgs_history) == 1
+
+    pair = solver._lbfgs_history[0]
+    final_state = solver.evaluate(result.h_orth)
+    expected_y = solver.axpy(-1.0, initial.gradient, final_state.gradient)
+    assert float(cp.max(cp.abs(pair.y[0] - expected_y[0])).item()) < 1.0e-12
+    assert float(cp.max(cp.abs(result.h_orth[0] - result.fock_orth[0])).item()) < 1.0e-12
+
+
+def test_lbfgs_non_wolfe_and_bad_direction_reset():
+    _, solver = _solver(optimizer='lbfgs')
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j],
+                      [0.19 + 0.11j, 0.6]])]
+    old = solver.evaluate(h0)
+    new = solver.evaluate(solver.axpy(0.5, old.residual, old.h_orth))
+    history = []
+    wolfe = _LineSearchResult(
+        True, new, 0.5, 1, True, False, 'strong Wolfe')
+    info = solver._update_lbfgs_history(history, old, new, wolfe)
+    assert info['pair_added']
+    assert len(history) == 1
+
+    non_wolfe = _LineSearchResult(
+        True, new, 0.5, 1, False, True, 'best Armijo')
+    info = solver._update_lbfgs_history(history, old, new, non_wolfe)
+    assert not history
+    assert not info['pair_added']
+    assert 'cleared' in info['action']
+
+    uphill = solver.copy_blocks(old.gradient)
+    restart, reset, reason = solver._ensure_lbfgs_descent(
+        old, uphill, used_history=True)
+    assert reset
+    assert 'rejected L-BFGS direction' in reason
+    assert solver._is_descent(old, restart)
+
+
+def test_lbfgs_history_evicts_oldest_pair():
+    _, solver = _solver(optimizer='lbfgs', lbfgs_history_size=2)
+    state = solver.evaluate([
+        cp.asarray([[-0.1, 0.19 - 0.11j],
+                    [0.19 + 0.11j, 0.6]])])
+    states = [state]
+    for _ in range(3):
+        state = solver.evaluate(
+            solver.axpy(0.2, state.residual, state.h_orth))
+        states.append(state)
+    history = []
+    wolfe = _LineSearchResult(
+        True, states[1], 0.2, 1, True, False, 'strong Wolfe')
+    for old, new in zip(states, states[1:]):
+        info = solver._update_lbfgs_history(history, old, new, wolfe)
+        assert info['pair_added']
+    assert len(history) == 2
+    expected_oldest = solver.axpy(-1.0, states[1].h_orth, states[2].h_orth)
+    assert float(cp.max(cp.abs(history[0].s[0] - expected_oldest[0])).item()) < 1.0e-13
+    actual_bytes = sum(value.nbytes for pair in history for value in pair.s + pair.y)
+    assert actual_bytes == solver._lbfgs_history_allocation_bytes
+
+
+def test_fixed_electron_lbfgs_uses_scalar_metric_and_converges():
+    target = 1.25
+    _, solver = _solver(electron_number=target, optimizer='lbfgs')
+    assert solver.config.lbfgs_initial_metric == 'scalar'
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j],
+                      [0.19 + 0.11j, 0.6]])]
+    result = solver.kernel(h0=h0)
+    assert result.converged, result.message
+    assert abs(result.electron_number - target) < solver.config.mu_electron_number_tol
+    assert all(record.optimizer == 'lbfgs' for record in result.history)
+    assert all(b.objective <= a.objective + 1.0e-11
+               for a, b in zip(result.history, result.history[1:]))
+
+
+def test_lbfgs_checkpoint_restart_starts_with_empty_history(tmp_path):
+    checkpoint = str(tmp_path / 'lbfgs.npz')
+    _, solver = _solver(
+        optimizer='lbfgs', checkpoint_path=checkpoint,
+        lbfgs_line_search_c2=0.1)
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j],
+                      [0.19 + 0.11j, 0.6]])]
+    first = solver.kernel(h0=h0)
+    assert first.converged, first.message
+    assert solver._lbfgs_history
+
+    _, resumed = _solver(
+        optimizer='lbfgs', checkpoint_path=checkpoint,
+        lbfgs_line_search_c2=0.1)
+    assert resumed._lbfgs_history == []
+    checkpoint_h = resumed._load_checkpoint_h()
+    state = resumed.evaluate(checkpoint_h)
+    direction, used_history, reason = resumed._lbfgs_direction(
+        state, resumed._lbfgs_history)
+    assert not used_history
+    assert reason == 'empty L-BFGS history'
+    assert float(cp.max(cp.abs(direction[0] - state.residual[0])).item()) < 1.0e-13
+
+    second = resumed.kernel()
+    assert second.converged, second.message
+    assert resumed._lbfgs_history == []
+    assert abs(second.grand_potential - first.grand_potential) < 1.0e-12
+
+
 def test_initial_auxiliary_electron_number_selects_requested_basin():
     target = 1.25
     _, solver = _solver(initial_electron_number=target)
@@ -372,6 +574,33 @@ def test_real_multik_krks_evaluator_and_finalisation():
     assert float(cp.max(cp.abs(reconstructed - result.dm_ao)).item()) < 1.0e-9
     assert abs(mf.e_tot - result.dft_total_energy) < 1.0e-12
     assert abs(mf.grand_potential - result.grand_potential) < 1.0e-12
+
+
+def test_real_multik_lbfgs_preserves_time_reversal_and_converges():
+    cell = _small_periodic_cell()
+    mf = cell.KRKS(kpts=cell.make_kpts([3, 1, 1])).to_gpu()
+    mf.xc = 'LDA,VWN'
+    config = GrandCanonicalConfig(
+        optimizer='lbfgs', max_cycle=25, required_consecutive_conv=1,
+        conv_tol_omega=1.0e-7, conv_tol_grad_rms=1.0e-6,
+        conv_tol_residual_rms=1.0e-5, conv_tol_density_rms=1.0e-7,
+        conv_tol_nelec=1.0e-7, line_search_max_evals=10,
+        line_search_zoom_evals=10,
+    )
+    solver = GrandCanonicalKRKS(mf, mu=-0.4, sigma=0.08, config=config)
+    result = solver.kernel()
+    assert result.converged, result.message
+    assert solver._time_reversal_enabled
+    assert solver._lbfgs_history
+    assert all(record.optimizer == 'lbfgs' for record in result.history)
+    assert all(b.objective <= a.objective + 1.0e-10
+               for a, b in zip(result.history, result.history[1:]))
+    for pair in solver._lbfgs_history:
+        for blocks in (pair.s, pair.y):
+            assert all(float(cp.max(cp.abs(value - value.conj().T)).item()) < 1.0e-12
+                       for value in blocks)
+            for i, j in solver._tr_pairs:
+                assert float(cp.max(cp.abs(blocks[i] - blocks[j].conj())).item()) < 1.0e-12
 
 
 def test_real_multik_fixed_electron_number_minimisation():
