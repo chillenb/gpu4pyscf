@@ -147,6 +147,7 @@ class GrandCanonicalConfig:
     line_search_nelec_trust_bad_ratio: float = 2.5e-1
     line_search_nelec_trust_good_ratio: float = 7.5e-1
     diis_preserve_accepted_history: bool = False
+    lbfgs_use_projected_pairs: bool = False
 
 
 @dataclass(frozen=True)
@@ -199,6 +200,7 @@ class IterationRecord:
     nelec_trust_ratio: float = np.nan
     nelec_projection_response_fallback: bool = False
     nelec_projection_correction_rms: float = np.nan
+    fock_evaluations: int = 0
 
 
 @dataclass(frozen=True)
@@ -636,7 +638,8 @@ class GrandCanonicalKRKS:
                 'lbfgs_line_search_c2 must be finite and lie between '
                 'line_search_c1 and 1')
         for name in ('lbfgs_cap_unit_step_with_history',
-                     'lbfgs_clear_on_non_wolfe'):
+                     'lbfgs_clear_on_non_wolfe',
+                     'lbfgs_use_projected_pairs'):
             if not isinstance(getattr(self.config, name), bool):
                 raise TypeError(f'{name} must be boolean')
 
@@ -1558,21 +1561,53 @@ class GrandCanonicalKRKS:
             'curvature_cosine': np.nan,
             'action': 'no pair',
         }
-        if line_search.nelec_projection_applied:
+        projected_pair = line_search.nelec_projection_applied
+        if (projected_pair and
+                not self.config.lbfgs_use_projected_pairs):
             history.clear()
             info['action'] = 'history cleared after occupation projection'
             return info
-        non_wolfe = fallback_used or not line_search.strong_wolfe
-        if ((line_search.force_restart or non_wolfe) and
-                not line_search.trust_boundary):
-            if line_search.force_restart or self.config.lbfgs_clear_on_non_wolfe:
-                history.clear()
-                info['action'] = 'history cleared after non-Wolfe acceptance'
-            else:
-                info['action'] = 'pair skipped after non-Wolfe acceptance'
-            return info
+        if not projected_pair:
+            non_wolfe = fallback_used or not line_search.strong_wolfe
+            if ((line_search.force_restart or non_wolfe) and
+                    not line_search.trust_boundary):
+                if (line_search.force_restart or
+                        self.config.lbfgs_clear_on_non_wolfe):
+                    history.clear()
+                    info['action'] = (
+                        'history cleared after non-Wolfe acceptance')
+                else:
+                    info['action'] = (
+                        'pair skipped after non-Wolfe acceptance')
+                return info
 
-        s = self.axpy(-1.0, old_state.h_orth, new_state.h_orth)
+        if projected_pair:
+            if line_search.actual_step is None:
+                history.clear()
+                info['action'] = (
+                    'history cleared: projected pair lacks actual step')
+                return info
+            s = self.copy_blocks(line_search.actual_step)
+            endpoint_step = self.axpy(
+                -1.0, old_state.h_orth, new_state.h_orth)
+            if (not self.all_finite(s) or
+                    not self.all_finite(endpoint_step)):
+                history.clear()
+                info['action'] = (
+                    'history cleared after nonfinite projected step')
+                return info
+            mismatch = self.max_block_rms(
+                self.axpy(-1.0, endpoint_step, s))
+            if not np.isfinite(mismatch) or mismatch > 1.0e-8:
+                history.clear()
+                info['action'] = (
+                    'history cleared after inconsistent projected step')
+                return info
+            # The accepted endpoints are authoritative.  The stored actual
+            # step is an invariant check, not a second secant displacement.
+            s = endpoint_step
+        else:
+            s = self.axpy(-1.0, old_state.h_orth, new_state.h_orth)
         y = self.axpy(-1.0, old_state.gradient, new_state.gradient)
         s = self.hermitize_blocks(s)
         y = self.hermitize_blocks(y)
@@ -1598,28 +1633,40 @@ class GrandCanonicalKRKS:
         if s_norm > 0.0 and y_norm > 0.0:
             info['curvature_cosine'] = sy / (s_norm * y_norm)
         if sy <= 0.0:
-            history.clear()
-            info['action'] = 'history cleared after bad curvature'
+            if projected_pair:
+                info['action'] = 'projected pair skipped: bad curvature'
+            else:
+                history.clear()
+                info['action'] = 'history cleared after bad curvature'
             return info
         if (self.rms(s) < self.config.lbfgs_min_pair_step_rms or
                 s_norm == 0.0 or y_norm == 0.0 or
                 sy < self.config.lbfgs_curvature_tol * s_norm * y_norm):
-            info['action'] = 'pair skipped: weak curvature'
+            prefix = 'projected ' if projected_pair else ''
+            info['action'] = f'{prefix}pair skipped: weak curvature'
             return info
         if self.config.lbfgs_history_size == 0:
-            info['action'] = 'pair skipped: history capacity is zero'
+            prefix = 'projected ' if projected_pair else ''
+            info['action'] = (
+                f'{prefix}pair skipped: history capacity is zero')
             return info
 
+        rho = 1.0 / sy
+        if not np.isfinite(rho):
+            history.clear()
+            info['action'] = 'history cleared after nonfinite curvature'
+            return info
         pair = _LBFGSPair(
-            self.copy_blocks(s), self.copy_blocks(y), float(1.0 / sy),
+            self.copy_blocks(s), self.copy_blocks(y), float(rho),
             float(sy), float(s_norm), float(y_norm),
             float(info['curvature_cosine']))
         history.append(pair)
+        prefix = 'projected ' if projected_pair else ''
         if len(history) > self.config.lbfgs_history_size:
             del history[0]
-            info['action'] = 'pair added; oldest pair evicted'
+            info['action'] = f'{prefix}pair added; oldest pair evicted'
         else:
-            info['action'] = 'pair added'
+            info['action'] = f'{prefix}pair added'
         info['pair_added'] = True
         return info
 
@@ -2071,6 +2118,19 @@ class GrandCanonicalKRKS:
                target_nelec) > 1.0e-10:
             projected, _ = self._scalar_shift_to_nelec(
                 projected, target_nelec)
+        # A nearly singular frozen Fermi response can formally reach the
+        # charge target only through an enormous localized spectral change.
+        # Such a correction cannot produce an admissible Hamiltonian step and
+        # previously reached ~1e21 RMS in rejected slab trials.  Use the
+        # globally monotone scalar projection before the pathological response
+        # reaches the expensive evaluator.
+        correction_rms = self.max_block_rms(
+            self.axpy(-1.0, candidate, projected))
+        if (not np.isfinite(correction_rms) or
+                correction_rms > self.config.line_search_max_h_rms_step):
+            projected, parameter = self._scalar_shift_to_nelec(
+                candidate, target_nelec, eigenvalues=eigenvalues)
+            return projected, parameter, True
         return projected, parameter, False
 
     def _shrink_nelec_trust_radius(
@@ -2492,7 +2552,8 @@ class GrandCanonicalKRKS:
             line_search.nelec_trust_radius,
             line_search.nelec_trust_ratio,
             line_search.nelec_projection_response_fallback,
-            line_search.nelec_projection_correction_rms))
+            line_search.nelec_projection_correction_rms,
+            self.nfev))
         if self.fixed_electron_number:
             self.log.info('Canonical cycle %d  A = %.12g  E_DFT = %.12g  '
                           'N = %.10g  mu = %.12g  |g|_rms = %.3g  '
@@ -2691,11 +2752,14 @@ class GrandCanonicalKRKS:
     @staticmethod
     def _continuation_history(
             records: Sequence[IterationRecord], cycle_offset: int,
-            electron_number: float) -> list[IterationRecord]:
+            electron_number: float,
+            evaluation_offset: int = 0) -> list[IterationRecord]:
         prefix = f'canonical continuation N={electron_number:.12g}'
         return [replace(
             record,
             cycle=cycle_offset + record.cycle,
+            fock_evaluations=(
+                evaluation_offset + record.fock_evaluations),
             restart_reason=(prefix +
                             (('; ' + record.restart_reason)
                              if record.restart_reason else '')))
@@ -2749,10 +2813,12 @@ class GrandCanonicalKRKS:
                 electron_number=current_nelec)
             canonical_result = canonical_solver.kernel(h0=h)
             outer_steps += 1
+            stage_evaluation_offset = (
+                initialization_evaluations + continuation_evaluations)
             continuation_evaluations += canonical_result.nfev
             stage_history = self._continuation_history(
                 canonical_result.history, continuation_iterations,
-                current_nelec)
+                current_nelec, stage_evaluation_offset)
             continuation_history.extend(stage_history)
             continuation_iterations += canonical_result.niter
             h = canonical_result.h_orth
@@ -2917,7 +2983,8 @@ class GrandCanonicalKRKS:
             self.config.diis_max_coefficient_l1 = saved_max_coefficient_l1
 
         final_history = self._continuation_history(
-            final_result.history, pre_iterations, final_result.electron_number)
+            final_result.history, pre_iterations, final_result.electron_number,
+            pre_evaluations)
         # The final records are fixed-mu, not canonical; remove the stage
         # prefix while retaining globally increasing cycle numbers.
         final_history = [replace(
