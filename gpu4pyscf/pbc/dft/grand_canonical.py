@@ -1575,7 +1575,7 @@ class GrandCanonicalKRKS:
                 return info
             ratio = line_search.nelec_trust_ratio
             if (not np.isfinite(ratio) or
-                    ratio < self.config.line_search_nelec_trust_good_ratio):
+                    ratio < self.config.line_search_nelec_trust_bad_ratio):
                 history.clear()
                 info['action'] = (
                     'history cleared after unreliable projected model')
