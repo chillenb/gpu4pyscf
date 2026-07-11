@@ -103,7 +103,19 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             line_search_nelec_trust_min=1.0e-3,
             line_search_nelec_trust_shrink=5.0e-1,
             line_search_nelec_trust_expand=2.0,
-            canonical_continuation=False):
+            canonical_continuation=False,
+            line_search_method='strong-wolfe',
+            line_search_c2=0.1,
+            line_search_max_evals=12,
+            line_search_max_trials=64,
+            line_search_nelec_feasible_alpha=True,
+            hager_zhang_objective_noise=1.0e-10,
+            hager_zhang_max_evals=20,
+            nlcg_nelec_projection_strategy='trial',
+            nlcg_exact_gradient_blend=True,
+            nlcg_exact_gradient_polish=True,
+            nlcg_reset_on_preprojection=True,
+            cg_restart_interval=20):
     f0 = cp.asarray([[[-0.7, 0.12j], [-0.12j, 0.3]]], dtype=cp.complex128)
     mf = _FixedFockKRKS(f0)
     config = GrandCanonicalConfig(
@@ -115,6 +127,7 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
         initial_electron_number=initial_electron_number,
         cg_update=cg_update,
         cg_beta_max=cg_beta_max,
+        cg_restart_interval=cg_restart_interval,
         optimizer=optimizer,
         lbfgs_initial_metric=lbfgs_initial_metric,
         lbfgs_history_size=lbfgs_history_size,
@@ -134,6 +147,19 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
         line_search_nelec_trust_shrink=line_search_nelec_trust_shrink,
         line_search_nelec_trust_expand=line_search_nelec_trust_expand,
         canonical_continuation=canonical_continuation,
+        line_search_method=line_search_method,
+        line_search_c2=line_search_c2,
+        line_search_max_evals=line_search_max_evals,
+        line_search_max_trials=line_search_max_trials,
+        line_search_nelec_feasible_alpha=(
+            line_search_nelec_feasible_alpha),
+        hager_zhang_objective_noise=hager_zhang_objective_noise,
+        hager_zhang_max_evals=hager_zhang_max_evals,
+        nlcg_nelec_projection_strategy=(
+            nlcg_nelec_projection_strategy),
+        nlcg_exact_gradient_blend=nlcg_exact_gradient_blend,
+        nlcg_exact_gradient_polish=nlcg_exact_gradient_polish,
+        nlcg_reset_on_preprojection=nlcg_reset_on_preprojection,
     )
     return mf, GrandCanonicalKRKS(
         mf, mu=mu, sigma=0.15, config=config,
@@ -207,6 +233,40 @@ def test_electron_number_guard_mode_validation():
         _solver(line_search_nelec_guard_mode=None)
     with pytest.raises(ValueError, match='reject, scalar-shift'):
         _solver(line_search_nelec_guard_mode='occupation-mixing')
+
+
+@pytest.mark.parametrize('alias, expected', [
+    ('strong', 'strong-wolfe'),
+    ('strong_wolfe', 'strong-wolfe'),
+    ('HZ', 'hager-zhang'),
+    ('cg descent', 'hager-zhang'),
+])
+def test_line_search_method_aliases(alias, expected):
+    _, solver = _solver(line_search_method=alias)
+    assert solver.config.line_search_method == expected
+
+
+@pytest.mark.parametrize('alias, expected', [
+    ('trial', 'trial'),
+    ('post_trial', 'trial'),
+    ('direction', 'direction'),
+    ('fixed direction', 'direction'),
+])
+def test_nlcg_projection_strategy_aliases(alias, expected):
+    _, solver = _solver(nlcg_nelec_projection_strategy=alias)
+    assert solver.config.nlcg_nelec_projection_strategy == expected
+
+
+def test_hager_zhang_configuration_validation():
+    with pytest.raises(ValueError, match='line_search_method'):
+        _solver(line_search_method='golden-section')
+    with pytest.raises(ValueError, match='Hager-Zhang constants'):
+        config = GrandCanonicalConfig(hager_zhang_delta=0.6)
+        GrandCanonicalKRKS(
+            _FixedFockKRKS([cp.eye(2)]), mu=-0.1, sigma=0.15,
+            config=config)
+    with pytest.raises(ValueError, match='objective_noise'):
+        _solver(hager_zhang_objective_noise=-1.0)
 
 
 def test_scalar_shift_projection_hits_charge_boundary_and_is_identity():
@@ -439,6 +499,108 @@ def test_electron_number_projection_is_bypassed_at_fixed_n(mode):
     assert solver.nnelec_projection_fallbacks == 0
 
 
+def test_cheap_charge_bracketing_does_not_consume_fock_budget():
+    mf, solver = _solver(
+        line_search_nelec_guard_residual_rms=None,
+        line_search_max_delta_nelec=1.0e-3,
+        line_search_nelec_guard_max_delta_nelec=1.0e-3,
+        line_search_max_evals=1)
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    identity = [cp.eye(2, dtype=cp.complex128)]
+    slope = solver.inner(state.gradient, identity)
+    direction = solver.scale_blocks(-np.copysign(1.0, slope), identity)
+    nfev_before = solver.nfev
+    veff_before = mf.veff_calls
+
+    result = solver._armijo_fallback(
+        state, direction, allow_nelec_projection=False)
+
+    assert result.success, result.message
+    assert result.nfev == 1
+    assert solver.nfev == nfev_before + 1
+    assert mf.veff_calls == veff_before + 1
+    assert result.cheap_nelec_evaluations > 1
+    assert result.cheap_nelec_alpha_reductions > 0
+
+
+@pytest.mark.parametrize('mode', ['scalar-shift', 'fermi-response'])
+def test_fixed_direction_projection_caps_endpoint_and_preserves_mu(mode):
+    _, solver = _solver(
+        line_search_nelec_guard_mode=mode,
+        line_search_nelec_guard_residual_rms=None,
+        line_search_nelec_trust_initial=1.0e-2,
+        nlcg_nelec_projection_strategy='direction')
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    identity = [cp.eye(2, dtype=cp.complex128)]
+    slope = solver.inner(state.gradient, identity)
+    direction = solver.scale_blocks(-np.copysign(1.0, slope), identity)
+    mu_before = solver.mu
+
+    prepared = solver._prepare_nlcg_direction(state, direction)
+    endpoint = solver._sanitize_h(
+        solver.axpy(1.0, prepared.direction, state.h_orth))
+    endpoint_nelec = solver._cheap_fixed_mu_electron_number(endpoint)
+
+    assert prepared.success
+    assert prepared.preprojected
+    assert prepared.alpha_cap == 1.0
+    assert solver.mu == mu_before
+    assert abs(abs(endpoint_nelec - state.electron_number) - 1.0e-2) <= 1.0e-10
+    assert abs(endpoint_nelec - state.electron_number -
+               prepared.projected_delta_nelec) <= 1.0e-10
+    assert solver._is_descent(state, prepared.direction)
+    assert all(float(cp.max(cp.abs(
+        value - value.conj().T)).item()) < 1.0e-12
+               for value in prepared.direction)
+
+
+def test_fixed_direction_projection_is_bypassed_at_fixed_n():
+    _, solver = _solver(
+        electron_number=1.25,
+        line_search_nelec_guard_mode='fermi-response',
+        nlcg_nelec_projection_strategy='direction')
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    direction = solver.copy_blocks(state.residual)
+
+    prepared = solver._prepare_nlcg_direction(state, direction)
+
+    assert prepared.success
+    assert not prepared.preprojected
+    assert solver.ndirection_projection_attempts == 0
+    assert float(cp.max(cp.abs(
+        prepared.direction[0] - direction[0])).item()) < 1.0e-14
+
+
+def test_charge_guard_checks_interior_of_endpoint_safe_line():
+    h = cp.diag(cp.asarray([0.2, -0.6], dtype=cp.float64))
+    solver = GrandCanonicalKRKS(
+        _FixedFockKRKS([h]), mu=0.0, sigma=0.01,
+        config=GrandCanonicalConfig(
+            check_time_reversal=False,
+            line_search_nelec_guard_residual_rms=None,
+            line_search_max_delta_nelec=0.1,
+            line_search_nelec_guard_max_delta_nelec=0.1))
+    state = solver.evaluate([h])
+    direction = [cp.diag(cp.asarray([-0.8, 0.8]))]
+
+    cap, restricted = solver._charge_feasible_alpha_cap(
+        state, direction, 1.0, maximum=0.1)
+    midpoint = solver._trial(
+        state, direction, 0.5, allow_nelec_projection=False,
+        nelec_limit_override=0.1)
+
+    assert cap == pytest.approx(1.0)
+    assert not restricted
+    assert midpoint is None
+    assert solver._last_trial_rejected_by_nelec
+
+
 def test_scalar_projection_trial_caps_delta_nelec_and_tracks_attempt():
     _, solver = _solver(
         line_search_nelec_guard_mode='scalar-shift',
@@ -569,10 +731,12 @@ def test_zoom_accepts_armijo_point_at_electron_number_trust_boundary():
     dphi0 = solver.inner(state.gradient, direction)
     calls = []
 
-    def trial_at_boundary(unused_state, unused_direction, alpha):
+    def trial_at_boundary(unused_state, unused_direction, alpha,
+                          **unused_kwargs):
         calls.append(alpha)
         if len(calls) == 1:
             solver._last_trial_rejected_by_nelec = False
+            solver.nfev += 1
             return replace(state, objective=state.objective - 1.0)
         solver._last_trial_rejected_by_nelec = True
         return None
@@ -583,10 +747,96 @@ def test_zoom_accepts_armijo_point_at_electron_number_trust_boundary():
         0.0, state, 1.0, None, None, 0)
     assert result.success
     assert result.alpha == pytest.approx(0.5)
-    assert result.nfev == 2
+    assert result.nfev == 1
     assert result.trust_boundary
     assert result.force_restart
     assert 'trust boundary' in result.message
+
+
+def test_hager_zhang_weak_wolfe_caches_complex_fixed_fock_trials(
+        monkeypatch):
+    _, solver = _solver(
+        electron_number=1.2, line_search_method='hager-zhang',
+        hager_zhang_objective_noise=0.0,
+        line_search_nelec_feasible_alpha=False)
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    direction = solver.copy_blocks(state.residual)
+    original_trial = solver._trial
+    calls = []
+
+    def counted_trial(current, trial_direction, alpha,
+                      allow_nelec_projection=True,
+                      nelec_limit_override=None):
+        calls.append(alpha)
+        return original_trial(
+            current, trial_direction, alpha,
+            allow_nelec_projection=allow_nelec_projection,
+            nelec_limit_override=nelec_limit_override)
+
+    monkeypatch.setattr(solver, '_trial', counted_trial)
+    nfev_before = solver.nfev
+    result = solver._line_search(state, direction)
+
+    assert result.success, result.message
+    assert result.weak_wolfe
+    assert result.curvature_qualified
+    assert not result.approximate_wolfe
+    assert result.line_search_method == 'hager-zhang'
+    assert result.nfev == solver.nfev - nfev_before
+    assert len(calls) == len(set(calls))
+    solver._verify_accepted_step(
+        state, result.state, direction, result,
+        solver.inner(state.gradient, direction))
+
+
+@pytest.mark.parametrize('phi0', [-1.0, -1.0e6])
+def test_hager_zhang_approximate_wolfe_uses_absolute_noise(
+        monkeypatch, phi0):
+    noise = 1.0e-8
+    _, solver = _solver(
+        electron_number=1.2, line_search_method='hager-zhang',
+        hager_zhang_objective_noise=noise,
+        line_search_nelec_feasible_alpha=False)
+    evaluated = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    state = replace(evaluated, objective=phi0)
+    direction = solver.scale_blocks(-1.0e-3, state.gradient)
+    calls = []
+
+    def approximate_trial(current, trial_direction, alpha,
+                          allow_nelec_projection=True,
+                          nelec_limit_override=None):
+        calls.append(alpha)
+        solver.nfev += 1
+        actual_step = solver.scale_blocks(alpha, trial_direction)
+        solver._last_trial_rejected_by_nelec = False
+        solver._last_trial_info = _TrialInfo(
+            actual_step=actual_step,
+            actual_slope=solver.inner(current.gradient, actual_step))
+        return replace(
+            current,
+            h_orth=solver._sanitize_h(
+                solver.axpy(alpha, trial_direction, current.h_orth)),
+            objective=phi0 + 0.5 * noise,
+            gradient=solver.scale_blocks(0.0, current.gradient))
+
+    monkeypatch.setattr(solver, '_trial', approximate_trial)
+    result = solver._line_search(state, direction)
+
+    assert result.success, result.message
+    assert result.approximate_wolfe
+    assert result.weak_wolfe
+    assert result.curvature_qualified
+    assert result.objective_allowance == noise
+    assert result.state.objective - state.objective == pytest.approx(
+        0.5 * noise, abs=1.0e-12)
+    assert calls == [pytest.approx(1.0)]
+    solver._verify_accepted_step(
+        state, result.state, direction, result,
+        solver.inner(state.gradient, direction))
 
 
 def test_projected_line_search_uses_actual_step_and_forces_restart(
@@ -601,7 +851,8 @@ def test_projected_line_search_uses_actual_step_and_forces_restart(
     assert dphi0 < 0.0
     evaluated = {}
 
-    def projected_trial(unused_state, unused_direction, alpha):
+    def projected_trial(unused_state, unused_direction, alpha,
+                        **unused_kwargs):
         actual_step = solver.scale_blocks(0.1 * alpha, direction)
         actual_slope = solver.inner(state.gradient, actual_step)
         original_slope = alpha * dphi0
@@ -1035,6 +1286,7 @@ def test_cg_update_formulas_aliases_and_validation():
         'FR': 'fletcher-reeves',
         'polak_ribiere': 'polak-ribiere',
         'Hestenes Stiefel': 'hestenes-stiefel',
+        'Hager Zhang': 'hager-zhang',
     }
     h = [cp.asarray([[-0.3, 0.08 + 0.03j], [0.08 - 0.03j, 0.2]])]
     for alias, canonical in aliases.items():
@@ -1049,6 +1301,17 @@ def test_cg_update_formulas_aliases_and_validation():
         if canonical == 'fletcher-reeves':
             numerator = solver.inner(new.gradient, new.z)
             denominator = solver.inner(old.gradient, old.z)
+        elif canonical == 'hager-zhang':
+            delta_gradient = solver.axpy(
+                -1.0, old.gradient, new.gradient)
+            delta_z = solver.axpy(-1.0, old.z, new.z)
+            denominator = solver.inner(old_direction, delta_gradient)
+            expected = (
+                solver.inner(delta_gradient, new.z) / denominator -
+                solver.config.hager_zhang_theta *
+                solver.inner(delta_gradient, delta_z) *
+                solver.inner(old_direction, new.gradient) /
+                denominator**2)
         else:
             delta_z = solver.axpy(-1.0, old.z, new.z)
             numerator = solver.inner(new.gradient, delta_z)
@@ -1057,7 +1320,9 @@ def test_cg_update_formulas_aliases_and_validation():
             else:
                 delta_gradient = solver.axpy(-1.0, old.gradient, new.gradient)
                 denominator = solver.inner(old_direction, delta_gradient)
-        assert abs(beta - numerator / denominator) < 1.0e-13
+        if canonical != 'hager-zhang':
+            expected = numerator / denominator
+        assert abs(beta - expected) < 1.0e-13
 
     with pytest.raises(ValueError, match='unsupported cg_update'):
         _solver(cg_update='not-a-cg-update')
@@ -1065,7 +1330,8 @@ def test_cg_update_formulas_aliases_and_validation():
 
 def test_all_cg_updates_converge_fixed_fock_problem():
     h0 = [cp.asarray([[-0.1, 0.19 - 0.11j], [0.19 + 0.11j, 0.6]])]
-    for update in ('fletcher-reeves', 'polak-ribiere', 'hestenes-stiefel'):
+    for update in ('fletcher-reeves', 'polak-ribiere', 'hestenes-stiefel',
+                   'hager-zhang'):
         _, solver = _solver(cg_update=update)
         result = solver.kernel(h0=h0)
         assert result.converged, f'{update}: {result.message}'
@@ -1725,6 +1991,30 @@ def test_near_stationary_low_temperature_state_uses_exact_gradient():
     assert reason == 'exact-gradient final polishing'
     expected = solver.scale_blocks(-1.0, state.gradient)
     assert float(cp.max(cp.abs(direction[0] - expected[0])).item()) < 1.0e-13
+
+
+def test_exact_gradient_nlcg_safeguards_can_be_disabled_independently():
+    mf = _FixedFockKRKS([cp.diag(cp.asarray([10.0, 0.01]))])
+    solver = GrandCanonicalKRKS(
+        mf, mu=0.0, sigma=0.001,
+        config=GrandCanonicalConfig(
+            check_time_reversal=False,
+            nlcg_exact_gradient_blend=False,
+            nlcg_exact_gradient_polish=False),
+    )
+    state = solver.evaluate([cp.diag(cp.asarray([-1.0, 0.0]))])
+
+    restarted, reason = solver._restart_direction(state)
+    ensured, changed, ensure_reason = solver._ensure_descent(
+        state, state.residual)
+
+    assert reason == 'restarted with preconditioned residual'
+    assert not changed
+    assert ensure_reason == ''
+    assert float(cp.max(cp.abs(
+        restarted[0] - state.residual[0])).item()) < 1.0e-13
+    assert float(cp.max(cp.abs(
+        ensured[0] - state.residual[0])).item()) < 1.0e-13
 
 
 def test_restart_and_chemical_potential_sign(tmp_path):
