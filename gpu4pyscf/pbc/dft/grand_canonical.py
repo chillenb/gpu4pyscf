@@ -567,6 +567,16 @@ class GrandCanonicalKRKS:
         self._validate_diis_config()
         self._validate_nelec_guard_config()
         self._validate_canonical_continuation_config()
+        if (not self.fixed_electron_number and
+                self.config.line_search_method == 'hager-zhang' and
+                self.config.line_search_nelec_guard_mode != 'reject'):
+            if (self.config.optimizer != 'nlcg' or
+                    self.config.nlcg_nelec_projection_strategy !=
+                    'direction'):
+                raise ValueError(
+                    'Hager-Zhang with occupation projection requires the '
+                    'NLCG fixed-direction projection strategy; post-trial '
+                    'projection is not a one-dimensional line search')
         self.verbose = (getattr(mf, 'verbose', logger.NOTE)
                         if self.config.verbose is None else self.config.verbose)
         self.log = logger.new_logger(mf, self.verbose)
@@ -2343,11 +2353,10 @@ class GrandCanonicalKRKS:
             raw_delta = raw_nelec - state.electron_number
             self.max_raw_delta_nelec = max(
                 self.max_raw_delta_nelec, abs(raw_delta))
-            scaled_direction = self.hermitize_blocks(
-                self.axpy(-1.0, state.h_orth, raw_candidate))
             if abs(raw_delta) <= maximum:
                 return _PreparedDirection(
-                    direction=scaled_direction, alpha_cap=1.0,
+                    direction=self.copy_blocks(direction),
+                    alpha_cap=endpoint_scale,
                     raw_endpoint_scale=endpoint_scale,
                     raw_delta_nelec=raw_delta,
                     projected_delta_nelec=raw_delta,
@@ -2400,6 +2409,21 @@ class GrandCanonicalKRKS:
             direction=self.copy_blocks(direction), success=False,
             message='failed to construct a downhill charge-limited direction',
             raw_endpoint_scale=endpoint_scale, trust_radius=maximum)
+
+    def _charge_capped_direction_fallback(
+            self, state: _GCState, direction: Sequence,
+            message: str) -> _PreparedDirection:
+        """Use an unmodified line with the same frozen cheap charge radius."""
+        direction = self.hermitize_blocks(direction)
+        valid = (self._is_descent(state, direction) and
+                 self._alpha_cap(direction) >=
+                 self.config.line_search_alpha_min)
+        return _PreparedDirection(
+            direction=self.copy_blocks(direction), success=valid,
+            message=message, mode=self.config.line_search_nelec_guard_mode,
+            trust_radius=self._active_nelec_limit(
+                state, use_adaptive_radius=True),
+            reset_memory=True)
 
     def _decorate_direction_projection_result(
             self, old: _GCState, new: _GCState,
@@ -2756,6 +2780,26 @@ class GrandCanonicalKRKS:
             cheap_nelec_alpha_reductions=(
                 self.ncheap_nelec_alpha_reductions - reduction_start))
 
+    @staticmethod
+    def _combine_line_search_work(
+            primary: _LineSearchResult,
+            fallback: _LineSearchResult) -> _LineSearchResult:
+        """Keep accepted fallback metadata while reporting all search work."""
+        detail = fallback.message
+        if primary.message:
+            detail += (f'; after {primary.line_search_method} failure: '
+                       f'{primary.message}')
+        return replace(
+            fallback,
+            nfev=primary.nfev + fallback.nfev,
+            cheap_nelec_evaluations=(
+                primary.cheap_nelec_evaluations +
+                fallback.cheap_nelec_evaluations),
+            cheap_nelec_alpha_reductions=(
+                primary.cheap_nelec_alpha_reductions +
+                fallback.cheap_nelec_alpha_reductions),
+            message=detail)
+
     def _zoom(
             self, state0: _GCState, direction: Sequence, phi0: float,
             dphi0: float, lo_a: float, lo_state: _GCState, hi_a: float,
@@ -2788,12 +2832,12 @@ class GrandCanonicalKRKS:
         hi_phi = np.inf if hi_state is None else hi_state.objective
         hi_dphi = (np.nan if hi_state is None else
                    self.inner(hi_state.gradient, direction))
-        zoom_steps = 0
-        while (zoom_steps < self.config.line_search_zoom_evals and
+        zoom_start_nfev = self.nfev
+        while (self.nfev - zoom_start_nfev <
+               self.config.line_search_zoom_evals and
                trial_count < self.config.line_search_max_trials and
                self.nfev - start_nfev <
                self.config.line_search_max_evals):
-            zoom_steps += 1
             lower, upper = min(lo_a, hi_a), max(lo_a, hi_a)
             alpha = self._cubic_minimizer(
                 lo_a, lo_phi, lo_dphi, hi_a, hi_phi, hi_dphi)
@@ -3372,10 +3416,17 @@ class GrandCanonicalKRKS:
                 raise RuntimeError(
                     'accepted approximate-Wolfe point violates derivative '
                     'bounds')
-        elif (accepted.objective > state.objective +
-              self.config.line_search_c1 * armijo_slope + 1.0e-12):
-            raise RuntimeError(
-                'accepted line-search point does not satisfy Armijo decrease')
+        else:
+            armijo_constant = (
+                self.config.hager_zhang_delta
+                if (line_search.line_search_method == 'hager-zhang' and
+                    not line_search.nelec_projection_applied) else
+                self.config.line_search_c1)
+            if (accepted.objective > state.objective +
+                    armijo_constant * armijo_slope + 1.0e-12):
+                raise RuntimeError(
+                    'accepted line-search point does not satisfy Armijo '
+                    'decrease')
 
     def _record(self, cycle: int, old: _GCState, new: _GCState, line_search: _LineSearchResult,
                 dphi0: float, beta: float, restart_reason: str,
@@ -3949,7 +4000,6 @@ class GrandCanonicalKRKS:
         message = 'maximum cycles reached'
         converged = False
         niter = 0
-        force_restart = False
 
         for cycle in range(self.config.max_cycle):
             if self._meets_convergence(state, previous):
@@ -3978,20 +4028,25 @@ class GrandCanonicalKRKS:
                     message = 'stagnation: step cap below minimum'
                     break
                 restarted, restart_reason = True, 'step cap restart; ' + cap_reason
+            fixed_direction_projection = (
+                not self.fixed_electron_number and
+                self.config.nlcg_nelec_projection_strategy == 'direction')
             prepared = self._prepare_nlcg_direction(state, direction)
             if not prepared.success:
+                failed_preparation = prepared.message
                 direction, prepare_reason = self._restart_direction(state)
-                prepared = self._prepare_nlcg_direction(state, direction)
+                prepared = self._charge_capped_direction_fallback(
+                    state, direction,
+                    'fixed-direction preparation failed; using a cheap '
+                    'charge-capped residual line')
                 restarted = True
                 restart_reason = (
-                    prepare_reason + '; ' + prepared.message)
+                    prepare_reason + '; ' + failed_preparation + '; ' +
+                    prepared.message)
             if not prepared.success:
                 message = 'direction preparation failure: ' + prepared.message
                 break
             direction = prepared.direction
-            fixed_direction_projection = (
-                not self.fixed_electron_number and
-                self.config.nlcg_nelec_projection_strategy == 'direction')
             nelec_limit = (
                 prepared.trust_radius
                 if fixed_direction_projection and
@@ -4003,23 +4058,32 @@ class GrandCanonicalKRKS:
                 allow_nelec_projection=not fixed_direction_projection,
                 nelec_limit_override=nelec_limit)
             if not line_search.success:
+                primary_line_search = line_search
                 direction, fallback_reason = self._restart_direction(state)
                 prepared = self._prepare_nlcg_direction(state, direction)
                 if not prepared.success:
-                    message = (
-                        'fallback direction preparation failure: ' +
-                        prepared.message)
+                    failed_preparation = prepared.message
+                    prepared = self._charge_capped_direction_fallback(
+                        state, direction,
+                        'fallback fixed-direction preparation failed; using '
+                        'a cheap charge-capped residual line')
+                    fallback_reason += (
+                        '; ' + failed_preparation + '; ' + prepared.message)
+                if not prepared.success:
+                    message = 'fallback direction preparation failure'
                     break
                 direction = prepared.direction
                 nelec_limit = (
                     prepared.trust_radius
                     if fixed_direction_projection and
                     np.isfinite(prepared.trust_radius) else None)
-                line_search = self._armijo_fallback(
+                fallback_line_search = self._armijo_fallback(
                     state, direction,
                     alpha_cap_override=prepared.alpha_cap,
                     allow_nelec_projection=not fixed_direction_projection,
                     nelec_limit_override=nelec_limit)
+                line_search = self._combine_line_search_work(
+                    primary_line_search, fallback_line_search)
                 restarted = True
                 restart_reason = fallback_reason + '; ' + line_search.message
                 dphi0 = self.inner(state.gradient, direction)
@@ -4032,7 +4096,7 @@ class GrandCanonicalKRKS:
             self._verify_accepted_step(
                 state, new_state, direction, line_search, dphi0)
             beta = 0.0
-            if (force_restart or restarted or line_search.force_restart or
+            if (restarted or line_search.force_restart or
                     prepared.reset_memory):
                 if prepared.reset_memory:
                     restart_reason = (
@@ -4052,7 +4116,6 @@ class GrandCanonicalKRKS:
             state, previous = new_state, state
             proposed = self.axpy(beta, old_direction, state.residual)
             direction, lost_descent, descent_reason = self._ensure_descent(state, proposed)
-            force_restart = line_search.force_restart or lost_descent
             if lost_descent:
                 restart_reason = descent_reason
         else:
@@ -4149,13 +4212,17 @@ class GrandCanonicalKRKS:
                     else None))
             fallback_used = False
             if not line_search.success:
+                primary_line_search = line_search
                 lbfgs_history.clear()
                 direction, restart_reason = self._restart_direction(state)
                 used_history = False
                 self._last_lbfgs_metric_scale = np.nan
                 dphi0 = self.inner(state.gradient, direction)
                 descent_cosine = self._descent_cosine(state, direction)
-                line_search = self._armijo_fallback(state, direction)
+                fallback_line_search = self._armijo_fallback(
+                    state, direction)
+                line_search = self._combine_line_search_work(
+                    primary_line_search, fallback_line_search)
                 fallback_used = True
                 direction_reason = restart_reason + '; ' + line_search.message
             if not line_search.success or line_search.state is None:
