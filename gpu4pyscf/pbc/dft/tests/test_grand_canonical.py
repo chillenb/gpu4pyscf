@@ -92,6 +92,7 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             electron_number=None, optimizer='nlcg',
             lbfgs_initial_metric='fermi', lbfgs_history_size=5,
             lbfgs_line_search_c2=0.9, diis_switch_residual_rms=None,
+            lbfgs_use_projected_pairs=False,
             diis_max_objective_increase=1.0e-5,
             diis_max_delta_nelec=5.0e-2,
             line_search_nelec_guard_residual_rms=1.0e-2,
@@ -118,6 +119,7 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
         lbfgs_initial_metric=lbfgs_initial_metric,
         lbfgs_history_size=lbfgs_history_size,
         lbfgs_line_search_c2=lbfgs_line_search_c2,
+        lbfgs_use_projected_pairs=lbfgs_use_projected_pairs,
         diis_switch_residual_rms=diis_switch_residual_rms,
         diis_max_objective_increase=diis_max_objective_increase,
         diis_max_delta_nelec=diis_max_delta_nelec,
@@ -289,6 +291,32 @@ def test_fermi_response_singular_response_falls_back_to_scalar_shift():
     correction = projected[0] - candidate[0]
     assert float(cp.max(cp.abs(
         correction - parameter * cp.eye(2))).item()) < 1.0e-12
+
+
+def test_fermi_response_excessive_correction_falls_back_to_scalar_shift():
+    levels = cp.asarray([-2.0, -0.05, 0.10, 2.0], dtype=cp.float64)
+    fock = cp.diag(levels).astype(cp.complex128)
+    mf = _FixedFockKRKS([fock])
+    config = GrandCanonicalConfig(
+        check_time_reversal=False,
+        line_search_nelec_guard_mode='fermi-response')
+    solver = GrandCanonicalKRKS(
+        mf, mu=0.0, sigma=0.1, config=config)
+    # Force the response-conditioning guard without changing the charge root.
+    solver.config.line_search_max_h_rms_step = 1.0e-12
+    candidate = [fock.copy()]
+    target_nelec = (
+        solver._cheap_fixed_mu_electron_number(candidate) - 2.0e-2)
+
+    projected, parameter, fallback = (
+        solver._project_trial_electron_number(candidate, target_nelec))
+
+    assert fallback
+    assert abs(solver._cheap_fixed_mu_electron_number(projected) -
+               target_nelec) <= 1.0e-10
+    correction = projected[0] - candidate[0]
+    assert float(cp.max(cp.abs(
+        correction - parameter * cp.eye(4))).item()) < 1.0e-12
 
 
 def test_fermi_response_insufficient_charge_capacity_falls_back():
@@ -639,6 +667,148 @@ def test_projected_line_search_uses_actual_step_and_forces_restart(
     assert record.nelec_projection_correction_rms == pytest.approx(0.34)
 
 
+def test_lbfgs_opt_in_adds_actual_projected_secant_pair():
+    _, solver = _solver(
+        optimizer='lbfgs', lbfgs_initial_metric='scalar',
+        lbfgs_use_projected_pairs=True)
+    old = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    step = [cp.asarray([[0.02, 0.01 + 0.015j],
+                       [0.01 - 0.015j, -0.01]])]
+    gradient_change = solver.scale_blocks(2.0, step)
+    new = replace(
+        old,
+        h_orth=solver.axpy(1.0, step, old.h_orth),
+        gradient=solver.axpy(1.0, gradient_change, old.gradient))
+    projected = _LineSearchResult(
+        True, new, 1.0, 1, False, True,
+        'accepted occupation-projected Armijo point', True,
+        actual_step=solver.copy_blocks(step),
+        nelec_projection_applied=True,
+        nelec_projection_mode='fermi-response')
+
+    history = []
+    info = solver._update_lbfgs_history(
+        history, old, new, projected)
+
+    assert info['pair_added']
+    assert info['action'] == 'projected pair added'
+    assert len(history) == 1
+    pair = history[0]
+    assert float(cp.max(cp.abs(pair.s[0] - step[0])).item()) < 1.0e-14
+    assert (float(cp.max(cp.abs(
+        pair.y[0] - gradient_change[0])).item()) < 1.0e-14)
+    assert pair.sy == pytest.approx(solver.inner(step, gradient_change))
+    assert pair.rho == pytest.approx(1.0 / pair.sy)
+    assert float(cp.max(cp.abs(
+        pair.s[0] - pair.s[0].conj().T)).item()) < 1.0e-14
+
+    direction, used_history, reason = solver._lbfgs_direction(new, history)
+    assert used_history
+    assert reason == ''
+    assert solver.all_finite(direction)
+    assert all(float(cp.max(cp.abs(
+        value - value.conj().T)).item()) < 1.0e-14
+               for value in direction)
+
+
+def test_lbfgs_projected_bad_curvature_preserves_valid_history():
+    _, solver = _solver(
+        optimizer='lbfgs', lbfgs_initial_metric='scalar',
+        lbfgs_use_projected_pairs=True)
+    old = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    step = [cp.asarray([[0.02, 0.01j], [-0.01j, -0.01]])]
+    good = replace(
+        old,
+        h_orth=solver.axpy(1.0, step, old.h_orth),
+        gradient=solver.axpy(2.0, step, old.gradient))
+    projected = _LineSearchResult(
+        True, good, 1.0, 1, False, True, 'projected', True,
+        actual_step=solver.copy_blocks(step),
+        nelec_projection_applied=True)
+    history = []
+    assert solver._update_lbfgs_history(
+        history, old, good, projected)['pair_added']
+    retained = history[0]
+
+    bad_step = solver.scale_blocks(0.5, step)
+    bad = replace(
+        good,
+        h_orth=solver.axpy(1.0, bad_step, good.h_orth),
+        gradient=solver.axpy(-1.0, bad_step, good.gradient))
+    bad_projected = replace(
+        projected, state=bad,
+        actual_step=solver.copy_blocks(bad_step))
+    info = solver._update_lbfgs_history(
+        history, good, bad, bad_projected)
+
+    assert not info['pair_added']
+    assert info['sy'] < 0.0
+    assert info['action'] == 'projected pair skipped: bad curvature'
+    assert len(history) == 1
+    assert history[0] is retained
+
+    inconsistent = replace(
+        bad_projected,
+        actual_step=solver.scale_blocks(2.0, bad_step))
+    info = solver._update_lbfgs_history(
+        history, good, bad, inconsistent)
+    assert history == []
+    assert 'inconsistent projected step' in info['action']
+
+    history.append(retained)
+    missing_step = replace(bad_projected, actual_step=None)
+    info = solver._update_lbfgs_history(
+        history, good, bad, missing_step)
+    assert history == []
+    assert 'lacks actual step' in info['action']
+
+
+def test_lbfgs_kernel_uses_projected_pair_on_next_cycle(monkeypatch):
+    _, solver = _solver(
+        optimizer='lbfgs', lbfgs_initial_metric='scalar',
+        lbfgs_use_projected_pairs=True)
+    solver.config.max_cycle = 2
+    solver.config.lbfgs_descent_cosine_min = 1.0e-12
+    h0 = [cp.asarray([[-0.3, 0.08 + 0.03j],
+                      [0.08 - 0.03j, 0.2]])]
+    calls = []
+
+    def accepted_projected_step(state, direction, **unused_kwargs):
+        calls.append(solver.copy_blocks(direction))
+        step = solver.scale_blocks(0.02, direction)
+        slope = solver.inner(state.gradient, step)
+        assert slope < 0.0
+        new_gradient = solver.axpy(1.0, step, state.gradient)
+        new_objective = state.objective + 0.5 * slope
+        new = replace(
+            state,
+            h_orth=solver.axpy(1.0, step, state.h_orth),
+            gradient=new_gradient,
+            grad_rms=solver.rms(new_gradient),
+            objective=new_objective,
+            grand_potential=new_objective)
+        return _LineSearchResult(
+            True, new, 1.0, 1, False, True, 'projected', True,
+            actual_step=solver.copy_blocks(step),
+            nelec_projection_applied=True,
+            nelec_projection_mode='fermi-response')
+
+    monkeypatch.setattr(solver, '_line_search', accepted_projected_step)
+    result = solver._kernel_lbfgs(h0=h0)
+
+    assert len(calls) == 2
+    assert len(result.history) == 2
+    assert result.history[0].search_direction_source == 'residual'
+    assert result.history[0].lbfgs_pair_added
+    assert result.history[0].lbfgs_history_size == 1
+    assert result.history[1].search_direction_source == 'lbfgs'
+    assert result.history[1].lbfgs_history_size == 2
+
+
 def test_nlcg_projected_acceptance_restarts_with_zero_beta(monkeypatch):
     _, solver = _solver(line_search_nelec_guard_mode='scalar-shift')
     solver.config.max_cycle = 2
@@ -868,6 +1038,7 @@ def test_all_cg_updates_converge_fixed_fock_problem():
 
 
 def test_lbfgs_configuration_aliases_validation_and_fixed_n_metric():
+    assert not GrandCanonicalConfig().lbfgs_use_projected_pairs
     _, solver = _solver(optimizer='L-BFGS', lbfgs_initial_metric='fermi_response')
     assert solver.config.optimizer == 'lbfgs'
     assert solver.config.lbfgs_initial_metric == 'fermi'
@@ -881,6 +1052,11 @@ def test_lbfgs_configuration_aliases_validation_and_fixed_n_metric():
         _solver(optimizer='not-an-optimizer')
     with pytest.raises(ValueError, match='lbfgs_history_size'):
         _solver(optimizer='lbfgs', lbfgs_history_size=-1)
+    with pytest.raises(TypeError, match='lbfgs_use_projected_pairs'):
+        config = GrandCanonicalConfig(lbfgs_use_projected_pairs=1)
+        GrandCanonicalKRKS(
+            _FixedFockKRKS([cp.eye(2)]), mu=-0.1, sigma=0.15,
+            config=config)
 
 
 def test_residual_diis_configuration_and_pulay_coefficients():
@@ -1360,6 +1536,9 @@ def test_lbfgs_fixed_fock_step_and_exact_gradient_pair():
     assert result.history[0].lbfgs_pair_added
     assert result.history[0].lbfgs_sy > 0.0
     assert len(solver._lbfgs_history) == 1
+    fock_counts = [record.fock_evaluations for record in result.history]
+    assert fock_counts == sorted(fock_counts)
+    assert fock_counts[-1] == result.nfev
 
     pair = solver._lbfgs_history[0]
     final_state = solver.evaluate(result.h_orth)
