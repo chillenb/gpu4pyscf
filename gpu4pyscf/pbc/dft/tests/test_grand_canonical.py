@@ -115,6 +115,10 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             nlcg_exact_gradient_blend=True,
             nlcg_exact_gradient_polish=True,
             nlcg_reset_on_preprojection=True,
+            nlcg_residual_filter_rms=None,
+            nlcg_residual_filter_max_relative_increase=0.0,
+            nlcg_residual_filter_min_relative_reduction=2.0e-2,
+            nlcg_residual_filter_objective_noise=1.0e-10,
             cg_restart_interval=20):
     f0 = cp.asarray([[[-0.7, 0.12j], [-0.12j, 0.3]]], dtype=cp.complex128)
     mf = _FixedFockKRKS(f0)
@@ -160,6 +164,13 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
         nlcg_exact_gradient_blend=nlcg_exact_gradient_blend,
         nlcg_exact_gradient_polish=nlcg_exact_gradient_polish,
         nlcg_reset_on_preprojection=nlcg_reset_on_preprojection,
+        nlcg_residual_filter_rms=nlcg_residual_filter_rms,
+        nlcg_residual_filter_max_relative_increase=(
+            nlcg_residual_filter_max_relative_increase),
+        nlcg_residual_filter_min_relative_reduction=(
+            nlcg_residual_filter_min_relative_reduction),
+        nlcg_residual_filter_objective_noise=(
+            nlcg_residual_filter_objective_noise),
     )
     return mf, GrandCanonicalKRKS(
         mf, mu=mu, sigma=0.15, config=config,
@@ -272,6 +283,19 @@ def test_hager_zhang_configuration_validation():
             line_search_method='hager-zhang',
             line_search_nelec_guard_mode='fermi-response',
             nlcg_nelec_projection_strategy='trial')
+    with pytest.raises(ValueError, match='residual filter requires'):
+        _solver(nlcg_residual_filter_rms=1.0e-3)
+    with pytest.raises(ValueError, match='must be positive'):
+        _solver(
+            line_search_method='hager-zhang',
+            nlcg_nelec_projection_strategy='direction',
+            nlcg_residual_filter_rms=0.0)
+    with pytest.raises(ValueError, match='relative_reduction'):
+        _solver(
+            line_search_method='hager-zhang',
+            nlcg_nelec_projection_strategy='direction',
+            nlcg_residual_filter_rms=1.0e-3,
+            nlcg_residual_filter_min_relative_reduction=0.0)
 
 
 def test_scalar_shift_projection_hits_charge_boundary_and_is_identity():
@@ -549,6 +573,10 @@ def test_fixed_direction_projection_caps_endpoint_and_preserves_mu(mode):
     endpoint = solver._sanitize_h(
         solver.axpy(1.0, prepared.direction, state.h_orth))
     endpoint_nelec = solver._cheap_fixed_mu_electron_number(endpoint)
+    reductions_before = solver.ncheap_nelec_alpha_reductions
+    cap, restricted = solver._charge_feasible_alpha_cap(
+        state, prepared.direction, 1.0,
+        maximum=prepared.trust_radius)
 
     assert prepared.success
     assert prepared.preprojected
@@ -558,6 +586,9 @@ def test_fixed_direction_projection_caps_endpoint_and_preserves_mu(mode):
     assert abs(endpoint_nelec - state.electron_number -
                prepared.projected_delta_nelec) <= 1.0e-10
     assert solver._is_descent(state, prepared.direction)
+    assert cap == pytest.approx(1.0)
+    assert not restricted
+    assert solver.ncheap_nelec_alpha_reductions == reductions_before
     assert all(float(cp.max(cp.abs(
         value - value.conj().T)).item()) < 1.0e-12
                for value in prepared.direction)
@@ -916,6 +947,112 @@ def test_hager_zhang_approximate_wolfe_uses_absolute_noise(
     solver._verify_accepted_step(
         state, result.state, direction, result,
         solver.inner(state.gradient, direction))
+
+
+def test_hager_zhang_residual_filter_vetoes_wolfe_and_accepts_override(
+        monkeypatch):
+    filter_noise = 1.0e-10
+    _, solver = _solver(
+        electron_number=1.2, line_search_method='hager-zhang',
+        hager_zhang_objective_noise=0.0,
+        line_search_nelec_feasible_alpha=False,
+        nlcg_nelec_projection_strategy='direction',
+        nlcg_residual_filter_rms=1.0e-3,
+        nlcg_residual_filter_objective_noise=filter_noise)
+    evaluated = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    state = replace(evaluated, residual_rms=1.0e-4)
+    direction = solver.scale_blocks(-1.0e-3, state.gradient)
+    dphi0 = solver.inner(state.gradient, direction)
+    dd = solver.inner(direction, direction)
+    calls = []
+
+    def filtered_trial(current, trial_direction, alpha,
+                       allow_nelec_projection=True,
+                       nelec_limit_override=None):
+        calls.append(alpha)
+        solver.nfev += 1
+        solver._last_trial_rejected_by_nelec = False
+        step = solver.scale_blocks(alpha, trial_direction)
+        solver._last_trial_info = _TrialInfo(
+            actual_step=step,
+            actual_slope=solver.inner(current.gradient, step))
+        h = solver._sanitize_h(
+            solver.axpy(alpha, trial_direction, current.h_orth))
+        if len(calls) == 1:
+            # Ordinary weak Wolfe, but a 50% residual increase: veto it.
+            objective = current.objective + 0.2 * alpha * dphi0
+            slope = 0.0
+            residual_rms = 1.5 * current.residual_rms
+        else:
+            # Fails Wolfe curvature but lowers the residual by 20% while
+            # staying inside the absolute objective allowance.
+            objective = current.objective + 0.5 * filter_noise
+            slope = dphi0
+            residual_rms = 0.8 * current.residual_rms
+        gradient = solver.scale_blocks(slope / dd, direction)
+        return replace(
+            current, h_orth=h, objective=objective,
+            gradient=gradient, residual_rms=residual_rms)
+
+    monkeypatch.setattr(solver, '_trial', filtered_trial)
+    result = solver._line_search(state, direction)
+
+    assert result.success, result.message
+    assert calls == pytest.approx([1.0, 0.5])
+    assert result.nfev == 2
+    assert result.residual_filter_active
+    assert result.residual_filter_qualified
+    assert result.residual_filter_rejections == 1
+    assert result.residual_filter_ratio == pytest.approx(0.8)
+    assert result.force_restart
+    assert not result.curvature_qualified
+    assert solver.nresidual_filter_acceptances == 1
+    solver._verify_accepted_step(
+        state, result.state, direction, result, dphi0)
+
+
+def test_hager_zhang_bounded_wolfe_retains_curvature_with_filter(
+        monkeypatch):
+    _, solver = _solver(
+        electron_number=1.2, line_search_method='hager-zhang',
+        hager_zhang_objective_noise=0.0,
+        line_search_nelec_feasible_alpha=False,
+        nlcg_nelec_projection_strategy='direction',
+        nlcg_residual_filter_rms=1.0e-3)
+    evaluated = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    state = replace(evaluated, residual_rms=1.0e-4)
+    direction = solver.scale_blocks(-1.0e-3, state.gradient)
+    dphi0 = solver.inner(state.gradient, direction)
+
+    def bounded_wolfe(current, trial_direction, alpha,
+                      allow_nelec_projection=True,
+                      nelec_limit_override=None):
+        solver.nfev += 1
+        step = solver.scale_blocks(alpha, trial_direction)
+        solver._last_trial_info = _TrialInfo(
+            actual_step=step,
+            actual_slope=solver.inner(current.gradient, step))
+        return replace(
+            current,
+            h_orth=solver._sanitize_h(
+                solver.axpy(alpha, trial_direction, current.h_orth)),
+            objective=current.objective + 0.2 * alpha * dphi0,
+            gradient=solver.scale_blocks(0.0, current.gradient),
+            residual_rms=0.9 * current.residual_rms)
+
+    monkeypatch.setattr(solver, '_trial', bounded_wolfe)
+    result = solver._line_search(state, direction)
+
+    assert result.success
+    assert result.weak_wolfe
+    assert result.curvature_qualified
+    assert result.residual_filter_active
+    assert not result.residual_filter_qualified
+    assert result.residual_filter_rejections == 0
 
 
 def test_projected_line_search_uses_actual_step_and_forces_restart(
