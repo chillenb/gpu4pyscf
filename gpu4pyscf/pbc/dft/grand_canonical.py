@@ -67,6 +67,21 @@ class GrandCanonicalConfig:
     lbfgs_cap_unit_step_with_history: bool = True
     lbfgs_clear_on_non_wolfe: bool = True
 
+    # Optional residual-DIIS final polishing.  The direct optimizer hands off
+    # once the residual reaches the switch threshold.  DIIS then prioritizes
+    # the fixed-point residual over objective changes below the configured
+    # noise allowance.
+    diis_switch_residual_rms: Optional[float] = None
+    diis_space: int = 6
+    diis_regularization: float = 1.0e-10
+    diis_max_condition: float = 1.0e12
+    diis_max_coefficient_l1: float = 10.0
+    diis_backtrack_factor: float = 0.5
+    diis_max_backtracks: int = 8
+    diis_min_residual_reduction: float = 1.0e-3
+    diis_max_objective_increase: float = 1.0e-5
+    diis_max_delta_nelec: float = 5.0e-2
+
     # Optional branch selector for low-temperature calculations.  This shifts
     # only the initial auxiliary Hamiltonian by a scalar; mu and every
     # subsequently evaluated Fock matrix retain their physical energy zero.
@@ -82,6 +97,9 @@ class GrandCanonicalConfig:
     line_search_growth: float = 2.0
     line_search_max_h_rms_step: float = 0.5
     armijo_backtrack_factor: float = 0.5
+    line_search_nelec_guard_residual_rms: Optional[float] = 1.0e-2
+    line_search_max_delta_nelec: float = 1.0
+    line_search_nelec_guard_max_delta_nelec: float = 5.0e-2
 
     fermi_divdiff_rtol: float = 1.0e-10
     hermiticity_tol: float = 1.0e-10
@@ -127,6 +145,11 @@ class IterationRecord:
     strong_wolfe: bool = False
     line_search_message: str = ''
     descent_cosine: float = np.nan
+    diis_history_size: int = 0
+    diis_condition: float = np.nan
+    diis_coefficient_l1: float = np.nan
+    diis_damping: float = np.nan
+    diis_history_action: str = ''
 
 
 @dataclass(frozen=True)
@@ -183,6 +206,13 @@ class _LBFGSPair:
 
 
 @dataclass
+class _DIISItem:
+    h: list
+    fock: list
+    residual: list
+
+
+@dataclass
 class GrandCanonicalResult:
     converged: bool
     message: str
@@ -219,6 +249,7 @@ class GrandCanonicalResult:
     free_energy: float = np.nan
     fixed_electron_number: bool = False
     target_electron_number: Optional[float] = None
+    cheap_nelec_rejections: int = 0
 
 
 def _as_float(value: Any, name: str = 'value') -> float:
@@ -346,6 +377,8 @@ class GrandCanonicalKRKS:
         self.config.lbfgs_initial_metric = self._canonical_lbfgs_metric(
             self.config.lbfgs_initial_metric)
         self._validate_lbfgs_config()
+        self._validate_diis_config()
+        self._validate_nelec_guard_config()
         self.verbose = (getattr(mf, 'verbose', logger.NOTE)
                         if self.config.verbose is None else self.config.verbose)
         self.log = logger.new_logger(mf, self.verbose)
@@ -357,8 +390,10 @@ class GrandCanonicalKRKS:
             self.config.lbfgs_initial_metric = 'scalar'
         self.history: list[IterationRecord] = []
         self._lbfgs_history: list[_LBFGSPair] = []
+        self._diis_history: list[_DIISItem] = []
         self._last_lbfgs_metric_scale = np.nan
         self.nfev = 0
+        self.ncheap_nelec_reject = 0
         self._prepare_fixed_basis_data()
         bytes_per_pair = 2 * sum(
             n * n * int(x.dtype.itemsize)
@@ -482,6 +517,62 @@ class GrandCanonicalKRKS:
                      'lbfgs_clear_on_non_wolfe'):
             if not isinstance(getattr(self.config, name), bool):
                 raise TypeError(f'{name} must be boolean')
+
+    def _validate_diis_config(self) -> None:
+        switch = self.config.diis_switch_residual_rms
+        if switch is not None:
+            switch = _as_float(switch, 'diis_switch_residual_rms')
+            if switch <= 0.0:
+                raise ValueError(
+                    'diis_switch_residual_rms must be positive when enabled')
+            if switch < self.config.conv_tol_residual_rms:
+                raise ValueError(
+                    'diis_switch_residual_rms may not be smaller than '
+                    'conv_tol_residual_rms')
+            self.config.diis_switch_residual_rms = switch
+        for name, minimum in (('diis_space', 2), ('diis_max_backtracks', 0)):
+            value = getattr(self.config, name)
+            if (not isinstance(value, int) or isinstance(value, bool) or
+                    value < minimum):
+                relation = 'at least 2' if minimum == 2 else 'nonnegative'
+                raise ValueError(f'{name} must be an integer that is {relation}')
+        positive = (
+            'diis_regularization', 'diis_max_condition',
+            'diis_max_coefficient_l1', 'diis_max_objective_increase',
+            'diis_max_delta_nelec',
+        )
+        for name in positive:
+            value = getattr(self.config, name)
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f'{name} must be finite and positive')
+        reduction = self.config.diis_min_residual_reduction
+        if not np.isfinite(reduction) or not 0.0 <= reduction < 1.0:
+            raise ValueError(
+                'diis_min_residual_reduction must lie in [0, 1)')
+        factor = self.config.diis_backtrack_factor
+        if not np.isfinite(factor) or not 0.0 < factor < 1.0:
+            raise ValueError('diis_backtrack_factor must lie strictly between 0 and 1')
+
+    def _validate_nelec_guard_config(self) -> None:
+        threshold = self.config.line_search_nelec_guard_residual_rms
+        if threshold is not None:
+            threshold = _as_float(
+                threshold, 'line_search_nelec_guard_residual_rms')
+            if threshold <= 0.0:
+                raise ValueError(
+                    'line_search_nelec_guard_residual_rms must be positive '
+                    'when enabled')
+            self.config.line_search_nelec_guard_residual_rms = threshold
+        for name in ('line_search_max_delta_nelec',
+                     'line_search_nelec_guard_max_delta_nelec'):
+            maximum = getattr(self.config, name)
+            if not np.isfinite(maximum) or maximum <= 0.0:
+                raise ValueError(f'{name} must be finite and positive')
+        if (self.config.line_search_nelec_guard_max_delta_nelec >
+                self.config.line_search_max_delta_nelec):
+            raise ValueError(
+                'line_search_nelec_guard_max_delta_nelec may not exceed '
+                'line_search_max_delta_nelec')
 
     def _prepare_fixed_basis_data(self) -> None:
         required = ('cell', 'kpts', 'get_ovlp', 'get_hcore', 'get_veff',
@@ -1286,6 +1377,142 @@ class GrandCanonicalKRKS:
         info['pair_added'] = True
         return info
 
+    # ---- residual DIIS ---------------------------------------------------
+
+    def _should_start_diis(self, state: _GCState) -> bool:
+        threshold = self.config.diis_switch_residual_rms
+        return threshold is not None and state.residual_rms <= threshold
+
+    def _append_diis_item(self, history: list[_DIISItem],
+                          state: _GCState) -> None:
+        history.append(_DIISItem(
+            self.copy_blocks(state.h_orth),
+            self.copy_blocks(state.fock_orth),
+            self.copy_blocks(state.residual)))
+        if len(history) > self.config.diis_space:
+            del history[0]
+
+    def _diis_coefficients(
+            self, history: list[_DIISItem]) -> tuple[np.ndarray, float,
+                                                      float, str]:
+        """Return regularized Pulay coefficients, pruning unsafe history."""
+        action = ''
+        while len(history) >= 2:
+            size = len(history)
+            gram = np.empty((size, size), dtype=float)
+            for i, item_i in enumerate(history):
+                for j in range(i + 1):
+                    value = self.inner(item_i.residual, history[j].residual)
+                    gram[i, j] = gram[j, i] = value
+            scale = max(float(np.max(np.diag(gram))), 1.0e-30)
+            regularized = gram / scale
+            regularized += self.config.diis_regularization * np.eye(size)
+            try:
+                condition = float(np.linalg.cond(regularized))
+                augmented = np.zeros((size + 1, size + 1), dtype=float)
+                augmented[:size, :size] = regularized
+                augmented[:size, size] = 1.0
+                augmented[size, :size] = 1.0
+                rhs = np.zeros(size + 1, dtype=float)
+                rhs[size] = 1.0
+                coefficients = np.linalg.solve(augmented, rhs)[:size]
+                coefficient_l1 = float(np.sum(np.abs(coefficients)))
+                valid = (
+                    np.isfinite(condition)
+                    and condition <= self.config.diis_max_condition
+                    and np.all(np.isfinite(coefficients))
+                    and coefficient_l1 <= self.config.diis_max_coefficient_l1)
+            except (FloatingPointError, np.linalg.LinAlgError):
+                condition = np.inf
+                coefficient_l1 = np.inf
+                valid = False
+            if valid:
+                return coefficients, condition, coefficient_l1, action
+            if len(history) > 2:
+                del history[0]
+                action = 'dropped oldest ill-conditioned DIIS vector'
+                continue
+            latest = history[-1]
+            history[:] = [latest]
+            return (np.ones(1), condition, 1.0,
+                    'reset ill-conditioned DIIS history')
+        return np.ones(1), np.nan, 1.0, action or 'fixed-point seed'
+
+    def _diis_target(self, history: Sequence[_DIISItem],
+                     coefficients: Sequence[float]) -> list:
+        target = self.scale_blocks(float(coefficients[0]), history[0].fock)
+        for coefficient, item in zip(coefficients[1:], history[1:]):
+            target = self.axpy(float(coefficient), item.fock, target)
+        target = self.hermitize_blocks(target)
+        target, _ = self.project_time_reversal(target)
+        return self.hermitize_blocks(target)
+
+    def _diis_trial_acceptable(self, state: _GCState,
+                               trial: _GCState) -> tuple[bool, str]:
+        residual_limit = state.residual_rms * (
+            1.0 - self.config.diis_min_residual_reduction)
+        if not trial.residual_rms < residual_limit:
+            return False, 'residual did not decrease sufficiently'
+        objective_increase = trial.objective - state.objective
+        if objective_increase > self.config.diis_max_objective_increase:
+            return False, 'objective increase exceeded DIIS noise allowance'
+        if (not self.fixed_electron_number and
+                abs(trial.electron_number - state.electron_number) >
+                self.config.diis_max_delta_nelec):
+            return False, 'electron-number change exceeded DIIS safeguard'
+        return True, ''
+
+    def _try_diis_target(self, state: _GCState,
+                         target: Sequence) -> tuple[Optional[_GCState],
+                                                    float, str]:
+        direction = self.axpy(-1.0, state.h_orth, target)
+        if not self.all_finite(direction) or self.norm(direction) == 0.0:
+            return None, 0.0, 'zero or nonfinite DIIS direction'
+        damping = 1.0
+        last_reason = 'no DIIS trial evaluated'
+        for _ in range(self.config.diis_max_backtracks + 1):
+            trial = self._trial(state, direction, damping)
+            if trial is not None:
+                acceptable, last_reason = self._diis_trial_acceptable(
+                    state, trial)
+                if acceptable:
+                    return trial, damping, ''
+            else:
+                last_reason = 'DIIS trial evaluation failed'
+            damping *= self.config.diis_backtrack_factor
+        return None, 0.0, last_reason
+
+    def _diis_step(
+            self, state: _GCState,
+            history: list[_DIISItem]) -> tuple[_LineSearchResult, float,
+                                                float, str]:
+        start_nfev = self.nfev
+        coefficients, condition, coefficient_l1, action = (
+            self._diis_coefficients(history))
+        target = self._diis_target(history, coefficients)
+        trial, damping, rejection = self._try_diis_target(state, target)
+        if trial is None and len(history) > 1:
+            latest = history[-1]
+            history[:] = [latest]
+            action = ((action + '; ') if action else '') + (
+                'cleared DIIS history after rejected extrapolation')
+            target = self.copy_blocks(latest.fock)
+            coefficients = np.ones(1)
+            coefficient_l1 = 1.0
+            trial, damping, rejection = self._try_diis_target(state, target)
+        nfev = self.nfev - start_nfev
+        if trial is None:
+            message = 'residual-DIIS failed: ' + rejection
+            return (_LineSearchResult(False, None, nfev=nfev,
+                                      message=message),
+                    condition, coefficient_l1, action)
+        message = 'residual-DIIS accepted'
+        if damping < 1.0:
+            message += f' with damping {damping:.6g}'
+        return (_LineSearchResult(True, trial, damping, nfev,
+                                  False, False, message),
+                condition, coefficient_l1, action)
+
     def _alpha_cap(self, direction: Sequence) -> float:
         block_rms = self.max_block_rms(direction)
         if block_rms == 0.0:
@@ -1293,9 +1520,44 @@ class GrandCanonicalKRKS:
         return min(self.config.line_search_alpha_cap,
                    self.config.line_search_max_h_rms_step / block_rms)
 
+    def _cheap_fixed_mu_electron_number(self, h_orth: Sequence) -> float:
+        """Evaluate N(H) without constructing a density or building a Fock matrix."""
+        if self.fixed_electron_number:
+            return self.target_electron_number
+        return 2.0 * sum(
+            float((self.weights[k] * cp.sum(fermi_occupations(
+                self.beta * (cp.linalg.eigvalsh(hk) - self.mu)))).item())
+            for k, hk in enumerate(h_orth))
+
+    def _reject_trial_by_electron_number(
+            self, state: _GCState, candidate: Sequence) -> tuple[bool, float]:
+        threshold = self.config.line_search_nelec_guard_residual_rms
+        if self.fixed_electron_number:
+            return False, state.electron_number
+        electron_number = self._cheap_fixed_mu_electron_number(candidate)
+        maximum = self.config.line_search_max_delta_nelec
+        if threshold is not None and state.residual_rms <= threshold:
+            maximum = min(
+                maximum,
+                self.config.line_search_nelec_guard_max_delta_nelec)
+        rejected = (abs(electron_number - state.electron_number) >
+                    maximum)
+        return rejected, electron_number
+
     def _trial(self, state: _GCState, direction: Sequence, alpha: float) -> Optional[_GCState]:
         try:
-            candidate = self.axpy(alpha, direction, state.h_orth)
+            candidate = self._sanitize_h(
+                self.axpy(alpha, direction, state.h_orth))
+            rejected, electron_number = self._reject_trial_by_electron_number(
+                state, candidate)
+            if rejected:
+                self.ncheap_nelec_reject += 1
+                self.log.debug(
+                    'Rejected trial before Fock build: alpha = %.6g, '
+                    'residual RMS = %.6g, N = %.12g -> %.12g',
+                    alpha, state.residual_rms, state.electron_number,
+                    electron_number)
+                return None
             return self.evaluate(candidate)
         except (ArithmeticError, FloatingPointError, ValueError, RuntimeError, cp.linalg.LinAlgError):
             return None
@@ -1466,7 +1728,12 @@ class GrandCanonicalKRKS:
                 lbfgs_curvature_cosine: float = np.nan,
                 lbfgs_metric_scale: float = np.nan,
                 lbfgs_history_action: str = '',
-                descent_cosine: float = np.nan) -> None:
+                descent_cosine: float = np.nan,
+                diis_history_size: int = 0,
+                diis_condition: float = np.nan,
+                diis_coefficient_l1: float = np.nan,
+                diis_damping: float = np.nan,
+                diis_history_action: str = '') -> None:
         delta_objective, delta_nelec, density_change, _ = self._metrics(new, old)
         delta_omega = new.grand_potential - old.grand_potential
         self.history.append(IterationRecord(
@@ -1479,7 +1746,9 @@ class GrandCanonicalKRKS:
             optimizer, search_direction_source, lbfgs_history_size,
             lbfgs_pair_added, lbfgs_sy, lbfgs_curvature_cosine,
             lbfgs_metric_scale, lbfgs_history_action,
-            line_search.strong_wolfe, line_search.message, descent_cosine))
+            line_search.strong_wolfe, line_search.message, descent_cosine,
+            diis_history_size, diis_condition, diis_coefficient_l1,
+            diis_damping, diis_history_action))
         if self.fixed_electron_number:
             self.log.info('Canonical cycle %d  A = %.12g  E_DFT = %.12g  '
                           'N = %.10g  mu = %.12g  |g|_rms = %.3g  '
@@ -1516,6 +1785,25 @@ class GrandCanonicalKRKS:
             history_size, direction_source, line_search.strong_wolfe,
             self._last_lbfgs_metric_scale, pair_info['action'])
 
+    def _record_diis(
+            self, cycle: int, old: _GCState, new: _GCState,
+            step: _LineSearchResult, history_size: int, condition: float,
+            coefficient_l1: float, history_action: str) -> None:
+        self._record(
+            cycle, old, new, step, np.nan, np.nan, history_action,
+            optimizer='diis', search_direction_source='residual-diis',
+            diis_history_size=history_size, diis_condition=condition,
+            diis_coefficient_l1=coefficient_l1,
+            diis_damping=step.alpha,
+            diis_history_action=history_action)
+        self.log.info(
+            'DIIS cycle %d  residual %.6g -> %.6g  delta objective = %.3g  '
+            'delta N = %.3g  damping = %.3g  history = %d  cond = %.3g  %s',
+            cycle, old.residual_rms, new.residual_rms,
+            new.objective - old.objective,
+            new.electron_number - old.electron_number, step.alpha,
+            history_size, condition, history_action)
+
     def kernel(self, dm0: Any = None, h0: Any = None) -> GrandCanonicalResult:
         """Run the configured safeguarded direct minimizer."""
         if self.config.optimizer == 'nlcg':
@@ -1529,6 +1817,7 @@ class GrandCanonicalKRKS:
         """Run safeguarded fixed-mu or fixed-electron nonlinear CG."""
         self.history = []
         self.nfev = 0
+        self.ncheap_nelec_reject = 0
         state = self.evaluate(self._initial_h(dm0, h0))
         previous: Optional[_GCState] = None
         direction = self.copy_blocks(state.residual)
@@ -1546,6 +1835,12 @@ class GrandCanonicalKRKS:
                     break
             else:
                 consecutive = 0
+            if self._should_start_diis(state):
+                self.log.info(
+                    'Switching from NLCG to residual DIIS at |F-H|_rms = %.6g; '
+                    'CG memory reset', state.residual_rms)
+                return self._kernel_diis(
+                    state, previous, niter=niter, cycle_start=cycle)
             direction, restarted, restart_reason = self._ensure_descent(state, direction)
             if not self._is_descent(state, direction):
                 if state.grad_rms < self.config.conv_tol_grad_rms and state.residual_rms < self.config.conv_tol_residual_rms:
@@ -1604,6 +1899,7 @@ class GrandCanonicalKRKS:
         """Run safeguarded exact-gradient limited-memory BFGS."""
         self.history = []
         self.nfev = 0
+        self.ncheap_nelec_reject = 0
         state = self.evaluate(self._initial_h(dm0, h0))
         previous: Optional[_GCState] = None
         lbfgs_history: list[_LBFGSPair] = []
@@ -1622,6 +1918,15 @@ class GrandCanonicalKRKS:
                     break
             else:
                 consecutive = 0
+
+            if self._should_start_diis(state):
+                lbfgs_history.clear()
+                self._last_lbfgs_metric_scale = np.nan
+                self.log.info(
+                    'Switching from L-BFGS to residual DIIS at |F-H|_rms = '
+                    '%.6g; L-BFGS history reset', state.residual_rms)
+                return self._kernel_diis(
+                    state, previous, niter=niter, cycle_start=cycle)
 
             # At an exact stationary point no further accepted state exists
             # with which to satisfy density-change or consecutive-state
@@ -1716,6 +2021,40 @@ class GrandCanonicalKRKS:
                           else self._metrics(state, previous)[2])
         return self._finalize(state, converged, message, niter, density_change)
 
+    def _kernel_diis(self, state: _GCState, previous: Optional[_GCState],
+                     niter: int, cycle_start: int) -> GrandCanonicalResult:
+        """Polish a locally converged direct-minimization state with DIIS."""
+        diis_history: list[_DIISItem] = []
+        self._diis_history = diis_history
+        converged = False
+        message = 'maximum cycles reached during residual-DIIS polishing'
+
+        for cycle in range(cycle_start, self.config.max_cycle):
+            if state.residual_rms < self.config.conv_tol_residual_rms:
+                converged = True
+                message = 'converged residual-DIIS fixed point'
+                break
+            self._append_diis_item(diis_history, state)
+            step, condition, coefficient_l1, history_action = (
+                self._diis_step(state, diis_history))
+            if not step.success or step.state is None:
+                message = step.message
+                break
+            new_state = step.state
+            self._record_diis(
+                cycle, state, new_state, step, len(diis_history),
+                condition, coefficient_l1, history_action)
+            niter += 1
+            self._checkpoint(new_state, niter)
+            previous, state = state, new_state
+        else:
+            if state.residual_rms < self.config.conv_tol_residual_rms:
+                converged = True
+                message = 'converged residual-DIIS fixed point at maximum cycle'
+        density_change = (0.0 if previous is None
+                          else self._metrics(state, previous)[2])
+        return self._finalize(state, converged, message, niter, density_change)
+
     # ---- public state finalisation ----------------------------------------
 
     def _finalize(self, state: _GCState, converged: bool, message: str,
@@ -1740,6 +2079,7 @@ class GrandCanonicalKRKS:
         self.mu = state.chemical_potential
         self.mf.mu_gc = state.chemical_potential
         self.mf.sigma_gc = self.sigma
+        self.mf.cheap_nelec_rejections_gc = self.ncheap_nelec_reject
         self.mf.fixed_electron_number = self.fixed_electron_number
         self.mf.target_electron_number = self.target_electron_number
         self.mf.h_aux_gc = self.copy_blocks(state.h_orth)
@@ -1754,6 +2094,7 @@ class GrandCanonicalKRKS:
             'entropy_energy_gc': state.entropy_energy,
             'mu_gc': state.chemical_potential,
             'sigma_gc': self.sigma,
+            'cheap_nelec_rejections_gc': self.ncheap_nelec_reject,
             'fixed_electron_number': self.fixed_electron_number,
         })
         return GrandCanonicalResult(
@@ -1766,4 +2107,5 @@ class GrandCanonicalKRKS:
             self.copy_blocks(state.occupations), mo_coeff, mo_occ, mo_energy,
             state.grad_rms, state.residual_rms, density_change, list(self.history),
             state.veff, self.config.checkpoint_path, state.free_energy,
-            self.fixed_electron_number, self.target_electron_number)
+            self.fixed_electron_number, self.target_electron_number,
+            self.ncheap_nelec_reject)
