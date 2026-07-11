@@ -952,7 +952,8 @@ def test_diis_backtracking_stops_when_local_secant_cannot_reduce_residual():
         0.1, [cp.eye(2, dtype=cp.complex128)], state.h_orth)
     calls = []
 
-    def trial(current, direction, alpha):
+    def trial(current, direction, alpha, allow_nelec_projection=True):
+        assert not allow_nelec_projection
         calls.append(alpha)
         factor = 1.01 if len(calls) == 1 else 1.005
         return replace(current, residual_rms=factor * current.residual_rms)
