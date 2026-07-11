@@ -3474,6 +3474,7 @@ class GrandCanonicalKRKS:
     def _armijo_fallback(
             self, state: _GCState, direction: Sequence, *,
             alpha_init: Optional[float] = None,
+            max_evals_override: Optional[int] = None,
             alpha_cap_override: Optional[float] = None,
             allow_nelec_projection: bool = True,
             nelec_limit_override: Optional[float] = None
@@ -3485,6 +3486,15 @@ class GrandCanonicalKRKS:
         filter_active = (
             self.config.nlcg_residual_filter_rms is not None and
             state.residual_rms <= self.config.nlcg_residual_filter_rms)
+        maximum_evals = self.config.line_search_max_evals
+        if max_evals_override is not None:
+            if (not isinstance(max_evals_override, int) or
+                    isinstance(max_evals_override, bool) or
+                    max_evals_override < 0):
+                raise ValueError(
+                    'fallback max_evals_override must be a nonnegative '
+                    'integer or None')
+            maximum_evals = min(maximum_evals, max_evals_override)
 
         def finish(value: _LineSearchResult) -> _LineSearchResult:
             ratio = value.residual_filter_ratio
@@ -3530,8 +3540,7 @@ class GrandCanonicalKRKS:
             alpha = min(float(alpha_init), alpha_max)
         trial_count = 0
         while (trial_count < self.config.line_search_max_trials and
-               self.nfev - start_nfev <
-               self.config.line_search_max_evals):
+               self.nfev - start_nfev < maximum_evals):
             trial = self._trial(
                 state, direction, alpha,
                 allow_nelec_projection=allow_nelec_projection,
@@ -4322,14 +4331,32 @@ class GrandCanonicalKRKS:
                     prepared.trust_radius
                     if fixed_direction_projection and
                     np.isfinite(prepared.trust_radius) else None)
-                fallback_line_search = self._armijo_fallback(
-                    state, direction,
-                    alpha_init=(
-                        None if alpha_init is None else
-                        alpha_init * self.config.armijo_backtrack_factor),
-                    alpha_cap_override=prepared.alpha_cap,
-                    allow_nelec_projection=not fixed_direction_projection,
-                    nelec_limit_override=nelec_limit)
+                fallback_max_evals = None
+                filter_max_evals = (
+                    self.config.nlcg_residual_filter_max_evals)
+                filter_threshold = self.config.nlcg_residual_filter_rms
+                if (filter_max_evals is not None and
+                        filter_threshold is not None and
+                        state.residual_rms <= filter_threshold):
+                    fallback_max_evals = max(
+                        0, filter_max_evals - primary_line_search.nfev)
+                if fallback_max_evals == 0:
+                    fallback_line_search = _LineSearchResult(
+                        False, None, line_search_method='armijo',
+                        message=('residual-filter line-search evaluation '
+                                 'cap exhausted'))
+                else:
+                    fallback_line_search = self._armijo_fallback(
+                        state, direction,
+                        alpha_init=(
+                            None if alpha_init is None else
+                            alpha_init *
+                            self.config.armijo_backtrack_factor),
+                        max_evals_override=fallback_max_evals,
+                        alpha_cap_override=prepared.alpha_cap,
+                        allow_nelec_projection=(
+                            not fixed_direction_projection),
+                        nelec_limit_override=nelec_limit)
                 line_search = self._combine_line_search_work(
                     primary_line_search, fallback_line_search)
                 restarted = True
