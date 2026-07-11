@@ -1816,7 +1816,9 @@ class GrandCanonicalKRKS:
                     # expensive Fock trial cannot repair this DIIS model.
                     # Return the nearby rejected state so the outer model can
                     # augment or prune its history immediately.
-                    if (np.isfinite(slope) and slope > 0.0 and
+                    local_samples = (
+                        max(residual0, residual1) <= interpolation_limit)
+                    if (local_samples and np.isfinite(slope) and slope > 0.0 and
                             np.isfinite(intercept) and
                             intercept >= residual_limit):
                         last_reason = (
