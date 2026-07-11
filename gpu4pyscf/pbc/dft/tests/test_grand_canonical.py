@@ -1215,6 +1215,67 @@ def test_hager_zhang_residual_warm_start_limits_active_fock_evals(
     assert len(calls) == 7
 
 
+@pytest.mark.parametrize(
+    'filter_rms, primary_evals, expected_override, fallback_evals', [
+        (1.0e6, 1, [1], 1),
+        (1.0e6, 2, [], 0),
+        (1.0e-30, 2, [None], 3),
+    ])
+def test_kernel_residual_hz_and_fallback_share_eval_budget(
+        monkeypatch, filter_rms, primary_evals, expected_override,
+        fallback_evals):
+    _, solver = _solver(
+        line_search_method='hager-zhang',
+        hager_zhang_max_evals=7,
+        line_search_max_evals=3,
+        line_search_nelec_feasible_alpha=False,
+        nlcg_nelec_projection_strategy='direction',
+        nlcg_residual_filter_rms=filter_rms,
+        nlcg_residual_filter_warm_start=True,
+        nlcg_residual_filter_max_evals=2)
+    solver.config.max_cycle = 1
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j],
+                      [0.19 + 0.11j, 0.6]])]
+    fallback_overrides = []
+    fallback_trials = []
+
+    def failed_hz(*unused_args, **unused_kwargs):
+        solver.nfev += primary_evals
+        return _LineSearchResult(
+            False, None, nfev=primary_evals,
+            line_search_method='hager-zhang',
+            message='injected Hager-Zhang failure')
+
+    def failed_fallback_trial(current, direction, alpha,
+                              allow_nelec_projection=True,
+                              nelec_limit_override=None):
+        del current, direction, allow_nelec_projection
+        del nelec_limit_override
+        fallback_trials.append(alpha)
+        solver.nfev += 1
+        solver._last_trial_rejected_by_nelec = False
+        solver._last_trial_info = _TrialInfo()
+        return None
+
+    original_fallback = solver._armijo_fallback
+
+    def counted_fallback(*args, **kwargs):
+        fallback_overrides.append(kwargs.get('max_evals_override'))
+        return original_fallback(*args, **kwargs)
+
+    monkeypatch.setattr(solver, '_line_search', failed_hz)
+    monkeypatch.setattr(solver, '_trial', failed_fallback_trial)
+    monkeypatch.setattr(solver, '_armijo_fallback', counted_fallback)
+
+    result = solver.kernel(h0=h0)
+
+    assert fallback_overrides == expected_override
+    assert len(fallback_trials) == fallback_evals
+    assert result.nfev == 1 + primary_evals + fallback_evals
+    if filter_rms > 1.0:
+        assert primary_evals + fallback_evals <= 2
+
+
 def test_hager_zhang_residual_warm_start_resets_between_kernel_runs(
         monkeypatch):
     _, solver = _solver(
