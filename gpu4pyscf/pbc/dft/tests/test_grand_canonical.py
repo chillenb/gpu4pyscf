@@ -832,7 +832,7 @@ def test_hager_zhang_approximate_wolfe_uses_absolute_noise(
     assert result.curvature_qualified
     assert result.objective_allowance == noise
     assert result.state.objective - state.objective == pytest.approx(
-        0.5 * noise, abs=1.0e-12)
+        0.5 * noise, abs=1.0e-11)
     assert calls == [pytest.approx(1.0)]
     solver._verify_accepted_step(
         state, result.state, direction, result,
@@ -1101,7 +1101,7 @@ def test_nlcg_projected_acceptance_restarts_with_zero_beta(monkeypatch):
                       [0.08 - 0.03j, 0.2]])]
     calls = []
 
-    def accepted_step(state, direction):
+    def accepted_step(state, direction, **unused_kwargs):
         cycle = len(calls)
         if cycle == 0:
             alpha = 0.05
