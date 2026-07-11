@@ -9,7 +9,7 @@ functional.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import inspect
 from pathlib import Path
@@ -77,6 +77,7 @@ class GrandCanonicalConfig:
     diis_max_condition: float = 1.0e12
     diis_max_coefficient_l1: float = 10.0
     diis_backtrack_factor: float = 0.5
+    diis_initial_damping: float = 1.0
     diis_max_backtracks: int = 8
     diis_model_max_backtracks: int = 2
     diis_max_trust_model_repairs: int = 2
@@ -87,7 +88,22 @@ class GrandCanonicalConfig:
     diis_trust_shrink_ratio: float = 0.25
     diis_trust_expand_ratio: float = 0.75
     diis_trust_expansion: float = 2.0
+    diis_trust_expand_min_relative_reduction: float = 2.0e-2
     diis_max_restoration_residual_increase: float = 0.0
+
+    # Optional fixed-mu globalization through canonical continuation.  Each
+    # inner solve fixes N; the outer scalar iteration approaches the requested
+    # mu until the frozen-H charge response is safe for a fixed-mu polish.
+    canonical_continuation: bool = False
+    canonical_continuation_max_outer: int = 16
+    canonical_continuation_coarse_residual_tol: float = 4.0e-6
+    canonical_continuation_bracketed_residual_tol: float = 1.0e-7
+    canonical_continuation_handoff_delta_nelec: float = 1.0e-3
+    canonical_continuation_initial_delta_nelec: float = 3.0e-2
+    canonical_continuation_max_delta_nelec: float = 1.0
+    canonical_continuation_min_delta_nelec: float = 1.0e-5
+    canonical_continuation_initial_damping: float = 0.125
+    canonical_continuation_final_damping: float = 1.0 / 256.0
 
     # Optional branch selector for low-temperature calculations.  This shifts
     # only the initial auxiliary Hamiltonian by a scalar; mu and every
@@ -261,6 +277,10 @@ class GrandCanonicalResult:
     fixed_electron_number: bool = False
     target_electron_number: Optional[float] = None
     cheap_nelec_rejections: int = 0
+    canonical_continuation_steps: int = 0
+    canonical_continuation_evaluations: int = 0
+    canonical_continuation_mu_error: float = np.nan
+    canonical_continuation_delta_nelec: float = np.nan
 
 
 def _as_float(value: Any, name: str = 'value') -> float:
@@ -390,6 +410,7 @@ class GrandCanonicalKRKS:
         self._validate_lbfgs_config()
         self._validate_diis_config()
         self._validate_nelec_guard_config()
+        self._validate_canonical_continuation_config()
         self.verbose = (getattr(mf, 'verbose', logger.NOTE)
                         if self.config.verbose is None else self.config.verbose)
         self.log = logger.new_logger(mf, self.verbose)
@@ -581,6 +602,10 @@ class GrandCanonicalKRKS:
         factor = self.config.diis_backtrack_factor
         if not np.isfinite(factor) or not 0.0 < factor < 1.0:
             raise ValueError('diis_backtrack_factor must lie strictly between 0 and 1')
+        initial_damping = self.config.diis_initial_damping
+        if (not np.isfinite(initial_damping) or
+                not 0.0 < initial_damping <= 1.0):
+            raise ValueError('diis_initial_damping must lie in (0, 1]')
         shrink = self.config.diis_trust_shrink_ratio
         expand = self.config.diis_trust_expand_ratio
         if (not np.isfinite(shrink) or not np.isfinite(expand) or
@@ -590,6 +615,12 @@ class GrandCanonicalKRKS:
         expansion = self.config.diis_trust_expansion
         if not np.isfinite(expansion) or expansion <= 1.0:
             raise ValueError('diis_trust_expansion must be finite and exceed 1')
+        min_expand_reduction = (
+            self.config.diis_trust_expand_min_relative_reduction)
+        if (not np.isfinite(min_expand_reduction) or
+                not 0.0 <= min_expand_reduction < 1.0):
+            raise ValueError(
+                'diis_trust_expand_min_relative_reduction must lie in [0, 1)')
 
     def _validate_nelec_guard_config(self) -> None:
         threshold = self.config.line_search_nelec_guard_residual_rms
@@ -611,6 +642,50 @@ class GrandCanonicalKRKS:
             raise ValueError(
                 'line_search_nelec_guard_max_delta_nelec may not exceed '
                 'line_search_max_delta_nelec')
+
+    def _validate_canonical_continuation_config(self) -> None:
+        if not isinstance(self.config.canonical_continuation, bool):
+            raise TypeError('canonical_continuation must be boolean')
+        max_outer = self.config.canonical_continuation_max_outer
+        if (not isinstance(max_outer, int) or isinstance(max_outer, bool) or
+                max_outer < 1):
+            raise ValueError(
+                'canonical_continuation_max_outer must be a positive integer')
+        positive = (
+            'canonical_continuation_coarse_residual_tol',
+            'canonical_continuation_bracketed_residual_tol',
+            'canonical_continuation_handoff_delta_nelec',
+            'canonical_continuation_initial_delta_nelec',
+            'canonical_continuation_max_delta_nelec',
+            'canonical_continuation_min_delta_nelec',
+            'canonical_continuation_initial_damping',
+            'canonical_continuation_final_damping',
+        )
+        for name in positive:
+            value = getattr(self.config, name)
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f'{name} must be finite and positive')
+        if (self.config.canonical_continuation_bracketed_residual_tol >
+                self.config.canonical_continuation_coarse_residual_tol):
+            raise ValueError(
+                'canonical_continuation_bracketed_residual_tol may not '
+                'exceed canonical_continuation_coarse_residual_tol')
+        if (self.config.canonical_continuation_min_delta_nelec >
+                self.config.canonical_continuation_initial_delta_nelec):
+            raise ValueError(
+                'canonical_continuation_min_delta_nelec may not exceed '
+                'canonical_continuation_initial_delta_nelec')
+        if (self.config.canonical_continuation_initial_delta_nelec >
+                self.config.canonical_continuation_max_delta_nelec):
+            raise ValueError(
+                'canonical_continuation_initial_delta_nelec may not exceed '
+                'canonical_continuation_max_delta_nelec')
+        if self.config.canonical_continuation_initial_damping > 1.0:
+            raise ValueError(
+                'canonical_continuation_initial_damping may not exceed 1')
+        if self.config.canonical_continuation_final_damping > 1.0:
+            raise ValueError(
+                'canonical_continuation_final_damping may not exceed 1')
 
     def _prepare_fixed_basis_data(self) -> None:
         required = ('cell', 'kpts', 'get_ovlp', 'get_hcore', 'get_veff',
@@ -1019,6 +1094,10 @@ class GrandCanonicalKRKS:
     # ---- initialisation and checkpointing ---------------------------------
 
     def _initial_h_from_dm(self, dm: Any) -> list:
+        # This is a genuine Fock build even though it precedes the first
+        # objective evaluation.  Count it so result.nfev is the total number
+        # of expensive Fock constructions from a fresh density guess.
+        self.nfev += 1
         dm_blocks = self.hermitize_blocks(_blocks(dm, 'initial density'))
         if len(dm_blocks) != self.nkpts:
             raise ValueError('initial density and k-point counts differ')
@@ -1499,6 +1578,7 @@ class GrandCanonicalKRKS:
         predicted_reduction = state.residual_rms - predicted_residual_rms
         actual_reduction = state.residual_rms - trial.residual_rms
         scale = max(state.residual_rms, np.finfo(float).tiny)
+        relative_reduction = actual_reduction / scale
         if predicted_reduction > np.finfo(float).eps * scale:
             ratio = actual_reduction / predicted_reduction
         else:
@@ -1510,6 +1590,8 @@ class GrandCanonicalKRKS:
             next_damping *= self.config.diis_backtrack_factor
         elif (np.isfinite(ratio) and
               ratio > self.config.diis_trust_expand_ratio and
+              relative_reduction >=
+              self.config.diis_trust_expand_min_relative_reduction and
               accepted_damping >= starting_damping * (1.0 - 1.0e-12)):
             next_damping *= self.config.diis_trust_expansion
         next_damping = min(1.0, max(
@@ -1564,6 +1646,7 @@ class GrandCanonicalKRKS:
             max_backtracks = self.config.diis_max_backtracks
         last_reason = 'no DIIS trial evaluated'
         best_rejected = None
+        rejected_samples: list[tuple[float, float]] = []
         for _ in range(max_backtracks + 1):
             trial = self._trial(state, direction, damping)
             if trial is not None:
@@ -1590,6 +1673,30 @@ class GrandCanonicalKRKS:
                 if (best_rejected is None and
                         trial.residual_rms <= interpolation_limit):
                     best_rejected = trial
+                rejected_samples.append((damping, trial.residual_rms))
+                if len(rejected_samples) >= 2:
+                    (alpha0, residual0), (alpha1, residual1) = (
+                        rejected_samples[-2:])
+                    slope = ((residual1 - residual0) /
+                             (alpha1 - alpha0))
+                    intercept = residual1 - slope * alpha1
+                    residual_limit = state.residual_rms * (
+                        1.0 - self.config.diis_min_residual_reduction)
+                    if residual_target_rms is not None:
+                        residual_limit = min(
+                            residual_limit, residual_target_rms)
+                    # If the two smallest sampled trust radii extrapolate to
+                    # an unacceptable residual even at zero radius, another
+                    # expensive Fock trial cannot repair this DIIS model.
+                    # Return the nearby rejected state so the outer model can
+                    # augment or prune its history immediately.
+                    if (np.isfinite(slope) and slope > 0.0 and
+                            np.isfinite(intercept) and
+                            intercept >= residual_limit):
+                        last_reason = (
+                            'backtracking secant predicts no acceptable '
+                            'residual for this DIIS model')
+                        break
             else:
                 last_reason = 'DIIS trial evaluation failed'
             damping *= self.config.diis_backtrack_factor
@@ -1658,14 +1765,18 @@ class GrandCanonicalKRKS:
         return min(self.config.line_search_alpha_cap,
                    self.config.line_search_max_h_rms_step / block_rms)
 
+    def _electron_number_at_mu(self, h_orth: Sequence, mu: float) -> float:
+        """Evaluate N(H, mu) without a density or Fock construction."""
+        return 2.0 * sum(
+            float((self.weights[k] * cp.sum(fermi_occupations(
+                self.beta * (cp.linalg.eigvalsh(hk) - mu)))).item())
+            for k, hk in enumerate(h_orth))
+
     def _cheap_fixed_mu_electron_number(self, h_orth: Sequence) -> float:
         """Evaluate N(H) without constructing a density or building a Fock matrix."""
         if self.fixed_electron_number:
             return self.target_electron_number
-        return 2.0 * sum(
-            float((self.weights[k] * cp.sum(fermi_occupations(
-                self.beta * (cp.linalg.eigvalsh(hk) - self.mu)))).item())
-            for k, hk in enumerate(h_orth))
+        return self._electron_number_at_mu(h_orth, self.mu)
 
     def _reject_trial_by_electron_number(
             self, state: _GCState, candidate: Sequence) -> tuple[bool, float]:
@@ -1967,8 +2078,274 @@ class GrandCanonicalKRKS:
             next_damping, trust_ratio, history_size, condition,
             history_action)
 
+    # ---- fixed-mu canonical continuation --------------------------------
+
+    def _canonical_continuation_config(
+            self, residual_tolerance: float,
+            initial_damping: float) -> GrandCanonicalConfig:
+        """Return an immediate-DIIS configuration for one fixed-N solve."""
+        return replace(
+            self.config,
+            canonical_continuation=False,
+            checkpoint_path=None,
+            checkpoint_interval=0,
+            initial_electron_number=None,
+            conv_tol_residual_rms=residual_tolerance,
+            # Canonical continuation is a fixed-point globalization.  Enter
+            # residual DIIS immediately instead of spending low-temperature
+            # objective line searches to discover the same local model.
+            diis_switch_residual_rms=max(1.0, residual_tolerance),
+            diis_initial_damping=initial_damping,
+            required_consecutive_conv=1,
+        )
+
+    def _canonical_continuation_proposal(
+            self, samples: Sequence[tuple[float, float]],
+            h_orth: Sequence, current_nelec: float,
+            maximum_step: float) -> float:
+        """Propose N using a bracketed secant or a free Fermi projection."""
+        negative = [(n, error) for n, error in samples if error < 0.0]
+        positive = [(n, error) for n, error in samples if error > 0.0]
+        minimum_step = self.config.canonical_continuation_min_delta_nelec
+
+        proposal = None
+        bracket = None
+        if negative and positive:
+            lower = max(negative, key=lambda item: item[0])
+            upper = min(positive, key=lambda item: item[0])
+            if lower[0] > upper[0]:
+                lower = min(negative, key=lambda item: abs(item[1]))
+                upper = min(positive, key=lambda item: abs(item[1]))
+            lo, hi = sorted((lower[0], upper[0]))
+            bracket = (lo, hi)
+
+            # Once a global sign-changing bracket exists, prefer the two most
+            # recent distinct points if their local dmu/dN is positive and
+            # their secant remains inside that bracket.  This keeps the
+            # superlinear local convergence of a secant without giving up the
+            # global safeguard.
+            current_n, current_error = samples[-1]
+            previous = next(
+                ((n, error) for n, error in reversed(samples[:-1])
+                 if abs(n - current_n) >= minimum_step), None)
+            if previous is not None:
+                slope = ((current_error - previous[1]) /
+                         (current_n - previous[0]))
+                if np.isfinite(slope) and slope > 0.0:
+                    local = current_n - current_error / slope
+                    if (np.isfinite(local) and
+                            lo + minimum_step <= local <= hi - minimum_step):
+                        proposal = local
+
+        if proposal is None and bracket is not None:
+            denominator = upper[1] - lower[1]
+            if denominator != 0.0:
+                proposal = (lower[0] - lower[1] *
+                            (upper[0] - lower[0]) / denominator)
+            else:
+                proposal = 0.5 * (lower[0] + upper[0])
+            lo, hi = bracket
+            if hi - lo > 2.0 * minimum_step:
+                proposal = min(hi - minimum_step,
+                               max(lo + minimum_step, proposal))
+            else:
+                proposal = 0.5 * (lo + hi)
+        elif proposal is None:
+            proposal = self._electron_number_at_mu(h_orth, self.mu)
+            if abs(proposal - current_nelec) < minimum_step:
+                error = samples[-1][1]
+                proposal = current_nelec - np.sign(error) * minimum_step
+
+        delta = min(maximum_step,
+                    max(-maximum_step, proposal - current_nelec))
+        capacity = 2.0 * sum(
+            float(self.weights[k].item()) * n
+            for k, n in enumerate(self.north))
+        margin = min(minimum_step, 0.25 * capacity)
+        return min(capacity - margin,
+                   max(margin, current_nelec + delta))
+
+    @staticmethod
+    def _continuation_history(
+            records: Sequence[IterationRecord], cycle_offset: int,
+            electron_number: float) -> list[IterationRecord]:
+        prefix = f'canonical continuation N={electron_number:.12g}'
+        return [replace(
+            record,
+            cycle=cycle_offset + record.cycle,
+            restart_reason=(prefix +
+                            (('; ' + record.restart_reason)
+                             if record.restart_reason else '')))
+            for record in records]
+
+    def _kernel_canonical_continuation(
+            self, dm0: Any = None, h0: Any = None) -> GrandCanonicalResult:
+        """Globalize a fixed-mu solve through automatic fixed-N continuation."""
+        if self.fixed_electron_number:
+            raise AssertionError('canonical continuation requires fixed mu')
+
+        self.history = []
+        self.nfev = 0
+        self.ncheap_nelec_reject = 0
+        h = self._initial_h(dm0, h0)
+        initialization_evaluations = self.nfev
+        current_nelec = self._electron_number_at_mu(h, self.mu)
+        samples: list[tuple[float, float]] = []
+        continuation_history: list[IterationRecord] = []
+        continuation_evaluations = 0
+        continuation_iterations = 0
+        best_error = np.inf
+        best_handoff_delta_nelec = np.inf
+        best_h = self.copy_blocks(h)
+        outer_steps = 0
+        outer_trust_radius = (
+            self.config.canonical_continuation_initial_delta_nelec)
+
+        for outer in range(self.config.canonical_continuation_max_outer):
+            had_bracket = (
+                any(value < 0.0 for _, value in samples) and
+                any(value > 0.0 for _, value in samples))
+            residual_tolerance = (
+                self.config.canonical_continuation_bracketed_residual_tol
+                if had_bracket else
+                self.config.canonical_continuation_coarse_residual_tol)
+            # A conservative fixed-point seed is cheaper than trying and
+            # rejecting several over-aggressive full DIIS extrapolations.
+            # The trust update expands this damping rapidly when warranted.
+            initial_damping = (
+                self.config.canonical_continuation_initial_damping)
+            canonical_solver = GrandCanonicalKRKS(
+                self.mf, mu=self.mu, sigma=self.sigma,
+                config=self._canonical_continuation_config(
+                    residual_tolerance, initial_damping),
+                electron_number=current_nelec)
+            canonical_result = canonical_solver.kernel(h0=h)
+            outer_steps += 1
+            continuation_evaluations += canonical_result.nfev
+            stage_history = self._continuation_history(
+                canonical_result.history, continuation_iterations,
+                current_nelec)
+            continuation_history.extend(stage_history)
+            continuation_iterations += canonical_result.niter
+            h = canonical_result.h_orth
+            error = canonical_result.mu - self.mu
+            target_nelec = self._electron_number_at_mu(h, self.mu)
+            handoff_delta_nelec = target_nelec - current_nelec
+            samples.append((current_nelec, error))
+            self.log.info(
+                'Canonical continuation %d: N = %.12g, optimized mu = '
+                '%.12g, target mu = %.12g, delta mu = %.3g, residual = %.3g, '
+                'Fock evaluations = %d',
+                outer, current_nelec, canonical_result.mu, self.mu, error,
+                canonical_result.residual_rms, canonical_result.nfev)
+
+            if abs(handoff_delta_nelec) < abs(best_handoff_delta_nelec):
+                best_handoff_delta_nelec = handoff_delta_nelec
+                best_error = error
+                best_h = self.copy_blocks(h)
+
+            # Continuation is a globalization device, not the final solver.
+            # Measure handoff safety by the frozen-H Fermi response rather
+            # than an absolute mu window: the same delta mu is benign in a
+            # gap but can move many electrons when sigma is small.  This
+            # projection is cheap and does not require knowing the final N.
+            if (canonical_result.converged and
+                    abs(handoff_delta_nelec) <=
+                    self.config.canonical_continuation_handoff_delta_nelec):
+                self.log.info(
+                    'Canonical continuation reached the fixed-mu handoff '
+                    'window (delta N = %.3g, delta mu = %.3g); starting '
+                    'fixed-mu polish', handoff_delta_nelec, error)
+                break
+            if not canonical_result.converged:
+                self.log.warn(
+                    'Canonical continuation inner solve did not converge: %s; '
+                    'proceeding to fixed-mu verification from the best state',
+                    canonical_result.message)
+                break
+
+            bracketed = (
+                any(value < 0.0 for _, value in samples) and
+                any(value > 0.0 for _, value in samples))
+            if (not bracketed and len(samples) >= 2 and
+                    np.sign(samples[-1][1]) == np.sign(samples[-2][1])):
+                outer_trust_radius = min(
+                    self.config.canonical_continuation_max_delta_nelec,
+                    2.0 * outer_trust_radius)
+            proposal = self._canonical_continuation_proposal(
+                samples, h, current_nelec, outer_trust_radius)
+            if abs(proposal - current_nelec) < (
+                    self.config.canonical_continuation_min_delta_nelec):
+                continue
+            current_nelec = proposal
+        else:
+            self.log.warn(
+                'Canonical continuation reached its maximum of %d outer steps; '
+                'proceeding to fixed-mu verification',
+                self.config.canonical_continuation_max_outer)
+
+        h = best_h
+
+        pre_evaluations = initialization_evaluations + continuation_evaluations
+        pre_iterations = continuation_iterations
+        saved_initial_damping = self.config.diis_initial_damping
+        self.config.diis_initial_damping = min(
+            saved_initial_damping,
+            self.config.canonical_continuation_final_damping)
+        try:
+            if self.config.optimizer == 'nlcg':
+                final_result = self._kernel_nlcg(h0=h)
+            elif self.config.optimizer == 'lbfgs':
+                final_result = self._kernel_lbfgs(h0=h)
+            else:  # pragma: no cover - validated during construction
+                raise AssertionError('validated optimizer is unreachable')
+        finally:
+            self.config.diis_initial_damping = saved_initial_damping
+
+        final_history = self._continuation_history(
+            final_result.history, pre_iterations, final_result.electron_number)
+        # The final records are fixed-mu, not canonical; remove the stage
+        # prefix while retaining globally increasing cycle numbers.
+        final_history = [replace(
+            record,
+            restart_reason=(record.restart_reason.split('; ', 1)[1]
+                            if '; ' in record.restart_reason else ''))
+            for record in final_history]
+        combined_history = continuation_history + final_history
+        total_evaluations = pre_evaluations + final_result.nfev
+        total_iterations = pre_iterations + final_result.niter
+        self.nfev = total_evaluations
+        self.ncheap_nelec_reject = final_result.cheap_nelec_rejections
+        self.history = combined_history
+        self.mf.scf_summary.update({
+            'canonical_continuation_steps': outer_steps,
+            'canonical_continuation_evaluations': continuation_evaluations,
+            'canonical_continuation_mu_error': best_error,
+            'canonical_continuation_delta_nelec': (
+                best_handoff_delta_nelec),
+            'fock_evaluations_total': total_evaluations,
+        })
+        message = (
+            f'canonical continuation ({outer_steps} outer steps, '
+            f'{continuation_evaluations} Fock evaluations); '
+            f'{final_result.message}')
+        return replace(
+            final_result,
+            message=message,
+            niter=total_iterations,
+            nfev=total_evaluations,
+            history=combined_history,
+            canonical_continuation_steps=outer_steps,
+            canonical_continuation_evaluations=continuation_evaluations,
+            canonical_continuation_mu_error=best_error,
+            canonical_continuation_delta_nelec=best_handoff_delta_nelec,
+        )
+
     def kernel(self, dm0: Any = None, h0: Any = None) -> GrandCanonicalResult:
         """Run the configured safeguarded direct minimizer."""
+        if (self.config.canonical_continuation and
+                not self.fixed_electron_number):
+            return self._kernel_canonical_continuation(dm0=dm0, h0=h0)
         if self.config.optimizer == 'nlcg':
             return self._kernel_nlcg(dm0=dm0, h0=h0)
         if self.config.optimizer == 'lbfgs':
@@ -2191,7 +2568,7 @@ class GrandCanonicalKRKS:
         self._diis_history = diis_history
         converged = False
         message = 'maximum cycles reached during residual-DIIS polishing'
-        damping_hint = 1.0
+        damping_hint = self.config.diis_initial_damping
         best_residual_rms = state.residual_rms
         restoration_pending = False
 
