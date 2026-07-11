@@ -119,6 +119,11 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             nlcg_residual_filter_max_relative_increase=0.0,
             nlcg_residual_filter_min_relative_reduction=2.0e-2,
             nlcg_residual_filter_objective_noise=1.0e-10,
+            nlcg_residual_filter_warm_start=False,
+            nlcg_residual_filter_initial_alpha=0.1,
+            nlcg_residual_filter_alpha_min=0.02,
+            nlcg_residual_filter_alpha_max=0.2,
+            nlcg_residual_filter_max_evals=None,
             cg_restart_interval=20):
     f0 = cp.asarray([[[-0.7, 0.12j], [-0.12j, 0.3]]], dtype=cp.complex128)
     mf = _FixedFockKRKS(f0)
@@ -171,6 +176,16 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             nlcg_residual_filter_min_relative_reduction),
         nlcg_residual_filter_objective_noise=(
             nlcg_residual_filter_objective_noise),
+        nlcg_residual_filter_warm_start=(
+            nlcg_residual_filter_warm_start),
+        nlcg_residual_filter_initial_alpha=(
+            nlcg_residual_filter_initial_alpha),
+        nlcg_residual_filter_alpha_min=(
+            nlcg_residual_filter_alpha_min),
+        nlcg_residual_filter_alpha_max=(
+            nlcg_residual_filter_alpha_max),
+        nlcg_residual_filter_max_evals=(
+            nlcg_residual_filter_max_evals),
     )
     return mf, GrandCanonicalKRKS(
         mf, mu=mu, sigma=0.15, config=config,
@@ -1053,6 +1068,181 @@ def test_hager_zhang_bounded_wolfe_retains_curvature_with_filter(
     assert result.residual_filter_active
     assert not result.residual_filter_qualified
     assert result.residual_filter_rejections == 0
+
+
+def test_hager_zhang_residual_warm_start_reuses_clipped_accepted_alpha(
+        monkeypatch):
+    _, solver = _solver(
+        line_search_method='hager-zhang',
+        line_search_nelec_feasible_alpha=False,
+        nlcg_nelec_projection_strategy='direction',
+        nlcg_residual_filter_rms=1.0e6,
+        nlcg_residual_filter_warm_start=True,
+        nlcg_residual_filter_initial_alpha=0.1,
+        nlcg_residual_filter_alpha_min=0.02,
+        nlcg_residual_filter_alpha_max=0.2)
+    solver.config.max_cycle = 3
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j],
+                      [0.19 + 0.11j, 0.6]])]
+    starts = []
+    accepted_alphas = iter([0.5, 0.005, 0.05])
+
+    def accepted_line_search(current, unused_direction, *, alpha_init=None,
+                             **unused_kwargs):
+        starts.append(alpha_init)
+        alpha = next(accepted_alphas)
+        new = replace(
+            current,
+            objective=current.objective - 1.0e-3,
+            grand_potential=current.grand_potential - 1.0e-3)
+        return _LineSearchResult(
+            True, new, alpha=alpha, force_restart=True,
+            message='injected accepted step')
+
+    monkeypatch.setattr(solver, '_line_search', accepted_line_search)
+    monkeypatch.setattr(
+        solver, '_verify_accepted_step', lambda *args, **kwargs: None)
+    monkeypatch.setattr(solver, '_record', lambda *args, **kwargs: None)
+
+    result = solver.kernel(h0=h0)
+
+    assert result.niter == 3
+    # First use the configured residual-mode alpha.  The accepted 0.5 is
+    # clipped to 0.2 on the next cycle; accepted 0.005 is clipped to 0.02.
+    assert starts == pytest.approx([0.1, 0.2, 0.02])
+    assert solver._nlcg_residual_previous_alpha == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize('warm_start, residual_rms', [
+    (False, 1.0e-4),
+    (True, 2.0e-3),
+])
+def test_hager_zhang_residual_warm_start_inactive_uses_default_alpha(
+        monkeypatch, warm_start, residual_rms):
+    assert not GrandCanonicalConfig().nlcg_residual_filter_warm_start
+    _, solver = _solver(
+        line_search_method='hager-zhang',
+        hager_zhang_objective_noise=0.0,
+        line_search_nelec_feasible_alpha=False,
+        nlcg_nelec_projection_strategy='direction',
+        nlcg_residual_filter_rms=1.0e-3,
+        nlcg_residual_filter_warm_start=warm_start,
+        nlcg_residual_filter_initial_alpha=0.1)
+    evaluated = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    state = replace(evaluated, residual_rms=residual_rms)
+    direction = solver.scale_blocks(-1.0e-3, state.gradient)
+    dphi0 = solver.inner(state.gradient, direction)
+    calls = []
+
+    def ordinary_wolfe(current, trial_direction, alpha,
+                       allow_nelec_projection=True,
+                       nelec_limit_override=None):
+        del allow_nelec_projection, nelec_limit_override
+        calls.append(alpha)
+        solver.nfev += 1
+        step = solver.scale_blocks(alpha, trial_direction)
+        solver._last_trial_info = _TrialInfo(
+            actual_step=step,
+            actual_slope=solver.inner(current.gradient, step))
+        return replace(
+            current,
+            h_orth=solver._sanitize_h(
+                solver.axpy(alpha, trial_direction, current.h_orth)),
+            objective=current.objective + 0.2 * alpha * dphi0,
+            gradient=solver.scale_blocks(0.0, current.gradient),
+            residual_rms=0.9 * current.residual_rms)
+
+    monkeypatch.setattr(solver, '_trial', ordinary_wolfe)
+    # A stale residual-mode alpha must not affect a search when either the
+    # feature is disabled or the residual filter is not active.
+    solver._nlcg_residual_previous_alpha = 0.05
+    result = solver._line_search(state, direction)
+
+    assert result.success
+    assert calls == pytest.approx([1.0])
+    assert result.alpha == pytest.approx(1.0)
+
+
+def test_hager_zhang_residual_warm_start_limits_active_fock_evals(
+        monkeypatch):
+    _, solver = _solver(
+        line_search_method='hager-zhang',
+        hager_zhang_objective_noise=0.0,
+        hager_zhang_max_evals=7,
+        line_search_nelec_feasible_alpha=False,
+        nlcg_nelec_projection_strategy='direction',
+        nlcg_residual_filter_rms=1.0e-3,
+        nlcg_residual_filter_warm_start=True,
+        nlcg_residual_filter_initial_alpha=0.1,
+        nlcg_residual_filter_max_evals=2)
+    evaluated = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    direction = solver.scale_blocks(-1.0e-3, evaluated.gradient)
+    calls = []
+
+    def failed_trial(current, trial_direction, alpha,
+                     allow_nelec_projection=True,
+                     nelec_limit_override=None):
+        del current, trial_direction, allow_nelec_projection
+        del nelec_limit_override
+        calls.append(alpha)
+        solver.nfev += 1
+        solver._last_trial_rejected_by_nelec = False
+        solver._last_trial_info = _TrialInfo()
+        return None
+
+    monkeypatch.setattr(solver, '_trial', failed_trial)
+
+    active = replace(evaluated, residual_rms=1.0e-4)
+    active_result = solver._line_search(
+        active, direction,
+        alpha_init=solver._nlcg_residual_alpha_init(active))
+    assert not active_result.success
+    assert active_result.nfev == 2
+    assert calls == pytest.approx([0.1, 0.05])
+
+    calls.clear()
+    inactive = replace(evaluated, residual_rms=2.0e-3)
+    inactive_result = solver._line_search(
+        inactive, direction,
+        alpha_init=solver._nlcg_residual_alpha_init(inactive))
+    assert not inactive_result.success
+    assert inactive_result.nfev == 7
+    assert calls[0] == pytest.approx(1.0)
+    assert len(calls) == 7
+
+
+def test_hager_zhang_residual_warm_start_resets_between_kernel_runs(
+        monkeypatch):
+    _, solver = _solver(
+        line_search_method='hager-zhang',
+        line_search_nelec_feasible_alpha=False,
+        nlcg_nelec_projection_strategy='direction',
+        nlcg_residual_filter_rms=1.0,
+        nlcg_residual_filter_warm_start=True)
+    solver.config.max_cycle = 1
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j],
+                      [0.19 + 0.11j, 0.6]])]
+    previous_alphas = []
+
+    def failed_line_search(*unused_args, **unused_kwargs):
+        previous_alphas.append(solver._nlcg_residual_previous_alpha)
+        solver._nlcg_residual_previous_alpha = 0.15
+        return _LineSearchResult(False, None, message='injected failure')
+
+    monkeypatch.setattr(solver, '_line_search', failed_line_search)
+    monkeypatch.setattr(
+        solver, '_armijo_fallback',
+        lambda *args, **kwargs: _LineSearchResult(
+            False, None, message='injected fallback failure'))
+
+    solver.kernel(h0=h0)
+    solver.kernel(h0=h0)
+
+    assert previous_alphas == [None, None]
 
 
 def test_projected_line_search_uses_actual_step_and_forces_restart(
