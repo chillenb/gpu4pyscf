@@ -886,6 +886,7 @@ def test_lbfgs_configuration_aliases_validation_and_fixed_n_metric():
 def test_residual_diis_configuration_and_pulay_coefficients():
     _, solver = _solver(diis_switch_residual_rms=1.0e-3)
     assert solver.config.diis_switch_residual_rms == 1.0e-3
+    assert not solver.config.diis_preserve_accepted_history
     with pytest.raises(ValueError, match='may not be smaller'):
         _solver(diis_switch_residual_rms=1.0e-8)
 
@@ -1064,6 +1065,87 @@ def test_residual_diis_uses_rejected_trial_as_trust_interpolation_point():
     assert calls == [(0.5, 2), (0.5, 2)]
     assert len(history) == 3
     assert 'augmented DIIS model with rejected trust trial' in action
+
+
+def test_diis_preserves_accepted_history_after_temporary_pruning():
+    _, solver = _solver(diis_switch_residual_rms=1.0e-3)
+    solver.config.diis_preserve_accepted_history = True
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    zero = [cp.zeros((2, 2), dtype=cp.complex128)]
+    history = [
+        _DIISItem(zero, [cp.eye(2)], [cp.diag(cp.asarray([1.0, 0.0]))]),
+        _DIISItem(zero, [2.0 * cp.eye(2)],
+                  [cp.diag(cp.asarray([0.0, 1.0]))]),
+        _DIISItem(zero, [3.0 * cp.eye(2)],
+                  [cp.asarray([[0.0, 1.0j], [-1.0j, 0.0]])]),
+    ]
+    accepted_items = list(history)
+    accepted = replace(state, residual_rms=0.5 * state.residual_rms)
+
+    def coefficients(items):
+        del items[0]
+        return np.full(2, 0.5), 1.0, 1.0, 'temporary test pruning'
+
+    solver._diis_coefficients = coefficients
+    solver._try_diis_target = lambda *args, **kwargs: (
+        accepted, 0.25, '', None)
+    step, _, _, action, _ = solver._diis_step(
+        state, history, starting_damping=0.5)
+
+    assert step.success
+    assert len(history) == len(accepted_items)
+    assert all(actual is expected
+               for actual, expected in zip(history, accepted_items))
+    assert 'restored accepted DIIS history' in action
+
+
+def test_diis_preserved_history_uses_latest_fock_fallback():
+    _, solver = _solver(diis_switch_residual_rms=1.0e-3)
+    solver.config.diis_preserve_accepted_history = True
+    solver.config.diis_model_max_backtracks = 2
+    solver.config.diis_max_backtracks = 7
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    zero = [cp.zeros((2, 2), dtype=cp.complex128)]
+    history = [
+        _DIISItem(zero, [cp.eye(2)], [cp.diag(cp.asarray([1.0, 0.0]))]),
+        _DIISItem(zero, [3.0 * cp.eye(2)],
+                  [cp.diag(cp.asarray([0.0, 1.0]))]),
+    ]
+    accepted_items = list(history)
+    rejected = replace(state, residual_rms=1.1 * state.residual_rms)
+    accepted = replace(state, residual_rms=0.5 * state.residual_rms)
+    calls = []
+
+    solver._diis_coefficients = lambda items: (
+        np.full(len(items), 1.0 / len(items)), 1.0, 1.0, '')
+
+    def try_target(unused_state, target, starting_damping,
+                   max_backtracks, **unused_kwargs):
+        calls.append((solver.copy_blocks(target), starting_damping,
+                      max_backtracks))
+        if len(calls) == 1:
+            return None, 0.0, 'rejected test model', rejected
+        return accepted, 0.125, '', None
+
+    solver._try_diis_target = try_target
+    step, _, _, action, _ = solver._diis_step(
+        state, history, starting_damping=0.5)
+
+    assert step.success
+    assert step.state is accepted
+    assert step.alpha == pytest.approx(0.125)
+    assert [call[2] for call in calls] == [2, 7]
+    assert all(call[1] == pytest.approx(0.5) for call in calls)
+    assert float(cp.max(cp.abs(
+        calls[1][0][0] - accepted_items[-1].fock[0])).item()) < 1.0e-14
+    assert all(actual is expected
+               for actual, expected in zip(history, accepted_items))
+    assert rejected not in history
+    assert 'latest-Fock fallback' in action
 
 
 def test_residual_diis_allows_one_bounded_nonmonotone_restoration():
