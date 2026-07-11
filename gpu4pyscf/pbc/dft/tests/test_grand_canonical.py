@@ -7,7 +7,7 @@ from pyscf.pbc import gto
 from gpu4pyscf.lib.cupy_helper import tag_array
 from gpu4pyscf.pbc.dft.grand_canonical import (
     GrandCanonicalConfig, GrandCanonicalKRKS, _DIISItem, _LBFGSPair,
-    _LineSearchResult, fermi_divided_difference, fermi_entropy,
+    _LineSearchResult, _TrialInfo, fermi_divided_difference, fermi_entropy,
     fermi_occupations,
 )
 
@@ -97,6 +97,11 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             line_search_nelec_guard_residual_rms=1.0e-2,
             line_search_max_delta_nelec=1.0,
             line_search_nelec_guard_max_delta_nelec=5.0e-2,
+            line_search_nelec_guard_mode='reject',
+            line_search_nelec_trust_initial=2.5e-1,
+            line_search_nelec_trust_min=1.0e-3,
+            line_search_nelec_trust_shrink=5.0e-1,
+            line_search_nelec_trust_expand=2.0,
             canonical_continuation=False):
     f0 = cp.asarray([[[-0.7, 0.12j], [-0.12j, 0.3]]], dtype=cp.complex128)
     mf = _FixedFockKRKS(f0)
@@ -121,6 +126,11 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
         line_search_max_delta_nelec=line_search_max_delta_nelec,
         line_search_nelec_guard_max_delta_nelec=(
             line_search_nelec_guard_max_delta_nelec),
+        line_search_nelec_guard_mode=line_search_nelec_guard_mode,
+        line_search_nelec_trust_initial=line_search_nelec_trust_initial,
+        line_search_nelec_trust_min=line_search_nelec_trust_min,
+        line_search_nelec_trust_shrink=line_search_nelec_trust_shrink,
+        line_search_nelec_trust_expand=line_search_nelec_trust_expand,
         canonical_continuation=canonical_continuation,
     )
     return mf, GrandCanonicalKRKS(
@@ -175,6 +185,173 @@ def test_cheap_fixed_mu_electron_number_matches_full_evaluation():
     assert abs(cheap - full.electron_number) < 1.0e-12
 
 
+@pytest.mark.parametrize('alias, expected', [
+    ('reject', 'reject'),
+    ('scalar', 'scalar-shift'),
+    ('scalar_shift', 'scalar-shift'),
+    ('scalar shift', 'scalar-shift'),
+    ('fermi', 'fermi-response'),
+    ('response', 'fermi-response'),
+    ('fermi_response', 'fermi-response'),
+])
+def test_electron_number_guard_mode_aliases_and_default(alias, expected):
+    assert GrandCanonicalConfig().line_search_nelec_guard_mode == 'reject'
+    _, solver = _solver(line_search_nelec_guard_mode=alias)
+    assert solver.config.line_search_nelec_guard_mode == expected
+
+
+def test_electron_number_guard_mode_validation():
+    with pytest.raises(TypeError, match='must be a string'):
+        _solver(line_search_nelec_guard_mode=None)
+    with pytest.raises(ValueError, match='reject, scalar-shift'):
+        _solver(line_search_nelec_guard_mode='occupation-mixing')
+
+
+def test_scalar_shift_projection_hits_charge_boundary_and_is_identity():
+    _, solver = _solver(line_search_nelec_guard_mode='scalar-shift')
+    mu_before = solver.mu
+    candidate = [cp.asarray([
+        [-0.25, 0.07 + 0.11j],
+        [0.07 - 0.11j, 0.35],
+    ], dtype=cp.complex128)]
+    candidate = solver._sanitize_h(candidate)
+    raw_nelec = solver._cheap_fixed_mu_electron_number(candidate)
+    target_nelec = raw_nelec - 5.0e-2
+
+    projected, parameter, fallback = (
+        solver._project_trial_electron_number(candidate, target_nelec))
+
+    assert not fallback
+    assert solver.mu == mu_before
+    assert abs(solver._cheap_fixed_mu_electron_number(projected) -
+               target_nelec) <= 1.0e-10
+    correction = projected[0] - candidate[0]
+    expected = parameter * cp.eye(2, dtype=cp.complex128)
+    assert float(cp.max(cp.abs(correction - expected)).item()) < 1.0e-12
+    assert abs(complex(correction[0, 1].item())) < 1.0e-14
+    assert abs(complex(projected[0][0, 1].item()) -
+               complex(candidate[0][0, 1].item())) < 1.0e-14
+    assert float(cp.max(cp.abs(
+        projected[0] - projected[0].conj().T)).item()) < 1.0e-14
+
+
+def test_fermi_response_projection_hits_boundary_and_targets_near_mu():
+    levels = cp.asarray([-2.0, -0.05, 0.10, 2.0], dtype=cp.float64)
+    fock = cp.diag(levels).astype(cp.complex128)
+    mf = _FixedFockKRKS([fock])
+    config = GrandCanonicalConfig(
+        check_time_reversal=False,
+        line_search_nelec_guard_mode='fermi-response')
+    solver = GrandCanonicalKRKS(
+        mf, mu=0.0, sigma=0.1, config=config)
+    candidate = [fock.copy()]
+    raw_nelec = solver._cheap_fixed_mu_electron_number(candidate)
+    target_nelec = raw_nelec - 2.0e-2
+
+    projected, _, fallback = solver._project_trial_electron_number(
+        candidate, target_nelec)
+    scalar, _ = solver._scalar_shift_to_nelec(candidate, target_nelec)
+
+    assert not fallback
+    assert abs(solver._cheap_fixed_mu_electron_number(projected) -
+               target_nelec) <= 1.0e-10
+    response_correction = cp.diag(projected[0] - candidate[0]).real
+    scalar_correction = cp.diag(scalar[0] - candidate[0]).real
+    near_mu = float(cp.max(cp.abs(response_correction[1:3])).item())
+    far_from_mu = float(cp.max(cp.abs(
+        response_correction[[0, 3]])).item())
+    assert near_mu > 1.0e4 * max(far_from_mu, 1.0e-16)
+    assert float(cp.max(cp.abs(
+        response_correction - scalar_correction)).item()) > 1.0e-5
+    assert float(cp.max(cp.abs(
+        scalar_correction - scalar_correction[0])).item()) < 1.0e-12
+
+
+def test_fermi_response_singular_response_falls_back_to_scalar_shift():
+    levels = cp.asarray([-10.0, 10.0], dtype=cp.float64)
+    fock = cp.diag(levels).astype(cp.complex128)
+    mf = _FixedFockKRKS([fock])
+    config = GrandCanonicalConfig(
+        check_time_reversal=False,
+        line_search_nelec_guard_mode='fermi-response')
+    solver = GrandCanonicalKRKS(
+        mf, mu=0.0, sigma=1.0e-3, config=config)
+    candidate = [fock.copy()]
+    target_nelec = (
+        solver._cheap_fixed_mu_electron_number(candidate) - 1.0e-2)
+
+    projected, parameter, fallback = (
+        solver._project_trial_electron_number(candidate, target_nelec))
+
+    assert fallback
+    assert abs(solver._cheap_fixed_mu_electron_number(projected) -
+               target_nelec) <= 1.0e-10
+    correction = projected[0] - candidate[0]
+    assert float(cp.max(cp.abs(
+        correction - parameter * cp.eye(2))).item()) < 1.0e-12
+
+
+def test_fermi_response_insufficient_charge_capacity_falls_back():
+    # The frontier level has a well-resolved f(1-f), but changing that level
+    # alone can remove only one electron.  Reaching this target also requires
+    # moving the otherwise saturated occupied level.
+    levels = cp.asarray([-10.0, 0.0, 10.0], dtype=cp.float64)
+    fock = cp.diag(levels).astype(cp.complex128)
+    mf = _FixedFockKRKS([fock])
+    config = GrandCanonicalConfig(
+        check_time_reversal=False,
+        line_search_nelec_guard_mode='fermi-response')
+    solver = GrandCanonicalKRKS(
+        mf, mu=0.0, sigma=1.0e-2, config=config)
+    candidate = [fock.copy()]
+    occupations = fermi_occupations(
+        solver.beta * (levels - solver.mu))
+    response_max = float(cp.max(
+        occupations * (1.0 - occupations)).item())
+    assert response_max > 1.0e-14
+    target_nelec = 1.5
+
+    projected, parameter, fallback = (
+        solver._project_trial_electron_number(candidate, target_nelec))
+
+    assert fallback
+    assert abs(solver._cheap_fixed_mu_electron_number(projected) -
+               target_nelec) <= 1.0e-10
+    correction = projected[0] - candidate[0]
+    assert float(cp.max(cp.abs(
+        correction - parameter * cp.eye(3))).item()) < 1.0e-12
+
+
+@pytest.mark.parametrize('mode', ['scalar-shift', 'fermi-response'])
+def test_projection_preserves_multik_time_reversal(mode):
+    block = cp.asarray([
+        [-0.3, 0.05 + 0.09j],
+        [0.05 - 0.09j, 0.2],
+    ], dtype=cp.complex128)
+    mf = _FixedFockKRKS([block, block.conj()])
+    mf.kpts = np.asarray([[0.25, 0.0, 0.0], [-0.25, 0.0, 0.0]])
+    config = GrandCanonicalConfig(
+        check_time_reversal=True, enforce_time_reversal=True,
+        line_search_nelec_guard_mode=mode)
+    solver = GrandCanonicalKRKS(
+        mf, mu=-0.1, sigma=0.15, config=config)
+    candidate = [block.copy(), block.conj()]
+    target_nelec = (
+        solver._cheap_fixed_mu_electron_number(candidate) - 2.0e-2)
+
+    projected, _, _ = solver._project_trial_electron_number(
+        candidate, target_nelec)
+
+    assert solver._time_reversal_enabled
+    assert abs(solver._cheap_fixed_mu_electron_number(projected) -
+               target_nelec) <= 1.0e-10
+    assert float(cp.max(cp.abs(
+        projected[0] - projected[1].conj())).item()) < 1.0e-12
+    assert all(float(cp.max(cp.abs(
+        value - value.conj().T)).item()) < 1.0e-12
+               for value in projected)
+
+
 def test_electron_number_prescreen_rejects_without_fock_build():
     mf, solver = _solver(
         line_search_nelec_guard_residual_rms=None,
@@ -210,6 +387,138 @@ def test_electron_number_prescreen_is_bypassed_at_fixed_n():
     assert solver.nfev == nfev_before + 1
     assert mf.veff_calls == veff_before + 1
     assert solver.ncheap_nelec_reject == 0
+
+
+@pytest.mark.parametrize('mode', ['scalar-shift', 'fermi-response'])
+def test_electron_number_projection_is_bypassed_at_fixed_n(mode):
+    mf, solver = _solver(
+        electron_number=1.25,
+        line_search_nelec_guard_mode=mode,
+        line_search_nelec_guard_residual_rms=None,
+        line_search_nelec_trust_initial=1.0e-3)
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    nfev_before = solver.nfev
+    trial = solver._trial(
+        state, [cp.eye(2, dtype=cp.complex128)], 1.0)
+
+    assert trial is not None
+    assert solver.nfev == nfev_before + 1
+    assert mf.veff_calls == nfev_before + 1
+    assert not solver._last_trial_info.projected
+    assert solver.nnelec_projection_attempts == 0
+    assert solver.nnelec_projection_fallbacks == 0
+
+
+def test_scalar_projection_trial_caps_delta_nelec_and_tracks_attempt():
+    _, solver = _solver(
+        line_search_nelec_guard_mode='scalar-shift',
+        line_search_nelec_guard_residual_rms=None,
+        line_search_nelec_trust_initial=1.0e-2)
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    identity = [cp.eye(2, dtype=cp.complex128)]
+    identity_slope = solver.inner(state.gradient, identity)
+    direction = solver.scale_blocks(
+        -np.copysign(1.0, identity_slope), identity)
+
+    trial = solver._trial(state, direction, 0.2)
+    info = solver._last_trial_info
+
+    assert trial is not None
+    assert info.projected
+    assert info.mode == 'scalar-shift'
+    assert abs(info.raw_delta_nelec) > 1.0e-2
+    assert abs(abs(info.projected_delta_nelec) - 1.0e-2) <= 1.0e-10
+    assert abs(trial.electron_number - state.electron_number -
+               info.projected_delta_nelec) < 1.0e-12
+    assert info.actual_slope < 0.0
+    assert solver.nnelec_projection_attempts == 1
+    assert solver.ncheap_nelec_reject == 0
+    assert solver.max_raw_delta_nelec == pytest.approx(
+        abs(info.raw_delta_nelec))
+    assert solver.max_nelec_projection_correction > 0.0
+
+
+def test_adaptive_electron_number_trust_radius_shrinks_and_expands():
+    _, solver = _solver(
+        line_search_nelec_guard_mode='scalar-shift',
+        line_search_max_delta_nelec=0.6,
+        line_search_nelec_trust_initial=0.25,
+        line_search_nelec_trust_min=0.01)
+    old = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    info = _TrialInfo(
+        actual_slope=-1.0, projected=True, trust_radius=0.05)
+    poor = replace(old, objective=old.objective - 0.1)
+    ratio = solver._accept_projected_trial(old, poor, info)
+    assert ratio == pytest.approx(0.1)
+    # Shrink from the effective boundary used by the trial, not from the
+    # larger latent adaptive radius.
+    assert solver._nelec_trust_radius == pytest.approx(0.025)
+
+    solver._nelec_trust_radius = 0.4
+    good = replace(old, objective=old.objective - 0.9)
+    good_info = replace(info, trust_radius=0.3)
+    ratio = solver._accept_projected_trial(old, good, good_info)
+    assert ratio == pytest.approx(0.9)
+    # Expansion is clamped by the global hard electron-number cap.
+    assert solver._nelec_trust_radius == pytest.approx(0.6)
+
+    solver._nelec_trust_radius = 0.012
+    min_info = replace(info, trust_radius=0.012)
+    solver._accept_projected_trial(old, poor, min_info)
+    assert solver._nelec_trust_radius == pytest.approx(0.01)
+
+
+def test_fixed_trust_radius_factors_leave_radius_unchanged():
+    _, solver = _solver(
+        line_search_nelec_guard_mode='fermi-response',
+        line_search_nelec_trust_initial=0.25,
+        line_search_nelec_trust_shrink=1.0,
+        line_search_nelec_trust_expand=1.0)
+    old = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    info = _TrialInfo(
+        actual_slope=-1.0, projected=True, trust_radius=0.05)
+
+    poor = replace(old, objective=old.objective - 0.1)
+    solver._accept_projected_trial(old, poor, info)
+    assert solver._nelec_trust_radius == pytest.approx(0.25)
+
+    good = replace(old, objective=old.objective - 0.9)
+    solver._accept_projected_trial(old, good, info)
+    assert solver._nelec_trust_radius == pytest.approx(0.25)
+
+
+def test_diis_trial_explicitly_disables_occupation_projection(monkeypatch):
+    _, solver = _solver(
+        line_search_nelec_guard_mode='fermi-response',
+        line_search_nelec_trust_initial=1.0e-3)
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    target = solver.axpy(0.2, state.residual, state.h_orth)
+    projection_flags = []
+
+    def failed_trial(unused_state, unused_direction, unused_damping,
+                     allow_nelec_projection=True):
+        projection_flags.append(allow_nelec_projection)
+        return None
+
+    monkeypatch.setattr(solver, '_trial', failed_trial)
+    trial, damping, reason, rejected = solver._try_diis_target(
+        state, target, max_backtracks=0)
+
+    assert trial is None
+    assert damping == 0.0
+    assert rejected is None
+    assert reason == 'DIIS trial evaluation failed'
+    assert projection_flags == [False]
 
 
 def test_electron_number_prescreen_configuration_validation():
@@ -250,6 +559,181 @@ def test_zoom_accepts_armijo_point_at_electron_number_trust_boundary():
     assert result.trust_boundary
     assert result.force_restart
     assert 'trust boundary' in result.message
+
+
+def test_projected_line_search_uses_actual_step_and_forces_restart(
+        monkeypatch):
+    _, solver = _solver(
+        optimizer='lbfgs', line_search_nelec_guard_mode='scalar-shift')
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    direction = solver.copy_blocks(state.residual)
+    dphi0 = solver.inner(state.gradient, direction)
+    assert dphi0 < 0.0
+    evaluated = {}
+
+    def projected_trial(unused_state, unused_direction, alpha):
+        actual_step = solver.scale_blocks(0.1 * alpha, direction)
+        actual_slope = solver.inner(state.gradient, actual_step)
+        original_slope = alpha * dphi0
+        # This objective passes Armijo for the projected displacement but
+        # deliberately fails Armijo for the raw alpha * direction step.
+        objective = (state.objective + solver.config.line_search_c1 *
+                     0.5 * (actual_slope + original_slope))
+        trial_h = solver._sanitize_h(
+            solver.axpy(1.0, actual_step, state.h_orth))
+        trial = replace(
+            state, h_orth=trial_h, objective=objective,
+            grand_potential=objective)
+        solver.nnelec_projection_attempts += 1
+        solver._last_trial_info = _TrialInfo(
+            actual_step=solver.copy_blocks(actual_step), projected=True,
+            mode='scalar-shift', raw_delta_nelec=0.7,
+            projected_delta_nelec=0.25, parameter=0.12,
+            trust_radius=0.25, actual_slope=actual_slope,
+            correction_rms=0.34)
+        evaluated.update(
+            alpha=alpha, actual_slope=actual_slope,
+            original_slope=original_slope, trial=trial)
+        return trial
+
+    monkeypatch.setattr(solver, '_trial', projected_trial)
+    result = solver._line_search(state, direction)
+
+    assert result.success
+    assert result.nelec_projection_applied
+    assert not result.strong_wolfe
+    assert result.force_restart
+    assert result.actual_step is not None
+    assert result.nelec_projection_correction_rms == pytest.approx(0.34)
+    assert (evaluated['trial'].objective <= state.objective +
+            solver.config.line_search_c1 * evaluated['actual_slope'])
+    assert (evaluated['trial'].objective > state.objective +
+            solver.config.line_search_c1 * evaluated['original_slope'])
+    solver._verify_accepted_step(
+        state, result.state, direction, result, dphi0)
+    assert solver.nnelec_projection_attempts == 1
+    assert solver.nnelec_projection_acceptances == 1
+    assert np.isfinite(result.nelec_trust_ratio)
+
+    history = [object()]
+    pair_info = solver._update_lbfgs_history(
+        history, state, result.state, result)
+    assert history == []
+    assert not pair_info['pair_added']
+    assert 'occupation projection' in pair_info['action']
+
+    solver._record(
+        0, state, result.state, result, dphi0, 0.0,
+        'occupation projection')
+    record = solver.history[-1]
+    assert record.nelec_projection_applied
+    assert record.nelec_projection_mode == 'scalar-shift'
+    assert record.raw_delta_nelec == pytest.approx(0.7)
+    assert record.projected_delta_nelec == pytest.approx(0.25)
+    assert record.nelec_projection_parameter == pytest.approx(0.12)
+    assert record.nelec_trust_radius == pytest.approx(0.25)
+    assert record.nelec_trust_ratio == pytest.approx(
+        result.nelec_trust_ratio)
+    assert record.nelec_projection_correction_rms == pytest.approx(0.34)
+
+
+def test_nlcg_projected_acceptance_restarts_with_zero_beta(monkeypatch):
+    _, solver = _solver(line_search_nelec_guard_mode='scalar-shift')
+    solver.config.max_cycle = 2
+    h0 = [cp.asarray([[-0.3, 0.08 + 0.03j],
+                      [0.08 - 0.03j, 0.2]])]
+    calls = []
+
+    def accepted_step(state, direction):
+        cycle = len(calls)
+        if cycle == 0:
+            alpha = 0.05
+            step = solver.scale_blocks(alpha, direction)
+            projected = False
+        else:
+            alpha = 1.0
+            step = solver.scale_blocks(0.03, direction)
+            projected = True
+        slope = solver.inner(state.gradient, step)
+        assert slope < 0.0
+        new_h = solver._sanitize_h(
+            solver.axpy(1.0, step, state.h_orth))
+        objective = state.objective + 0.5 * slope
+        new_state = replace(
+            state, h_orth=new_h, objective=objective,
+            grand_potential=objective)
+        calls.append(cycle)
+        if not projected:
+            return _LineSearchResult(
+                True, new_state, alpha, 1, True, False, 'strong Wolfe')
+        return _LineSearchResult(
+            True, new_state, alpha, 1, False, True,
+            'accepted occupation-projected Armijo point', True,
+            actual_step=solver.copy_blocks(step),
+            nelec_projection_applied=True,
+            nelec_projection_mode='scalar-shift',
+            raw_delta_nelec=0.5, projected_delta_nelec=0.25,
+            nelec_projection_parameter=0.1,
+            nelec_trust_radius=0.25, nelec_trust_ratio=0.8,
+            nelec_projection_correction_rms=0.2)
+
+    monkeypatch.setattr(solver, '_line_search', accepted_step)
+    monkeypatch.setattr(
+        solver, '_ensure_descent',
+        lambda unused_state, direction: (
+            solver.copy_blocks(direction), False, ''))
+    result = solver._kernel_nlcg(h0=h0)
+
+    assert calls == [0, 1]
+    assert len(result.history) == 2
+    assert not result.history[0].nelec_projection_applied
+    projected_record = result.history[1]
+    assert projected_record.nelec_projection_applied
+    assert projected_record.cg_beta == 0.0
+    assert 'occupation-projected' in projected_record.restart_reason
+
+
+def test_projection_diagnostics_are_exported_in_result_and_mean_field():
+    mf, solver = _solver(line_search_nelec_guard_mode='fermi-response')
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    solver.nnelec_projection_attempts = 4
+    solver.nnelec_projection_acceptances = 3
+    solver.nnelec_projection_fallbacks = 2
+    solver.max_raw_delta_nelec = 1.7
+    solver.max_projected_delta_nelec = 0.73
+    solver.max_nelec_projection_correction = 0.42
+    solver._nelec_trust_radius = 0.03125
+    solver.last_nelec_trust_ratio = 0.81
+
+    result = solver._finalize(
+        state, converged=False, message='diagnostic snapshot',
+        niter=0, density_change=0.0)
+
+    assert result.nelec_projection_attempts == 4
+    assert result.nelec_projection_acceptances == 3
+    assert result.nelec_projection_fallbacks == 2
+    assert result.max_raw_delta_nelec == pytest.approx(1.7)
+    assert result.max_projected_delta_nelec == pytest.approx(0.73)
+    assert result.max_nelec_projection_correction == pytest.approx(0.42)
+    assert result.final_nelec_trust_radius == pytest.approx(0.03125)
+    assert result.last_nelec_trust_ratio == pytest.approx(0.81)
+    assert mf.nelec_projection_attempts_gc == 4
+    assert mf.nelec_projection_acceptances_gc == 3
+    assert mf.max_projected_delta_nelec_gc == pytest.approx(0.73)
+    assert mf.scf_summary['nelec_projection_fallbacks_gc'] == 2
+    assert mf.scf_summary['max_raw_delta_nelec_gc'] == pytest.approx(1.7)
+    assert (mf.scf_summary['max_projected_delta_nelec_gc'] ==
+            pytest.approx(0.73))
+    assert (mf.scf_summary['max_nelec_projection_correction_gc'] ==
+            pytest.approx(0.42))
+    assert (mf.scf_summary['final_nelec_trust_radius_gc'] ==
+            pytest.approx(0.03125))
+    assert (mf.scf_summary['last_nelec_trust_ratio_gc'] ==
+            pytest.approx(0.81))
 
 
 def test_fixed_electron_number_gradient_and_mu_constraint():
