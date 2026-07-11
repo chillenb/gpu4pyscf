@@ -1810,7 +1810,9 @@ class GrandCanonicalKRKS:
                 return info
         if not projected_pair:
             non_wolfe = (
-                fallback_used or not line_search.curvature_qualified)
+                fallback_used or not (
+                    line_search.strong_wolfe or
+                    line_search.curvature_qualified))
             if ((line_search.force_restart or non_wolfe) and
                     not line_search.trust_boundary):
                 if (line_search.force_restart or
