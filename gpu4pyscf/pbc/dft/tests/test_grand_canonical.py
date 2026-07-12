@@ -141,7 +141,6 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             canonical_continuation_precondition_min_iterations=3,
             canonical_continuation_precondition_confirmations=1,
             canonical_continuation_precondition_max_fock_evaluations=24,
-            canonical_continuation_final_polish=False,
             canonical_continuation_verification_residual_tol=1.0e-6,
             canonical_continuation_verification_density_tol=1.0e-9,
             line_search_method='strong-wolfe',
@@ -203,8 +202,6 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             canonical_continuation_precondition_confirmations),
         canonical_continuation_precondition_max_fock_evaluations=(
             canonical_continuation_precondition_max_fock_evaluations),
-        canonical_continuation_final_polish=(
-            canonical_continuation_final_polish),
         canonical_continuation_verification_residual_tol=(
             canonical_continuation_verification_residual_tol),
         canonical_continuation_verification_density_tol=(
@@ -2106,7 +2103,6 @@ def test_automatic_canonical_continuation_finds_fixed_mu_electron_number():
     assert result.canonical_continuation_steps >= 1
     assert result.canonical_continuation_evaluations >= 1
     assert np.isfinite(result.canonical_continuation_mu_error)
-    assert result.canonical_continuation_mu_error_source == 'evaluated'
     assert abs(result.canonical_continuation_mu_error) <= (
         solver.config.canonical_continuation_handoff_delta_mu)
     assert abs(result.canonical_continuation_delta_nelec) <= (
@@ -2375,13 +2371,10 @@ def test_canonical_continuation_default_handoff_charge_is_conservative():
     _, solver = _solver(canonical_continuation=True)
     assert (solver.config.canonical_continuation_handoff_delta_nelec ==
             pytest.approx(2.0e-5))
-    assert (solver.config.canonical_continuation_interpolation_refine_width ==
-            pytest.approx(0.05))
 
 
 def test_canonical_only_terminal_defaults_are_tight():
     _, solver = _solver(canonical_continuation=True)
-    assert not solver.config.canonical_continuation_final_polish
     assert solver.config.canonical_continuation_handoff_delta_mu == pytest.approx(
         1.0e-6)
     assert (solver.config.canonical_continuation_handoff_delta_nelec ==
@@ -2491,14 +2484,14 @@ def test_canonical_continuation_uses_one_gauge_exact_verification_fock(
 
     monkeypatch.setattr(solver, 'evaluate', observed_evaluate)
 
-    def unexpected_fixed_mu_optimizer(*args, **kwargs):
+    def unexpected_iterative_fixed_mu(*args, **kwargs):
         raise AssertionError(
-            'canonical continuation entered an iterative fixed-mu polish')
+            'canonical continuation entered an iterative fixed-mu solve')
 
     # These are instance attributes, so fixed-N child solvers retain their
-    # ordinary class methods while either possible fixed-mu polish is blocked.
-    monkeypatch.setattr(solver, '_kernel_nlcg', unexpected_fixed_mu_optimizer)
-    monkeypatch.setattr(solver, '_kernel_diis', unexpected_fixed_mu_optimizer)
+    # ordinary class methods while an iterative fixed-mu solve is blocked.
+    monkeypatch.setattr(solver, '_kernel_nlcg', unexpected_iterative_fixed_mu)
+    monkeypatch.setattr(solver, '_kernel_diis', unexpected_iterative_fixed_mu)
 
     result = solver.kernel(h0=[
         cp.asarray([[0.25, 0.18 - 0.07j],
@@ -2507,7 +2500,6 @@ def test_canonical_continuation_uses_one_gauge_exact_verification_fock(
     assert result.converged, result.message
     assert not result.fixed_electron_number
     assert result.mu == pytest.approx(target_mu, abs=1.0e-14)
-    assert result.canonical_continuation_mu_error_source == 'evaluated'
     assert result.canonical_verification_attempts == 1
     assert result.canonical_verification_evaluations == 1
     assert result.canonical_verification_failures == 0
@@ -2598,11 +2590,11 @@ def test_failed_canonical_verification_resumes_fixed_n_continuation(
 
     monkeypatch.setattr(solver, 'evaluate', fail_first_verification)
 
-    def unexpected_fixed_mu_optimizer(*args, **kwargs):
+    def unexpected_iterative_fixed_mu(*args, **kwargs):
         raise AssertionError(
-            'failed verification entered an iterative fixed-mu polish')
+            'failed verification entered an iterative fixed-mu solve')
 
-    monkeypatch.setattr(solver, '_kernel_nlcg', unexpected_fixed_mu_optimizer)
+    monkeypatch.setattr(solver, '_kernel_nlcg', unexpected_iterative_fixed_mu)
 
     # Starting at the physical Fock makes the first fixed-N root exact.  The
     # injected verification failure must therefore trigger another fixed-N
@@ -2616,38 +2608,10 @@ def test_failed_canonical_verification_resumes_fixed_n_continuation(
     assert result.canonical_verification_failures == 1
     assert result.canonical_terminal_mode == 'canonical-verification'
     assert result.canonical_continuation_steps >= 2
-    assert result.canonical_continuation_mu_error_source == 'evaluated'
     assert result.nfev == mf.veff_calls
     assert result.nfev == (
         result.canonical_continuation_evaluations +
         result.canonical_verification_evaluations)
-
-
-def test_legacy_canonical_fixed_mu_polish_remains_opt_in(monkeypatch):
-    mf, solver = _solver(
-        mu=-0.1, canonical_continuation=True,
-        canonical_continuation_final_polish=True)
-    original_nlcg = solver._kernel_nlcg
-    polish_calls = 0
-
-    def observed_nlcg(*args, **kwargs):
-        nonlocal polish_calls
-        polish_calls += 1
-        return original_nlcg(*args, **kwargs)
-
-    monkeypatch.setattr(solver, '_kernel_nlcg', observed_nlcg)
-    result = solver.kernel(h0=[
-        cp.asarray([[0.25, 0.18 - 0.07j],
-                    [0.18 + 0.07j, -0.15]])])
-
-    assert result.converged, result.message
-    assert polish_calls == 1
-    assert result.canonical_terminal_mode == 'fixed-mu-polish'
-    assert result.canonical_verification_attempts == 0
-    assert result.canonical_verification_evaluations == 0
-    assert result.canonical_verification_failures == 0
-    assert mf.canonical_terminal_mode_gc == 'fixed-mu-polish'
-    assert mf.scf_summary['canonical_terminal_mode'] == 'fixed-mu-polish'
 
 
 def test_fock_evaluation_count_includes_fresh_initial_guess_build():
