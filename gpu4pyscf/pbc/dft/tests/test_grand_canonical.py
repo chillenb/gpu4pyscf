@@ -92,6 +92,8 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             electron_number=None, optimizer='nlcg',
             lbfgs_initial_metric='fermi', lbfgs_history_size=5,
             lbfgs_line_search_c2=0.9, diis_switch_residual_rms=None,
+            lbfgs_switch_residual_rms=None,
+            lbfgs_switch_line_search_method='strong-wolfe',
             lbfgs_use_projected_pairs=False,
             diis_max_objective_increase=1.0e-5,
             diis_max_delta_nelec=5.0e-2,
@@ -141,6 +143,8 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
         lbfgs_initial_metric=lbfgs_initial_metric,
         lbfgs_history_size=lbfgs_history_size,
         lbfgs_line_search_c2=lbfgs_line_search_c2,
+        lbfgs_switch_residual_rms=lbfgs_switch_residual_rms,
+        lbfgs_switch_line_search_method=lbfgs_switch_line_search_method,
         lbfgs_use_projected_pairs=lbfgs_use_projected_pairs,
         diis_switch_residual_rms=diis_switch_residual_rms,
         diis_max_objective_increase=diis_max_objective_increase,
@@ -1824,6 +1828,269 @@ def test_lbfgs_configuration_aliases_validation_and_fixed_n_metric():
         GrandCanonicalKRKS(
             _FixedFockKRKS([cp.eye(2)]), mu=-0.1, sigma=0.15,
             config=config)
+
+
+def test_nlcg_lbfgs_switch_configuration_and_validation():
+    defaults = GrandCanonicalConfig()
+    assert defaults.lbfgs_switch_residual_rms is None
+    assert defaults.lbfgs_switch_line_search_method == 'strong-wolfe'
+
+    _, solver = _solver(
+        lbfgs_switch_residual_rms=1.0e-3,
+        lbfgs_switch_line_search_method='wolfe')
+    assert solver.config.lbfgs_switch_residual_rms == pytest.approx(1.0e-3)
+    assert solver.config.lbfgs_switch_line_search_method == 'strong-wolfe'
+
+    _, canonical = _solver(
+        electron_number=1.2, lbfgs_switch_residual_rms=1.0e-3)
+    assert canonical.config.lbfgs_initial_metric == 'scalar'
+
+    with pytest.raises(ValueError, match='may not be smaller'):
+        _solver(lbfgs_switch_residual_rms=1.0e-8)
+    with pytest.raises(ValueError, match='requires optimizer'):
+        _solver(optimizer='lbfgs', lbfgs_switch_residual_rms=1.0e-3)
+    with pytest.raises(ValueError, match='must be smaller'):
+        _solver(
+            lbfgs_switch_residual_rms=1.0e-3,
+            diis_switch_residual_rms=1.0e-3)
+    with pytest.raises(ValueError, match='strong-Wolfe'):
+        _solver(
+            lbfgs_switch_residual_rms=1.0e-3,
+            lbfgs_switch_line_search_method='hager-zhang',
+            line_search_nelec_guard_mode='scalar-shift')
+
+
+def test_nlcg_lbfgs_switch_is_disabled_by_default():
+    mf, solver = _solver()
+    solver.config.max_cycle = 1
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j],
+                      [0.19 + 0.11j, 0.6]])]
+    result = solver.kernel(h0=h0)
+
+    assert result.history
+    assert all(record.optimizer == 'nlcg' for record in result.history)
+    assert result.lbfgs_switches == 0
+    assert result.lbfgs_switch_cycle == -1
+    assert result.lbfgs_switch_nfev == -1
+    assert mf.veff_calls == result.nfev
+    assert solver._lbfgs_history == []
+
+
+def test_fixed_n_nlcg_lbfgs_handoff_executes_with_scalar_metric():
+    _, solver = _solver(
+        electron_number=1.2,
+        lbfgs_initial_metric='fermi',
+        lbfgs_switch_residual_rms=10.0)
+    solver.config.max_cycle = 1
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j],
+                      [0.19 + 0.11j, 0.6]])]
+
+    result = solver.kernel(h0=h0)
+
+    assert result.fixed_electron_number
+    assert result.target_electron_number == pytest.approx(1.2)
+    assert result.electron_number == pytest.approx(1.2)
+    assert solver.config.lbfgs_initial_metric == 'scalar'
+    assert result.lbfgs_switches == 1
+    assert result.history
+    assert result.history[0].optimizer == 'lbfgs'
+
+
+def test_nlcg_lbfgs_handoff_reuses_state_and_resets_memory_each_run(
+        monkeypatch):
+    mf, solver = _solver(
+        line_search_method='hager-zhang',
+        lbfgs_switch_residual_rms=1.0,
+        lbfgs_switch_line_search_method='strong-wolfe')
+    solver.config.max_cycle = 3
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j],
+                      [0.19 + 0.11j, 0.6]])]
+    line_search_calls = []
+    lbfgs_history_sizes = []
+    original_lbfgs_direction = solver._lbfgs_direction
+
+    # Make exactly one NLCG step before handing off.  A deterministic short
+    # Armijo step keeps this test about orchestration rather than line-search
+    # particulars, while evaluate() still performs and counts a real complex
+    # fixed-Fock build on every accepted cycle.
+    monkeypatch.setattr(
+        solver, '_should_start_lbfgs',
+        lambda unused_state: len(solver.history) >= 1)
+    monkeypatch.setattr(
+        solver, '_meets_convergence',
+        lambda unused_state, unused_previous: False)
+
+    def short_armijo(state, direction, **kwargs):
+        alpha = 0.05
+        method = (kwargs.get('method_override') or
+                  solver.config.line_search_method)
+        line_search_calls.append((method, solver.nfev))
+        h = solver._sanitize_h(
+            solver.axpy(alpha, direction, state.h_orth))
+        trial = solver.evaluate(h)
+        slope = solver.inner(state.gradient, direction)
+        objective = state.objective + 0.5 * alpha * slope
+        trial = replace(
+            trial, objective=objective, grand_potential=objective)
+        return _LineSearchResult(
+            True, trial, alpha, 1, False, True, 'test Armijo step',
+            line_search_method=method)
+
+    def observed_lbfgs_direction(state, history):
+        lbfgs_history_sizes.append(len(history))
+        return original_lbfgs_direction(state, history)
+
+    monkeypatch.setattr(solver, '_line_search', short_armijo)
+    monkeypatch.setattr(
+        solver, '_lbfgs_direction', observed_lbfgs_direction)
+
+    first = solver.kernel(h0=h0)
+    assert [record.cycle for record in first.history] == [0, 1, 2]
+    assert [record.optimizer for record in first.history] == [
+        'nlcg', 'lbfgs', 'lbfgs']
+    assert [record.fock_evaluations for record in first.history] == [2, 3, 4]
+    assert line_search_calls == [
+        ('hager-zhang', 1), ('strong-wolfe', 2),
+        ('strong-wolfe', 3)]
+    assert lbfgs_history_sizes == [0, 0]
+    assert first.niter == 3
+    assert first.nfev == 4
+    assert first.lbfgs_switches == 1
+    assert first.lbfgs_switch_cycle == 1
+    assert first.lbfgs_switch_nfev == 2
+    assert first.lbfgs_switch_actual_residual_rms == pytest.approx(
+        first.history[0].residual_rms)
+    assert mf.veff_calls == first.nfev
+
+    # A second call must be a genuinely fresh run: cycles and Fock counts
+    # restart, and the first switched L-BFGS direction again sees no pairs.
+    calls_before_second = mf.veff_calls
+    line_search_calls.clear()
+    lbfgs_history_sizes.clear()
+    second = solver.kernel(h0=h0)
+    assert [record.cycle for record in second.history] == [0, 1, 2]
+    assert [record.fock_evaluations for record in second.history] == [2, 3, 4]
+    assert line_search_calls == [
+        ('hager-zhang', 1), ('strong-wolfe', 2),
+        ('strong-wolfe', 3)]
+    assert lbfgs_history_sizes == [0, 0]
+    assert second.niter == 3
+    assert second.nfev == 4
+    assert second.lbfgs_switches == 1
+    assert second.lbfgs_switch_cycle == 1
+    assert second.lbfgs_switch_nfev == 2
+    assert mf.veff_calls - calls_before_second == second.nfev
+
+
+def test_hager_zhang_handoff_uses_projected_strong_wolfe_lbfgs(
+        monkeypatch):
+    _, solver = _solver(
+        line_search_method='hager-zhang',
+        line_search_nelec_guard_mode='scalar-shift',
+        nlcg_nelec_projection_strategy='direction',
+        nlcg_residual_filter_rms=10.0,
+        lbfgs_switch_residual_rms=10.0,
+        lbfgs_switch_line_search_method='strong-wolfe')
+    solver.config.max_cycle = 1
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j],
+                      [0.19 + 0.11j, 0.6]])]
+    calls = []
+
+    def projected_lbfgs_step(state, direction, **kwargs):
+        calls.append((
+            kwargs.get('method_override'),
+            kwargs.get('allow_nelec_projection', True),
+            kwargs.get('residual_filter_enabled', True), solver.nfev))
+        step = solver.scale_blocks(0.02, direction)
+        h = solver._sanitize_h(solver.axpy(1.0, step, state.h_orth))
+        trial = solver.evaluate(h)
+        slope = solver.inner(state.gradient, step)
+        objective = state.objective + 0.5 * slope
+        trial = replace(
+            trial, objective=objective, grand_potential=objective)
+        return _LineSearchResult(
+            True, trial, 1.0, 1, False, True,
+            'test occupation-projected Armijo step',
+            actual_step=solver.copy_blocks(step),
+            nelec_projection_applied=True,
+            nelec_projection_mode='scalar-shift',
+            raw_delta_nelec=0.4, projected_delta_nelec=0.1,
+            nelec_projection_parameter=0.2,
+            nelec_trust_radius=0.1,
+            nelec_projection_correction_rms=0.3,
+            line_search_method='strong-wolfe')
+
+    monkeypatch.setattr(solver, '_line_search', projected_lbfgs_step)
+    result = solver.kernel(h0=h0)
+
+    assert calls == [('strong-wolfe', True, False, 1)]
+    assert result.lbfgs_switches == 1
+    assert result.lbfgs_switch_cycle == 0
+    assert result.lbfgs_switch_nfev == 1
+    assert result.nfev == 2
+    assert len(result.history) == 1
+    record = result.history[0]
+    assert record.optimizer == 'lbfgs'
+    assert record.search_direction_source == 'residual'
+    assert record.line_search_method == 'strong-wolfe'
+    assert record.nelec_projection_applied
+    assert record.nelec_projection_mode == 'scalar-shift'
+    assert not record.residual_filter_active
+    assert not record.residual_filter_qualified
+    assert record.residual_filter_rejections == 0
+    assert not record.lbfgs_pair_added
+    assert record.lbfgs_history_size == 0
+    assert 'occupation projection' in record.lbfgs_history_action
+
+
+def test_line_search_dispatch_can_disable_hz_residual_filter(monkeypatch):
+    _, solver = _solver(
+        line_search_method='hager-zhang',
+        line_search_nelec_guard_mode='reject',
+        nlcg_nelec_projection_strategy='direction',
+        nlcg_residual_filter_rms=10.0,
+        lbfgs_switch_residual_rms=10.0,
+        lbfgs_switch_line_search_method='hager-zhang')
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j],
+                      [0.19 + 0.11j, 0.6]])]
+    state = solver.evaluate(solver._initial_h(None, h0))
+
+    def unexpected_filter(*unused_args, **unused_kwargs):
+        pytest.fail('NLCG residual filter leaked into the L-BFGS phase')
+
+    monkeypatch.setattr(
+        solver, '_residual_filter_metrics', unexpected_filter)
+    result = solver._line_search(
+        state, state.residual, method_override='hager-zhang',
+        residual_filter_enabled=False)
+
+    assert not result.residual_filter_active
+    assert result.residual_filter_rejections == 0
+
+
+def test_diis_has_precedence_when_both_handoffs_are_ready(monkeypatch):
+    _, solver = _solver(
+        lbfgs_switch_residual_rms=1.0,
+        diis_switch_residual_rms=1.0e-3,
+        diis_max_delta_nelec=2.0)
+    h0 = [cp.asarray([[-0.1, 0.19 - 0.11j],
+                      [0.19 + 0.11j, 0.6]])]
+    lbfgs_checks = []
+    monkeypatch.setattr(
+        solver, '_should_start_diis', lambda unused_state: True)
+
+    def should_start_lbfgs(unused_state):
+        lbfgs_checks.append(True)
+        return True
+
+    monkeypatch.setattr(solver, '_should_start_lbfgs', should_start_lbfgs)
+    result = solver.kernel(h0=h0)
+
+    assert result.converged, result.message
+    assert result.history
+    assert all(record.optimizer == 'diis' for record in result.history)
+    assert lbfgs_checks == []
+    assert result.lbfgs_switches == 0
 
 
 def test_residual_diis_configuration_and_pulay_coefficients():
