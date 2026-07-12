@@ -135,12 +135,6 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             line_search_nelec_trust_shrink=5.0e-1,
             line_search_nelec_trust_expand=2.0,
             canonical_continuation=False,
-            canonical_continuation_precondition_residual_rms=None,
-            canonical_continuation_precondition_max_delta_nelec=5.0e-2,
-            canonical_continuation_precondition_min_fock_evaluations=8,
-            canonical_continuation_precondition_min_iterations=3,
-            canonical_continuation_precondition_confirmations=1,
-            canonical_continuation_precondition_max_fock_evaluations=24,
             canonical_continuation_verification_residual_tol=1.0e-6,
             canonical_continuation_verification_density_tol=1.0e-9,
             line_search_method='strong-wolfe',
@@ -190,18 +184,6 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
         line_search_nelec_trust_shrink=line_search_nelec_trust_shrink,
         line_search_nelec_trust_expand=line_search_nelec_trust_expand,
         canonical_continuation=canonical_continuation,
-        canonical_continuation_precondition_residual_rms=(
-            canonical_continuation_precondition_residual_rms),
-        canonical_continuation_precondition_max_delta_nelec=(
-            canonical_continuation_precondition_max_delta_nelec),
-        canonical_continuation_precondition_min_fock_evaluations=(
-            canonical_continuation_precondition_min_fock_evaluations),
-        canonical_continuation_precondition_min_iterations=(
-            canonical_continuation_precondition_min_iterations),
-        canonical_continuation_precondition_confirmations=(
-            canonical_continuation_precondition_confirmations),
-        canonical_continuation_precondition_max_fock_evaluations=(
-            canonical_continuation_precondition_max_fock_evaluations),
         canonical_continuation_verification_residual_tol=(
             canonical_continuation_verification_residual_tol),
         canonical_continuation_verification_density_tol=(
@@ -1969,40 +1951,6 @@ def test_automatic_canonical_continuation_finds_fixed_mu_electron_number():
     assert solver.config.diis_max_coefficient_l1 == pytest.approx(10.0)
 
 
-def test_canonical_precondition_metrics_remove_scalar_gauge_without_fock():
-    mf, solver = _solver(mu=-0.1, canonical_continuation=True)
-    state = solver.evaluate([
-        cp.asarray([[-0.31, 0.08 + 0.03j],
-                    [0.08 - 0.03j, 0.19]])])
-    nfev_before = solver.nfev
-    veff_calls_before = mf.veff_calls
-
-    (canonical_rms, delta_nelec, gauge_shift,
-     mu_proxy) = solver._canonical_precondition_metrics(state)
-    scalar_shift = 0.37
-    shifted_state = replace(
-        state,
-        h_orth=[h + scalar_shift * identity
-                for h, identity in zip(state.h_orth, solver.identity)])
-    (shifted_rms, shifted_delta_nelec, shifted_gauge,
-     shifted_mu_proxy) = solver._canonical_precondition_metrics(shifted_state)
-
-    # A scalar offset in H-F changes only the unphysical fixed-N gauge.  The
-    # shape residual and the frozen-Fock estimate of N remain unchanged.
-    assert shifted_rms == pytest.approx(canonical_rms, abs=1.0e-13)
-    assert shifted_delta_nelec == pytest.approx(delta_nelec, abs=1.0e-13)
-    assert shifted_gauge == pytest.approx(
-        gauge_shift + scalar_shift, abs=1.0e-13)
-    assert shifted_mu_proxy == pytest.approx(
-        mu_proxy - scalar_shift, abs=1.0e-13)
-    expected_delta_nelec = (
-        solver._electron_number_at_mu(state.fock_orth, solver.mu) -
-        state.electron_number)
-    assert delta_nelec == pytest.approx(expected_delta_nelec, abs=1.0e-13)
-    assert solver.nfev == nfev_before
-    assert mf.veff_calls == veff_calls_before
-
-
 def test_fixed_n_view_matches_evaluation_without_extra_fock():
     mf, fixed_mu_solver = _solver(mu=-0.1)
     source = fixed_mu_solver.evaluate([
@@ -2048,85 +1996,33 @@ def test_fixed_n_view_matches_evaluation_without_extra_fock():
         view.gradient, fixed_n_solver.identity)) < 1.0e-12
 
 
-def test_canonical_precondition_is_disabled_by_default_and_keeps_direct_route():
-    _, solver = _solver(canonical_continuation=True)
-    assert solver.config.canonical_continuation_precondition_residual_rms is None
-    assert not solver._canonical_precondition_enabled()
+@pytest.mark.parametrize(
+    'canonical_continuation,electron_number,expected_route', [
+        (True, None, 'canonical'),
+        (False, None, 'nlcg'),
+        (True, 1.0, 'nlcg'),
+    ])
+def test_kernel_routes_canonical_and_direct_solves(
+        canonical_continuation, electron_number, expected_route):
+    _, solver = _solver(
+        canonical_continuation=canonical_continuation,
+        electron_number=electron_number)
     sentinel = object()
     calls = []
 
-    def direct_continuation(*args, **kwargs):
-        calls.append((args, kwargs))
+    def canonical_kernel(*args, **kwargs):
+        calls.append(('canonical', args, kwargs))
         return sentinel
 
-    def unexpected_prefix(*args, **kwargs):
-        raise AssertionError('default canonical continuation ran NLCG prefix')
+    def nlcg_kernel(*args, **kwargs):
+        calls.append(('nlcg', args, kwargs))
+        return sentinel
 
-    solver._kernel_canonical_continuation = direct_continuation
-    solver._kernel_nlcg = unexpected_prefix
+    solver._kernel_canonical_continuation = canonical_kernel
+    solver._kernel_nlcg = nlcg_kernel
     assert solver.kernel(h0=solver.hcore_ao) is sentinel
     assert len(calls) == 1
-
-
-def test_enabled_canonical_precondition_hands_off_with_continuous_work(
-        monkeypatch):
-    mf, solver = _solver(
-        mu=-0.1, canonical_continuation=True,
-        line_search_method='hager-zhang',
-        nlcg_nelec_projection_strategy='direction',
-        canonical_continuation_precondition_residual_rms=10.0,
-        canonical_continuation_precondition_max_delta_nelec=2.0,
-        canonical_continuation_precondition_min_fock_evaluations=1,
-        canonical_continuation_precondition_min_iterations=1,
-        canonical_continuation_precondition_confirmations=1,
-        canonical_continuation_precondition_max_fock_evaluations=20)
-    fixed_n_entries = []
-    original_fixed_n_view = GrandCanonicalKRKS._fixed_n_view
-
-    def observed_fixed_n_view(canonical_solver, state):
-        before = (canonical_solver.nfev, canonical_solver.mf.veff_calls)
-        view = original_fixed_n_view(canonical_solver, state)
-        after = (canonical_solver.nfev, canonical_solver.mf.veff_calls)
-        fixed_n_entries.append((before, after))
-        return view
-
-    monkeypatch.setattr(
-        GrandCanonicalKRKS, '_fixed_n_view', observed_fixed_n_view)
-    result = solver.kernel(h0=[
-        cp.asarray([[0.25, 0.18 - 0.07j],
-                    [0.18 + 0.07j, -0.15]])])
-
-    assert result.converged, result.message
-    assert result.canonical_precondition_trigger == 'criteria-confirmed'
-    assert result.canonical_precondition_iterations == 1
-    assert result.canonical_precondition_evaluations > 1
-    assert np.isfinite(result.canonical_precondition_residual_rms)
-    assert np.isfinite(
-        result.canonical_precondition_canonical_residual_rms)
-    assert abs(result.canonical_precondition_delta_nelec) <= 2.0
-    assert len(fixed_n_entries) == 1
-    assert fixed_n_entries[0][0][0] == 0
-    assert fixed_n_entries[0][1][0] == 0
-    assert fixed_n_entries[0][0][1] == fixed_n_entries[0][1][1]
-
-    assert result.nfev == mf.veff_calls
-    assert result.niter == len(result.history)
-    assert [record.cycle for record in result.history] == list(
-        range(result.niter))
-    assert result.history[0].fock_evaluations == (
-        result.canonical_precondition_evaluations)
-    assert result.history[0].restart_reason.startswith(
-        'fixed-mu canonical precondition')
-    fock_evaluations = [record.fock_evaluations for record in result.history]
-    assert fock_evaluations == sorted(fock_evaluations)
-    assert all(value <= result.nfev for value in fock_evaluations)
-    assert result.nfev > (
-        result.canonical_precondition_evaluations +
-        result.canonical_continuation_evaluations)
-    assert mf.canonical_precondition_trigger_gc == 'criteria-confirmed'
-    assert (mf.scf_summary['canonical_precondition_evaluations'] ==
-            result.canonical_precondition_evaluations)
-    assert mf.scf_summary['fock_evaluations_total'] == result.nfev
+    assert calls[0][0] == expected_route
 
 
 def test_unbracketed_canonical_continuation_uses_screened_secant():
@@ -2425,9 +2321,7 @@ def test_canonical_continuation_uses_one_gauge_exact_verification_fock(
 
 def test_failed_canonical_verification_resumes_fixed_n_continuation(
         monkeypatch):
-    mf, solver = _solver(
-        mu=-0.1, canonical_continuation=True,
-        canonical_continuation_precondition_residual_rms=None)
+    mf, solver = _solver(mu=-0.1, canonical_continuation=True)
     original_evaluate = solver.evaluate
     verification_calls = 0
 
