@@ -2062,7 +2062,7 @@ def test_workspace_prepares_static_mean_field_data_once_and_is_frozen():
         solver._workspace.nuclear_energy = 1.0
 
 
-def test_canonical_children_share_workspace_without_repeating_static_setup(
+def test_canonical_inner_points_share_workspace_without_publishing(
         monkeypatch):
     fock = [cp.asarray([[-0.7, 0.12j], [-0.12j, 0.3]],
                        dtype=cp.complex128)]
@@ -2073,11 +2073,31 @@ def test_canonical_children_share_workspace_without_repeating_static_setup(
             check_time_reversal=False, canonical_continuation=True))
     expected_setup_calls = dict(mf.setup_calls)
     children = []
+    diis_children = []
+    points = []
     original_spawn = solver._spawn_fixed_n
 
     def observed_spawn(electron_number, config):
         child = original_spawn(electron_number, config)
         children.append(child)
+        original_run_diis = child._run_diis
+        original_solve = child._solve_fixed_n_point
+
+        def unexpected_finalize(*args, **kwargs):
+            raise AssertionError('canonical child published through _finalize')
+
+        def observed_run_diis(*args, **kwargs):
+            diis_children.append(child)
+            return original_run_diis(*args, **kwargs)
+
+        def observed_solve(h0, seed_state=None):
+            point = original_solve(h0, seed_state=seed_state)
+            points.append((child, point))
+            return point
+
+        monkeypatch.setattr(child, '_finalize', unexpected_finalize)
+        monkeypatch.setattr(child, '_run_diis', observed_run_diis)
+        monkeypatch.setattr(child, '_solve_fixed_n_point', observed_solve)
         return child
 
     monkeypatch.setattr(solver, '_spawn_fixed_n', observed_spawn)
@@ -2087,8 +2107,21 @@ def test_canonical_children_share_workspace_without_repeating_static_setup(
 
     assert result.converged, result.message
     assert children
+    assert len(points) == len(children)
+    assert diis_children == children
     assert all(child._workspace is solver._workspace for child in children)
+    for child, point in points:
+        assert point.state is not None
+        assert isinstance(point.converged, bool)
+        assert isinstance(point.message, str)
+        assert point.niter == len(point.history)
+        assert point.nfev == child.nfev
     assert mf.setup_calls == expected_setup_calls
+    assert mf.converged
+    assert mf.e_tot == pytest.approx(result.dft_total_energy)
+    assert mf.grand_potential == pytest.approx(result.grand_potential)
+    assert mf.mo_coeff is not None
+    assert mf.mo_occ is not None
 
 
 def test_automatic_canonical_continuation_finds_fixed_mu_electron_number():
