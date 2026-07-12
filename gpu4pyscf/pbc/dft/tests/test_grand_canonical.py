@@ -1,7 +1,7 @@
 import cupy as cp
 import numpy as np
 import pytest
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from pyscf.pbc import gto
 
 from gpu4pyscf.lib.cupy_helper import tag_array
@@ -59,6 +59,40 @@ class _FixedFockKRKS:
     @staticmethod
     def energy_nuc():
         return 0.0
+
+
+class _CountingSetupKRKS(_FixedFockKRKS):
+    """Record construction-time mean-field work separately from Fock calls."""
+
+    def __init__(self, fock):
+        self.setup_calls = {
+            'build': 0,
+            'get_ovlp': 0,
+            'get_hcore': 0,
+            'check_linear_dependency': 0,
+            'energy_nuc': 0,
+        }
+        super().__init__(fock)
+
+    def build(self):
+        self.setup_calls['build'] += 1
+        return self
+
+    def get_ovlp(self, cell, kpts):
+        self.setup_calls['get_ovlp'] += 1
+        return super().get_ovlp(cell, kpts)
+
+    def get_hcore(self, cell, kpts):
+        self.setup_calls['get_hcore'] += 1
+        return super().get_hcore(cell, kpts)
+
+    def check_linear_dependency(self, overlap, **kwargs):
+        self.setup_calls['check_linear_dependency'] += 1
+        return super().check_linear_dependency(overlap, **kwargs)
+
+    def energy_nuc(self):
+        self.setup_calls['energy_nuc'] += 1
+        return super().energy_nuc()
 
 
 class _TaggedSolventKRKS(_FixedFockKRKS):
@@ -2470,6 +2504,55 @@ def test_residual_diis_polishes_fixed_fock_for_both_direct_optimizers():
         assert result.residual_rms < solver.config.conv_tol_residual_rms
         if optimizer == 'lbfgs':
             assert solver._lbfgs_history == []
+
+
+def test_workspace_prepares_static_mean_field_data_once_and_is_frozen():
+    fock = [cp.asarray([[-0.7, 0.12j], [-0.12j, 0.3]],
+                       dtype=cp.complex128)]
+    mf = _CountingSetupKRKS(fock)
+
+    solver = GrandCanonicalKRKS(
+        mf, mu=-0.1, sigma=0.15,
+        config=GrandCanonicalConfig(check_time_reversal=False))
+
+    assert mf.setup_calls == {
+        'build': 1,
+        'get_ovlp': 1,
+        'get_hcore': 1,
+        'check_linear_dependency': 1,
+        'energy_nuc': 1,
+    }
+    with pytest.raises(FrozenInstanceError):
+        solver._workspace.nuclear_energy = 1.0
+
+
+def test_canonical_children_share_workspace_without_repeating_static_setup(
+        monkeypatch):
+    fock = [cp.asarray([[-0.7, 0.12j], [-0.12j, 0.3]],
+                       dtype=cp.complex128)]
+    mf = _CountingSetupKRKS(fock)
+    solver = GrandCanonicalKRKS(
+        mf, mu=-0.1, sigma=0.15,
+        config=GrandCanonicalConfig(
+            check_time_reversal=False, canonical_continuation=True))
+    expected_setup_calls = dict(mf.setup_calls)
+    children = []
+    original_spawn = solver._spawn_fixed_n
+
+    def observed_spawn(electron_number, config):
+        child = original_spawn(electron_number, config)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(solver, '_spawn_fixed_n', observed_spawn)
+    result = solver.kernel(h0=[
+        cp.asarray([[0.25, 0.18 - 0.07j],
+                    [0.18 + 0.07j, -0.15]])])
+
+    assert result.converged, result.message
+    assert children
+    assert all(child._workspace is solver._workspace for child in children)
+    assert mf.setup_calls == expected_setup_calls
 
 
 def test_automatic_canonical_continuation_finds_fixed_mu_electron_number():
