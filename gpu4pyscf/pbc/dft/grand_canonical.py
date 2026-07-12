@@ -213,21 +213,6 @@ class GrandCanonicalConfig:
     mu_electron_number_tol: float = 1.0e-12
     mu_max_cycle: int = 100
 
-    optimizer: str = 'nlcg'
-    lbfgs_history_size: int = 5
-    lbfgs_curvature_tol: float = 1.0e-8
-    lbfgs_min_pair_step_rms: float = 1.0e-12
-    lbfgs_descent_cosine_min: float = 1.0e-4
-    lbfgs_initial_metric: str = 'fermi'
-    lbfgs_inverse_metric_cap: float = 1.0
-    lbfgs_metric_scale_min: float = 0.1
-    lbfgs_metric_scale_max: float = 10.0
-    lbfgs_scalar_h0_min: float = 1.0e-8
-    lbfgs_scalar_h0_max: float = 1.0
-    lbfgs_line_search_c2: float = 0.9
-    lbfgs_cap_unit_step_with_history: bool = True
-    lbfgs_clear_on_non_wolfe: bool = True
-
     # Optional residual-DIIS final polishing.  The direct optimizer hands off
     # once the residual reaches the switch threshold.  DIIS then prioritizes
     # the fixed-point residual over objective changes below the configured
@@ -310,7 +295,6 @@ class GrandCanonicalConfig:
     line_search_nelec_trust_bad_ratio: float = 2.5e-1
     line_search_nelec_trust_good_ratio: float = 7.5e-1
     diis_preserve_accepted_history: bool = False
-    lbfgs_use_projected_pairs: bool = False
 
     # Experimental low-temperature NLCG controls.  These fields are appended
     # to retain positional compatibility with earlier GrandCanonicalConfig
@@ -345,12 +329,6 @@ class GrandCanonicalConfig:
     nlcg_residual_filter_alpha_min: float = 2.0e-2
     nlcg_residual_filter_alpha_max: float = 2.0e-1
     nlcg_residual_filter_max_evals: Optional[int] = None
-    # Optional in-kernel NLCG -> L-BFGS handoff.  The already evaluated state
-    # is reused, L-BFGS memory starts empty, and the iteration/Fock counters
-    # remain continuous.  A separate line-search choice lets Hager--Zhang
-    # NLCG hand off to the occupation-projected strong-Wolfe L-BFGS path.
-    lbfgs_switch_residual_rms: Optional[float] = None
-    lbfgs_switch_line_search_method: str = 'strong-wolfe'
     # Optional fixed-mu NLCG/Hager--Zhang prefix for automatic canonical
     # continuation.  The prefix stops once the scalar-gauge-free canonical
     # shape and the cheap one-Fock electron-number estimate are both ready.
@@ -392,15 +370,8 @@ class IterationRecord:
     delta_objective: float = np.nan
     optimizer: str = 'nlcg'
     search_direction_source: str = 'nlcg'
-    lbfgs_history_size: int = 0
-    lbfgs_pair_added: bool = False
-    lbfgs_sy: float = np.nan
-    lbfgs_curvature_cosine: float = np.nan
-    lbfgs_metric_scale: float = np.nan
-    lbfgs_history_action: str = ''
     strong_wolfe: bool = False
     line_search_message: str = ''
-    descent_cosine: float = np.nan
     diis_history_size: int = 0
     diis_condition: float = np.nan
     diis_coefficient_l1: float = np.nan
@@ -560,17 +531,6 @@ class _HZPoint:
 
 
 @dataclass
-class _LBFGSPair:
-    s: list
-    y: list
-    rho: float
-    sy: float
-    s_norm: float
-    y_norm: float
-    curvature_cosine: float
-
-
-@dataclass
 class _DIISItem:
     h: list
     fock: list
@@ -660,10 +620,6 @@ class GrandCanonicalResult:
     max_direction_projection_correction: float = 0.0
     residual_filter_acceptances: int = 0
     residual_filter_rejections: int = 0
-    lbfgs_switches: int = 0
-    lbfgs_switch_cycle: int = -1
-    lbfgs_switch_nfev: int = -1
-    lbfgs_switch_actual_residual_rms: float = np.nan
     canonical_precondition_iterations: int = 0
     canonical_precondition_evaluations: int = 0
     canonical_precondition_residual_rms: float = np.nan
@@ -805,70 +761,38 @@ class GrandCanonicalKRKS:
         self.beta = 1.0 / self.sigma
         self.config = config or GrandCanonicalConfig()
         self.config.cg_update = self._canonical_cg_update(self.config.cg_update)
-        self.config.optimizer = self._canonical_optimizer(self.config.optimizer)
-        self.config.lbfgs_initial_metric = self._canonical_lbfgs_metric(
-            self.config.lbfgs_initial_metric)
         self.config.line_search_nelec_guard_mode = (
             self._canonical_nelec_guard_mode(
                 self.config.line_search_nelec_guard_mode))
         self.config.line_search_method = self._canonical_line_search_method(
             self.config.line_search_method)
-        self.config.lbfgs_switch_line_search_method = (
-            self._canonical_line_search_method(
-                self.config.lbfgs_switch_line_search_method))
         self.config.nlcg_nelec_projection_strategy = (
             self._canonical_nlcg_projection_strategy(
                 self.config.nlcg_nelec_projection_strategy))
         self._validate_line_search_config()
-        self._validate_lbfgs_config()
         self._validate_diis_config()
         self._validate_nelec_guard_config()
         self._validate_canonical_continuation_config()
         if (not self.fixed_electron_number and
                 self.config.line_search_method == 'hager-zhang' and
                 self.config.line_search_nelec_guard_mode != 'reject'):
-            if (self.config.optimizer != 'nlcg' or
-                    self.config.nlcg_nelec_projection_strategy !=
-                    'direction'):
+            if (self.config.nlcg_nelec_projection_strategy != 'direction'):
                 raise ValueError(
                     'Hager-Zhang with occupation projection requires the '
                     'NLCG fixed-direction projection strategy; post-trial '
                     'projection is not a one-dimensional line search')
         if self.config.nlcg_residual_filter_rms is not None:
-            if (self.config.optimizer != 'nlcg' or
-                    self.config.line_search_method != 'hager-zhang' or
+            if (self.config.line_search_method != 'hager-zhang' or
                     self.config.nlcg_nelec_projection_strategy !=
                     'direction'):
                 raise ValueError(
                     'the NLCG residual filter requires Hager-Zhang and the '
                     'fixed-direction projection strategy')
-        if (self.config.lbfgs_switch_residual_rms is not None and
-                self.config.optimizer != 'nlcg'):
-            raise ValueError(
-                'lbfgs_switch_residual_rms requires optimizer="nlcg"')
-        if (not self.fixed_electron_number and
-                self.config.lbfgs_switch_residual_rms is not None and
-                self.config.lbfgs_switch_line_search_method ==
-                'hager-zhang' and
-                self.config.line_search_nelec_guard_mode != 'reject'):
-            raise ValueError(
-                'an occupation-projected NLCG-to-L-BFGS handoff requires '
-                'the strong-Wolfe L-BFGS line search')
         self.verbose = (getattr(mf, 'verbose', logger.NOTE)
                         if self.config.verbose is None else self.config.verbose)
         self.log = logger.new_logger(mf, self.verbose)
-        if ((self.config.optimizer == 'lbfgs' or
-             self.config.lbfgs_switch_residual_rms is not None) and
-                self.fixed_electron_number and
-                self.config.lbfgs_initial_metric == 'fermi'):
-            self.log.info(
-                'Fixed-electron L-BFGS uses the scalar initial metric; the '
-                'Fermi inverse metric is defined only at fixed mu')
-            self.config.lbfgs_initial_metric = 'scalar'
         self.history: list[IterationRecord] = []
-        self._lbfgs_history: list[_LBFGSPair] = []
         self._diis_history: list[_DIISItem] = []
-        self._last_lbfgs_metric_scale = np.nan
         self.nfev = 0
         self.ncheap_nelec_reject = 0
         self._last_trial_rejected_by_nelec = False
@@ -890,10 +814,6 @@ class GrandCanonicalKRKS:
         self.max_direction_projection_correction = 0.0
         self.nresidual_filter_acceptances = 0
         self.nresidual_filter_rejections = 0
-        self.nlbfgs_switches = 0
-        self.lbfgs_switch_cycle = -1
-        self.lbfgs_switch_nfev = -1
-        self.lbfgs_switch_actual_residual_rms = np.nan
         self.canonical_precondition_iterations = 0
         self.canonical_precondition_evaluations = 0
         self.canonical_precondition_residual_rms = np.nan
@@ -918,16 +838,6 @@ class GrandCanonicalKRKS:
             self._workspace = self._capture_workspace()
         else:
             self._install_workspace(_workspace)
-        bytes_per_pair = 2 * sum(
-            n * n * int(x.dtype.itemsize)
-            for n, x in zip(self.north, self.x_ao2orth))
-        self._lbfgs_history_allocation_bytes = (
-            self.config.lbfgs_history_size * bytes_per_pair)
-        if self.config.optimizer == 'lbfgs':
-            self.log.info(
-                'L-BFGS history capacity %d pairs; estimated GPU allocation %.3f MiB',
-                self.config.lbfgs_history_size,
-                self._lbfgs_history_allocation_bytes / 2.0**20)
         capacity = 2.0 * sum(float(self.weights[k].item()) * n
                              for k, n in enumerate(self.north))
         if (self.fixed_electron_number and
@@ -975,43 +885,6 @@ class GrandCanonicalKRKS:
                                  'hestenes-stiefel', 'hager-zhang'))
             raise ValueError(
                 f'unsupported cg_update {value!r}; choose one of {choices}') from error
-
-    @staticmethod
-    def _canonical_optimizer(value: str) -> str:
-        if not isinstance(value, str):
-            raise TypeError('optimizer must be a string')
-        key = value.strip().lower().replace('_', '-').replace(' ', '-')
-        aliases = {
-            'cg': 'nlcg',
-            'nlcg': 'nlcg',
-            'nonlinear-cg': 'nlcg',
-            'nonlinear-conjugate-gradient': 'nlcg',
-            'lbfgs': 'lbfgs',
-            'l-bfgs': 'lbfgs',
-            'limited-memory-bfgs': 'lbfgs',
-        }
-        try:
-            return aliases[key]
-        except KeyError as error:
-            raise ValueError(
-                f'unsupported optimizer {value!r}; choose nlcg or lbfgs') from error
-
-    @staticmethod
-    def _canonical_lbfgs_metric(value: str) -> str:
-        if not isinstance(value, str):
-            raise TypeError('lbfgs_initial_metric must be a string')
-        key = value.strip().lower().replace('_', '-').replace(' ', '-')
-        aliases = {
-            'fermi': 'fermi',
-            'fermi-response': 'fermi',
-            'scalar': 'scalar',
-            'identity': 'scalar',
-        }
-        try:
-            return aliases[key]
-        except KeyError as error:
-            raise ValueError(
-                'lbfgs_initial_metric must be fermi or scalar') from error
 
     @staticmethod
     def _canonical_nelec_guard_mode(value: str) -> str:
@@ -1184,53 +1057,6 @@ class GrandCanonicalKRKS:
                 'residual-filter warm starts and evaluation caps require '
                 'nlcg_residual_filter_rms')
 
-    def _validate_lbfgs_config(self) -> None:
-        switch = self.config.lbfgs_switch_residual_rms
-        if switch is not None:
-            switch = _as_float(switch, 'lbfgs_switch_residual_rms')
-            if switch <= 0.0:
-                raise ValueError(
-                    'lbfgs_switch_residual_rms must be positive when enabled')
-            if switch < self.config.conv_tol_residual_rms:
-                raise ValueError(
-                    'lbfgs_switch_residual_rms may not be smaller than '
-                    'conv_tol_residual_rms')
-            self.config.lbfgs_switch_residual_rms = switch
-        if (not isinstance(self.config.lbfgs_history_size, int) or
-                isinstance(self.config.lbfgs_history_size, bool) or
-                self.config.lbfgs_history_size < 0):
-            raise ValueError('lbfgs_history_size must be a nonnegative integer')
-        if switch is not None and self.config.lbfgs_history_size == 0:
-            raise ValueError(
-                'lbfgs_history_size must be positive when the NLCG-to-L-BFGS '
-                'handoff is enabled')
-        positive = (
-            'lbfgs_curvature_tol', 'lbfgs_min_pair_step_rms',
-            'lbfgs_descent_cosine_min', 'lbfgs_inverse_metric_cap',
-            'lbfgs_metric_scale_min', 'lbfgs_metric_scale_max',
-            'lbfgs_scalar_h0_min', 'lbfgs_scalar_h0_max',
-        )
-        for name in positive:
-            value = getattr(self.config, name)
-            if not np.isfinite(value) or value <= 0.0:
-                raise ValueError(f'{name} must be finite and positive')
-        if self.config.lbfgs_metric_scale_min > self.config.lbfgs_metric_scale_max:
-            raise ValueError(
-                'lbfgs_metric_scale_min may not exceed lbfgs_metric_scale_max')
-        if self.config.lbfgs_scalar_h0_min > self.config.lbfgs_scalar_h0_max:
-            raise ValueError(
-                'lbfgs_scalar_h0_min may not exceed lbfgs_scalar_h0_max')
-        c2 = self.config.lbfgs_line_search_c2
-        if (not np.isfinite(c2) or not self.config.line_search_c1 < c2 < 1.0):
-            raise ValueError(
-                'lbfgs_line_search_c2 must be finite and lie between '
-                'line_search_c1 and 1')
-        for name in ('lbfgs_cap_unit_step_with_history',
-                     'lbfgs_clear_on_non_wolfe',
-                     'lbfgs_use_projected_pairs'):
-            if not isinstance(getattr(self.config, name), bool):
-                raise TypeError(f'{name} must be boolean')
-
     def _validate_diis_config(self) -> None:
         if not isinstance(self.config.diis_preserve_accepted_history, bool):
             raise TypeError('diis_preserve_accepted_history must be boolean')
@@ -1245,12 +1071,6 @@ class GrandCanonicalKRKS:
                     'diis_switch_residual_rms may not be smaller than '
                     'conv_tol_residual_rms')
             self.config.diis_switch_residual_rms = switch
-        lbfgs_switch = self.config.lbfgs_switch_residual_rms
-        if (switch is not None and lbfgs_switch is not None and
-                switch >= lbfgs_switch):
-            raise ValueError(
-                'diis_switch_residual_rms must be smaller than '
-                'lbfgs_switch_residual_rms so the L-BFGS phase is reachable')
         for name, minimum in (
                 ('diis_space', 2), ('diis_max_backtracks', 0),
                 ('diis_model_max_backtracks', 0),
@@ -1435,8 +1255,7 @@ class GrandCanonicalKRKS:
                 raise ValueError(
                     'canonical-continuation preconditioning is available '
                     'only at fixed chemical potential')
-            if (self.config.optimizer != 'nlcg' or
-                    self.config.line_search_method != 'hager-zhang' or
+            if (self.config.line_search_method != 'hager-zhang' or
                     self.config.nlcg_nelec_projection_strategy !=
                     'direction'):
                 raise ValueError(
@@ -2197,269 +2016,10 @@ class GrandCanonicalKRKS:
             return 0.0, f'invalid {label} beta'
         return candidate, ''
 
-    # ---- limited-memory BFGS ---------------------------------------------
-
-    def _apply_fermi_inverse_metric(self, state: _GCState,
-                                    blocks: Sequence) -> list:
-        """Apply the capped fixed-mu Fermi-response inverse Hessian."""
-        if self.fixed_electron_number:
-            raise NotImplementedError(
-                'the Fermi inverse metric is not defined for fixed electron number')
-        output = []
-        inverse_floor = 1.0 / self.config.lbfgs_inverse_metric_cap
-        for value, vector, gamma, occupation in zip(
-                blocks, state.u, state.eigenvalues, state.occupations):
-            divided = fermi_divided_difference(
-                gamma, occupation, self.config.fermi_divdiff_rtol)
-            response = -4.0 * self.beta * divided
-            inverse_response = 1.0 / cp.maximum(response, inverse_floor)
-            transformed = vector.conj().T @ value @ vector
-            result = vector @ (inverse_response * transformed) @ vector.conj().T
-            output.append(0.5 * (result + result.conj().T))
-        output, _ = self.project_time_reversal(output)
-        return self.hermitize_blocks(output)
-
-    def _lbfgs_metric_scale(self, state: _GCState, pair: _LBFGSPair) -> float:
-        metric_y = self._apply_fermi_inverse_metric(state, pair.y)
-        denominator = self.inner(pair.y, metric_y)
-        if not np.isfinite(denominator) or denominator <= 0.0:
-            return 1.0
-        scale = pair.sy / denominator
-        if not np.isfinite(scale) or scale <= 0.0:
-            return 1.0
-        return float(np.clip(
-            scale, self.config.lbfgs_metric_scale_min,
-            self.config.lbfgs_metric_scale_max))
-
-    def _lbfgs_scalar_scale(self, pair: _LBFGSPair) -> float:
-        denominator = self.inner(pair.y, pair.y)
-        if not np.isfinite(denominator) or denominator <= 0.0:
-            return self.config.lbfgs_scalar_h0_min
-        scale = pair.sy / denominator
-        if not np.isfinite(scale) or scale <= 0.0:
-            return self.config.lbfgs_scalar_h0_min
-        return float(np.clip(
-            scale, self.config.lbfgs_scalar_h0_min,
-            self.config.lbfgs_scalar_h0_max))
-
-    def _nonfinite_direction(self, state: _GCState) -> list:
-        return [cp.full_like(value, cp.nan) for value in state.gradient]
-
-    def _lbfgs_direction(self, state: _GCState,
-                         history: Sequence[_LBFGSPair]) -> tuple[list, bool, str]:
-        """Construct ``-B g`` using exact-gradient secant pairs."""
-        self._last_lbfgs_metric_scale = np.nan
-        if not history:
-            return (self.copy_blocks(state.residual), False,
-                    'empty L-BFGS history')
-
-        q = self.copy_blocks(state.gradient)
-        alpha_rev = []
-        for pair in reversed(history):
-            alpha = pair.rho * self.inner(pair.s, q)
-            if not np.isfinite(alpha):
-                return (self._nonfinite_direction(state), True,
-                        'nonfinite first-loop coefficient')
-            alpha = float(alpha)
-            q = self.axpy(-alpha, pair.y, q)
-            alpha_rev.append(alpha)
-        if not self.all_finite(q):
-            return (self._nonfinite_direction(state), True,
-                    'nonfinite first-loop vector')
-
-        if self.config.lbfgs_initial_metric == 'fermi':
-            result = self._apply_fermi_inverse_metric(state, q)
-            scale = self._lbfgs_metric_scale(state, history[-1])
-        else:
-            scale = self._lbfgs_scalar_scale(history[-1])
-            result = self.copy_blocks(q)
-        if not np.isfinite(scale):
-            return (self._nonfinite_direction(state), True,
-                    'nonfinite initial-metric scale')
-        self._last_lbfgs_metric_scale = float(scale)
-        result = self.scale_blocks(float(scale), result)
-
-        for pair, alpha in zip(history, reversed(alpha_rev)):
-            beta = pair.rho * self.inner(pair.y, result)
-            if not np.isfinite(beta):
-                return (self._nonfinite_direction(state), True,
-                        'nonfinite second-loop coefficient')
-            result = self.axpy(alpha - float(beta), pair.s, result)
-        direction = self.scale_blocks(-1.0, result)
-        direction = self.hermitize_blocks(direction)
-        direction, _ = self.project_time_reversal(direction)
-        direction = self.hermitize_blocks(direction)
-        return direction, True, ''
-
-    def _ensure_lbfgs_descent(
-            self, state: _GCState, direction: Sequence,
-            used_history: bool) -> tuple[list, bool, str]:
-        """Validate a quasi-Newton direction without NLCG polishing/blending."""
-        direction = self.hermitize_blocks(direction)
-        direction, _ = self.project_time_reversal(direction)
-        direction = self.hermitize_blocks(direction)
-        source = 'L-BFGS' if used_history else 'restart'
-        if not self.all_finite(direction):
-            restart, reason = self._restart_direction(state)
-            return restart, True, f'nonfinite {source} direction; {reason}'
-        gnorm, dnorm = self.norm(state.gradient), self.norm(direction)
-        if gnorm == 0.0 or dnorm == 0.0:
-            restart, reason = self._restart_direction(state)
-            return restart, True, f'zero {source} direction; {reason}'
-        directional = self.inner(state.gradient, direction)
-        cosine = -directional / (gnorm * dnorm)
-        valid = (
-            directional < -self.config.descent_tolerance * gnorm * dnorm
-            and cosine >= self.config.lbfgs_descent_cosine_min)
-        if valid:
-            return direction, False, ''
-        restart, reason = self._restart_direction(state)
-        return restart, True, f'rejected {source} direction; {reason}'
-
-    def _update_lbfgs_history(
-            self, history: list[_LBFGSPair], old_state: _GCState,
-            new_state: _GCState, line_search: _LineSearchResult,
-            fallback_used: bool = False) -> dict[str, Any]:
-        """Validate and commit an exact-gradient secant pair."""
-        info = {
-            'pair_added': False,
-            'sy': np.nan,
-            'curvature_cosine': np.nan,
-            'action': 'no pair',
-        }
-        projected_pair = line_search.nelec_projection_applied
-        if (projected_pair and
-                not self.config.lbfgs_use_projected_pairs):
-            history.clear()
-            info['action'] = 'history cleared after occupation projection'
-            return info
-        if projected_pair:
-            if line_search.nelec_projection_response_fallback:
-                history.clear()
-                info['action'] = (
-                    'history cleared after response-fallback projection')
-                return info
-            ratio = line_search.nelec_trust_ratio
-            if (not np.isfinite(ratio) or
-                    ratio < self.config.line_search_nelec_trust_good_ratio):
-                history.clear()
-                info['action'] = (
-                    'history cleared after unreliable projected model')
-                return info
-        if not projected_pair:
-            non_wolfe = (
-                fallback_used or not (
-                    line_search.strong_wolfe or
-                    line_search.curvature_qualified))
-            if ((line_search.force_restart or non_wolfe) and
-                    not line_search.trust_boundary):
-                if (line_search.force_restart or
-                        self.config.lbfgs_clear_on_non_wolfe):
-                    history.clear()
-                    info['action'] = (
-                        'history cleared after non-Wolfe acceptance')
-                else:
-                    info['action'] = (
-                        'pair skipped after non-Wolfe acceptance')
-                return info
-
-        if projected_pair:
-            if line_search.actual_step is None:
-                history.clear()
-                info['action'] = (
-                    'history cleared: projected pair lacks actual step')
-                return info
-            s = self.copy_blocks(line_search.actual_step)
-            endpoint_step = self.axpy(
-                -1.0, old_state.h_orth, new_state.h_orth)
-            if (not self.all_finite(s) or
-                    not self.all_finite(endpoint_step)):
-                history.clear()
-                info['action'] = (
-                    'history cleared after nonfinite projected step')
-                return info
-            mismatch = self.max_block_rms(
-                self.axpy(-1.0, endpoint_step, s))
-            if not np.isfinite(mismatch) or mismatch > 1.0e-8:
-                history.clear()
-                info['action'] = (
-                    'history cleared after inconsistent projected step')
-                return info
-            # The accepted endpoints are authoritative.  The stored actual
-            # step is an invariant check, not a second secant displacement.
-            s = endpoint_step
-        else:
-            s = self.axpy(-1.0, old_state.h_orth, new_state.h_orth)
-        y = self.axpy(-1.0, old_state.gradient, new_state.gradient)
-        s = self.hermitize_blocks(s)
-        y = self.hermitize_blocks(y)
-        s, _ = self.project_time_reversal(s)
-        y, _ = self.project_time_reversal(y)
-        s = self.hermitize_blocks(s)
-        y = self.hermitize_blocks(y)
-        if not self.all_finite(s) or not self.all_finite(y):
-            history.clear()
-            info['action'] = 'history cleared after nonfinite curvature'
-            return info
-
-        sy = self.inner(s, y)
-        s_norm = self.norm(s)
-        y_norm = self.norm(y)
-        scalars_finite = all(np.isfinite(value) for value in
-                             (sy, s_norm, y_norm))
-        if not scalars_finite:
-            history.clear()
-            info['action'] = 'history cleared after nonfinite curvature'
-            return info
-        info['sy'] = sy
-        if s_norm > 0.0 and y_norm > 0.0:
-            info['curvature_cosine'] = sy / (s_norm * y_norm)
-        if sy <= 0.0:
-            if projected_pair:
-                info['action'] = 'projected pair skipped: bad curvature'
-            else:
-                history.clear()
-                info['action'] = 'history cleared after bad curvature'
-            return info
-        if (self.rms(s) < self.config.lbfgs_min_pair_step_rms or
-                s_norm == 0.0 or y_norm == 0.0 or
-                sy < self.config.lbfgs_curvature_tol * s_norm * y_norm):
-            prefix = 'projected ' if projected_pair else ''
-            info['action'] = f'{prefix}pair skipped: weak curvature'
-            return info
-        if self.config.lbfgs_history_size == 0:
-            prefix = 'projected ' if projected_pair else ''
-            info['action'] = (
-                f'{prefix}pair skipped: history capacity is zero')
-            return info
-
-        rho = 1.0 / sy
-        if not np.isfinite(rho):
-            history.clear()
-            info['action'] = 'history cleared after nonfinite curvature'
-            return info
-        pair = _LBFGSPair(
-            self.copy_blocks(s), self.copy_blocks(y), float(rho),
-            float(sy), float(s_norm), float(y_norm),
-            float(info['curvature_cosine']))
-        history.append(pair)
-        prefix = 'projected ' if projected_pair else ''
-        if len(history) > self.config.lbfgs_history_size:
-            del history[0]
-            info['action'] = f'{prefix}pair added; oldest pair evicted'
-        else:
-            info['action'] = f'{prefix}pair added'
-        info['pair_added'] = True
-        return info
-
     # ---- residual DIIS ---------------------------------------------------
 
     def _should_start_diis(self, state: _GCState) -> bool:
         threshold = self.config.diis_switch_residual_rms
-        return threshold is not None and state.residual_rms <= threshold
-
-    def _should_start_lbfgs(self, state: _GCState) -> bool:
-        threshold = self.config.lbfgs_switch_residual_rms
         return threshold is not None and state.residual_rms <= threshold
 
     def _canonical_precondition_enabled(self) -> bool:
@@ -4252,12 +3812,6 @@ class GrandCanonicalKRKS:
     def _record(self, cycle: int, old: _GCState, new: _GCState, line_search: _LineSearchResult,
                 dphi0: float, beta: float, restart_reason: str,
                 optimizer: str = 'nlcg', search_direction_source: str = 'nlcg',
-                lbfgs_history_size: int = 0, lbfgs_pair_added: bool = False,
-                lbfgs_sy: float = np.nan,
-                lbfgs_curvature_cosine: float = np.nan,
-                lbfgs_metric_scale: float = np.nan,
-                lbfgs_history_action: str = '',
-                descent_cosine: float = np.nan,
                 diis_history_size: int = 0,
                 diis_condition: float = np.nan,
                 diis_coefficient_l1: float = np.nan,
@@ -4275,10 +3829,8 @@ class GrandCanonicalKRKS:
             new.grad_rms, new.residual_rms, density_change, line_search.alpha, dphi0,
             beta, restart_reason, line_search.nfev, new.free_energy,
             new.chemical_potential, new.objective, delta_objective,
-            optimizer, search_direction_source, lbfgs_history_size,
-            lbfgs_pair_added, lbfgs_sy, lbfgs_curvature_cosine,
-            lbfgs_metric_scale, lbfgs_history_action,
-            line_search.strong_wolfe, line_search.message, descent_cosine,
+            optimizer, search_direction_source,
+            line_search.strong_wolfe, line_search.message,
             diis_history_size, diis_condition, diis_coefficient_l1,
             diis_damping, diis_history_action,
             diis_predicted_residual_rms, diis_trust_ratio,
@@ -4353,29 +3905,6 @@ class GrandCanonicalKRKS:
                 line_search.nelec_projection_parameter,
                 line_search.nelec_projection_correction_rms,
                 line_search.nelec_trust_ratio)
-
-    def _record_lbfgs(
-            self, cycle: int, old: _GCState, new: _GCState,
-            line_search: _LineSearchResult, dphi0: float,
-            history_size: int, direction_source: str,
-            pair_info: dict[str, Any], restart_reason: str,
-            descent_cosine: float) -> None:
-        self._record(
-            cycle, old, new, line_search, dphi0, np.nan, restart_reason,
-            optimizer='lbfgs', search_direction_source=direction_source,
-            lbfgs_history_size=history_size,
-            lbfgs_pair_added=pair_info['pair_added'],
-            lbfgs_sy=pair_info['sy'],
-            lbfgs_curvature_cosine=pair_info['curvature_cosine'],
-            lbfgs_metric_scale=self._last_lbfgs_metric_scale,
-            lbfgs_history_action=pair_info['action'],
-            descent_cosine=descent_cosine)
-        self.log.info(
-            'L-BFGS history = %d  direction = %s  Wolfe = %s  '
-            'metric scale = %.4g  %s',
-            history_size, direction_source,
-            line_search.curvature_qualified,
-            self._last_lbfgs_metric_scale, pair_info['action'])
 
     def _record_diis(
             self, cycle: int, old: _GCState, new: _GCState,
@@ -4490,10 +4019,6 @@ class GrandCanonicalKRKS:
         self.max_direction_projection_correction = 0.0
         self.nresidual_filter_acceptances = 0
         self.nresidual_filter_rejections = 0
-        self.nlbfgs_switches = 0
-        self.lbfgs_switch_cycle = -1
-        self.lbfgs_switch_nfev = -1
-        self.lbfgs_switch_actual_residual_rms = np.nan
         self.canonical_precondition_iterations = 0
         self.canonical_precondition_evaluations = 0
         self.canonical_precondition_residual_rms = np.nan
@@ -4523,7 +4048,6 @@ class GrandCanonicalKRKS:
             checkpoint_path=None,
             checkpoint_interval=0,
             initial_electron_number=None,
-            lbfgs_switch_residual_rms=None,
             canonical_continuation_precondition_residual_rms=None,
             conv_tol_residual_rms=residual_tolerance,
             # Canonical continuation is a fixed-point globalization.  Enter
@@ -5313,13 +4837,8 @@ class GrandCanonicalKRKS:
             saved_max_coefficient_l1,
             self.config.canonical_continuation_diis_max_coefficient_l1)
         try:
-            if self.config.optimizer == 'nlcg':
-                final_result = self._kernel_nlcg(
-                    h0=h, allow_canonical_handoff=False)
-            elif self.config.optimizer == 'lbfgs':
-                final_result = self._kernel_lbfgs(h0=h)
-            else:  # pragma: no cover - validated during construction
-                raise AssertionError('validated optimizer is unreachable')
+            final_result = self._kernel_nlcg(
+                h0=h, allow_canonical_handoff=False)
         finally:
             self.config.diis_initial_damping = saved_initial_damping
             self.config.diis_max_coefficient_l1 = saved_max_coefficient_l1
@@ -5338,12 +4857,6 @@ class GrandCanonicalKRKS:
             prefix_records + continuation_history + final_history)
         total_evaluations = pre_evaluations + final_result.nfev
         total_iterations = pre_iterations + final_result.niter
-        switch_cycle = final_result.lbfgs_switch_cycle
-        switch_nfev = final_result.lbfgs_switch_nfev
-        if switch_cycle >= 0:
-            switch_cycle += pre_iterations
-        if switch_nfev >= 0:
-            switch_nfev += pre_evaluations
         self.nfev = total_evaluations
         self.ncheap_nelec_reject = final_result.cheap_nelec_rejections
         self.history = combined_history
@@ -5423,13 +4936,7 @@ class GrandCanonicalKRKS:
                 self.canonical_precondition_trigger),
             'canonical_terminal_mode': 'fixed-mu-polish',
             'fock_evaluations_total': total_evaluations,
-            'lbfgs_switch_cycle_gc': switch_cycle,
-            'lbfgs_switch_nfev_gc': switch_nfev,
         })
-        self.lbfgs_switch_cycle = switch_cycle
-        self.lbfgs_switch_nfev = switch_nfev
-        self.mf.lbfgs_switch_cycle_gc = switch_cycle
-        self.mf.lbfgs_switch_nfev_gc = switch_nfev
         message = (
             f'canonical continuation ({outer_steps} outer steps, '
             f'{continuation_evaluations} Fock evaluations); '
@@ -5445,8 +4952,6 @@ class GrandCanonicalKRKS:
             canonical_continuation_mu_error=best_error,
             canonical_continuation_mu_error_source=best_error_source,
             canonical_continuation_delta_nelec=best_handoff_delta_nelec,
-            lbfgs_switch_cycle=switch_cycle,
-            lbfgs_switch_nfev=switch_nfev,
             canonical_precondition_iterations=(
                 self.canonical_precondition_iterations),
             canonical_precondition_evaluations=(
@@ -5472,11 +4977,7 @@ class GrandCanonicalKRKS:
                 not self.fixed_electron_number and
                 not self._canonical_precondition_enabled()):
             return self._kernel_canonical_continuation(dm0=dm0, h0=h0)
-        if self.config.optimizer == 'nlcg':
-            return self._kernel_nlcg(dm0=dm0, h0=h0)
-        if self.config.optimizer == 'lbfgs':
-            return self._kernel_lbfgs(dm0=dm0, h0=h0)
-        raise AssertionError('validated optimizer is unreachable')
+        return self._kernel_nlcg(dm0=dm0, h0=h0)
 
     def _kernel_nlcg(self, dm0: Any = None,
                      h0: Any = None, *,
@@ -5487,7 +4988,6 @@ class GrandCanonicalKRKS:
         self.nfev = 0
         self._reset_run_diagnostics()
         self._nlcg_residual_previous_alpha = None
-        self._lbfgs_history = []
         self._diis_history = []
         state = self.evaluate(self._initial_h(dm0, h0))
         previous: Optional[_GCState] = None
@@ -5521,20 +5021,6 @@ class GrandCanonicalKRKS:
                     'CG memory reset', state.residual_rms)
                 return self._kernel_diis(
                     state, previous, niter=niter, cycle_start=cycle)
-            if not canonical_prefix and self._should_start_lbfgs(state):
-                self.nlbfgs_switches += 1
-                self.lbfgs_switch_cycle = cycle
-                self.lbfgs_switch_nfev = self.nfev
-                self.lbfgs_switch_actual_residual_rms = state.residual_rms
-                self._nlcg_residual_previous_alpha = None
-                self.log.info(
-                    'Switching from NLCG to L-BFGS at |F-H|_rms = %.6g; '
-                    'CG and L-BFGS memory reset', state.residual_rms)
-                return self._kernel_lbfgs_from_state(
-                    state, previous, niter=niter, cycle_start=cycle,
-                    line_search_method=(
-                        self.config.lbfgs_switch_line_search_method),
-                    residual_filter_enabled=False)
             direction, restarted, restart_reason = self._ensure_descent(state, direction)
             if not self._is_descent(state, direction):
                 if canonical_prefix:
@@ -5701,153 +5187,6 @@ class GrandCanonicalKRKS:
         density_change = (0.0 if previous is None else self._metrics(state, previous)[2])
         return self._finalize(state, converged, message, niter, density_change)
 
-    def _kernel_lbfgs(self, dm0: Any = None,
-                      h0: Any = None) -> GrandCanonicalResult:
-        """Run safeguarded exact-gradient limited-memory BFGS."""
-        self.history = []
-        self.nfev = 0
-        self._reset_run_diagnostics()
-        state = self.evaluate(self._initial_h(dm0, h0))
-        return self._kernel_lbfgs_from_state(
-            state, None, niter=0, cycle_start=0,
-            line_search_method=self.config.line_search_method,
-            residual_filter_enabled=True)
-
-    def _kernel_lbfgs_from_state(
-            self, state: _GCState, previous: Optional[_GCState], *,
-            niter: int, cycle_start: int, line_search_method: str,
-            residual_filter_enabled: bool) -> GrandCanonicalResult:
-        """Continue from an evaluated state with fresh L-BFGS memory."""
-        line_search_method = self._canonical_line_search_method(
-            line_search_method)
-        if not isinstance(residual_filter_enabled, bool):
-            raise TypeError('residual_filter_enabled must be boolean')
-        lbfgs_history: list[_LBFGSPair] = []
-        self._lbfgs_history = lbfgs_history
-        self._last_lbfgs_metric_scale = np.nan
-        consecutive = 0
-        message = 'maximum cycles reached'
-        converged = False
-
-        for cycle in range(cycle_start, self.config.max_cycle):
-            if self._meets_convergence(state, previous):
-                consecutive += 1
-                if (previous is None or
-                        consecutive >= self.config.required_consecutive_conv):
-                    converged, message = True, 'converged'
-                    break
-            else:
-                consecutive = 0
-
-            if self._should_start_diis(state):
-                lbfgs_history.clear()
-                self._last_lbfgs_metric_scale = np.nan
-                self.log.info(
-                    'Switching from L-BFGS to residual DIIS at |F-H|_rms = '
-                    '%.6g; L-BFGS history reset', state.residual_rms)
-                return self._kernel_diis(
-                    state, previous, niter=niter, cycle_start=cycle)
-
-            # At an exact stationary point no further accepted state exists
-            # with which to satisfy density-change or consecutive-state
-            # criteria.  This is the same terminal condition used by NLCG
-            # after it discovers that no downhill direction remains, but it
-            # must be checked before constructing a fresh L-BFGS direction so
-            # valid history is not cleared merely because the gradient is zero.
-            if (state.grad_rms < self.config.conv_tol_grad_rms and
-                    state.residual_rms < self.config.conv_tol_residual_rms):
-                converged, message = True, 'stationary state'
-                break
-
-            direction, used_history, direction_reason = self._lbfgs_direction(
-                state, lbfgs_history)
-            direction, reset, reset_reason = self._ensure_lbfgs_descent(
-                state, direction, used_history)
-            if reset:
-                lbfgs_history.clear()
-                used_history = False
-                self._last_lbfgs_metric_scale = np.nan
-                direction_reason = reset_reason
-            if not self._is_descent(state, direction):
-                if (state.grad_rms < self.config.conv_tol_grad_rms and
-                        state.residual_rms < self.config.conv_tol_residual_rms):
-                    converged, message = True, 'stationary initial state'
-                else:
-                    message = 'persistent loss of descent'
-                break
-
-            if self._alpha_cap(direction) < self.config.line_search_alpha_min:
-                lbfgs_history.clear()
-                direction, restart_reason = self._restart_direction(state)
-                used_history = False
-                self._last_lbfgs_metric_scale = np.nan
-                direction_reason = 'step cap restart; ' + restart_reason
-                if (not self._is_descent(state, direction) or
-                        self._alpha_cap(direction) <
-                        self.config.line_search_alpha_min):
-                    message = 'stagnation: step cap below minimum'
-                    break
-
-            dphi0 = self.inner(state.gradient, direction)
-            descent_cosine = self._descent_cosine(state, direction)
-            line_search = self._line_search(
-                state, direction, c2=self.config.lbfgs_line_search_c2,
-                alpha_init=1.0,
-                alpha_cap_override=(
-                    1.0 if (used_history and
-                            self.config.lbfgs_cap_unit_step_with_history)
-                    else None),
-                method_override=line_search_method,
-                residual_filter_enabled=residual_filter_enabled)
-            fallback_used = False
-            if not line_search.success:
-                primary_line_search = line_search
-                lbfgs_history.clear()
-                direction, restart_reason = self._restart_direction(state)
-                used_history = False
-                self._last_lbfgs_metric_scale = np.nan
-                dphi0 = self.inner(state.gradient, direction)
-                descent_cosine = self._descent_cosine(state, direction)
-                fallback_line_search = self._armijo_fallback(
-                    state, direction,
-                    residual_filter_enabled=residual_filter_enabled)
-                line_search = self._combine_line_search_work(
-                    primary_line_search, fallback_line_search)
-                fallback_used = True
-                direction_reason = restart_reason + '; ' + line_search.message
-            if not line_search.success or line_search.state is None:
-                message = 'line-search failure: ' + line_search.message
-                break
-
-            new_state = line_search.state
-            self._verify_accepted_step(
-                state, new_state, direction, line_search, dphi0)
-            pair_info = self._update_lbfgs_history(
-                lbfgs_history, state, new_state, line_search, fallback_used)
-            if used_history:
-                direction_source = 'lbfgs'
-            elif 'blended' in direction_reason:
-                direction_source = 'residual/exact-gradient fallback'
-            elif 'exact' in direction_reason:
-                direction_source = 'exact-gradient fallback'
-            else:
-                direction_source = 'residual'
-            self._record_lbfgs(
-                cycle, state, new_state, line_search, dphi0,
-                len(lbfgs_history), direction_source, pair_info,
-                direction_reason, descent_cosine)
-            niter += 1
-            self._checkpoint(new_state, niter)
-            previous, state = state, new_state
-        else:
-            if self._meets_convergence(state, previous):
-                consecutive += 1
-                if consecutive >= self.config.required_consecutive_conv:
-                    converged, message = True, 'converged at maximum cycle'
-        density_change = (0.0 if previous is None
-                          else self._metrics(state, previous)[2])
-        return self._finalize(state, converged, message, niter, density_change)
-
     def _kernel_diis(self, state: _GCState, previous: Optional[_GCState],
                      niter: int, cycle_start: int) -> GrandCanonicalResult:
         """Polish a locally converged direct-minimization state with DIIS."""
@@ -5961,11 +5300,6 @@ class GrandCanonicalKRKS:
             self.nresidual_filter_acceptances)
         self.mf.residual_filter_rejections_gc = (
             self.nresidual_filter_rejections)
-        self.mf.lbfgs_switches_gc = self.nlbfgs_switches
-        self.mf.lbfgs_switch_cycle_gc = self.lbfgs_switch_cycle
-        self.mf.lbfgs_switch_nfev_gc = self.lbfgs_switch_nfev
-        self.mf.lbfgs_switch_residual_rms_gc = (
-            self.lbfgs_switch_actual_residual_rms)
         self.mf.canonical_precondition_iterations_gc = (
             self.canonical_precondition_iterations)
         self.mf.canonical_precondition_evaluations_gc = (
@@ -6041,11 +5375,6 @@ class GrandCanonicalKRKS:
                 self.nresidual_filter_acceptances),
             'residual_filter_rejections_gc': (
                 self.nresidual_filter_rejections),
-            'lbfgs_switches_gc': self.nlbfgs_switches,
-            'lbfgs_switch_cycle_gc': self.lbfgs_switch_cycle,
-            'lbfgs_switch_nfev_gc': self.lbfgs_switch_nfev,
-            'lbfgs_switch_residual_rms_gc': (
-                self.lbfgs_switch_actual_residual_rms),
             'canonical_precondition_iterations': (
                 self.canonical_precondition_iterations),
             'canonical_precondition_evaluations': (
@@ -6116,11 +5445,6 @@ class GrandCanonicalKRKS:
                 self.nresidual_filter_acceptances),
             residual_filter_rejections=(
                 self.nresidual_filter_rejections),
-            lbfgs_switches=self.nlbfgs_switches,
-            lbfgs_switch_cycle=self.lbfgs_switch_cycle,
-            lbfgs_switch_nfev=self.lbfgs_switch_nfev,
-            lbfgs_switch_actual_residual_rms=(
-                self.lbfgs_switch_actual_residual_rms),
             canonical_precondition_iterations=(
                 self.canonical_precondition_iterations),
             canonical_precondition_evaluations=(
