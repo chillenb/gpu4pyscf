@@ -1336,6 +1336,40 @@ def test_fixed_n_view_matches_evaluation_without_extra_fock():
         view.gradient, fixed_n_solver.identity)) < 1.0e-12
 
 
+def test_fixed_n_point_resume_skips_redundant_initial_fock():
+    mf, fixed_mu_solver = _solver(mu=-0.1)
+    source = fixed_mu_solver.evaluate([
+        cp.asarray([[-0.31, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.19]])])
+    config = replace(
+        fixed_mu_solver.config, conv_tol_residual_rms=10.0)
+    fixed_n_solver = GrandCanonicalKRKS(
+        mf, sigma=fixed_mu_solver.sigma, config=config,
+        electron_number=source.electron_number,
+        _workspace=fixed_mu_solver._workspace)
+    veff_calls_before = mf.veff_calls
+
+    resumed = fixed_n_solver._solve_fixed_n_point(
+        source.h_orth, seed_state=source)
+
+    assert resumed.converged
+    assert resumed.target_electron_number == pytest.approx(
+        source.electron_number, abs=1.0e-14)
+    assert resumed.nfev == 0
+    assert resumed.niter == 0
+    assert resumed.history == ()
+    assert mf.veff_calls == veff_calls_before
+
+    fresh = fixed_n_solver._solve_fixed_n_point(source.h_orth)
+    assert fresh.converged
+    assert fresh.nfev == 1
+    assert fresh.niter == 0
+    assert mf.veff_calls == veff_calls_before + 1
+    assert resumed.mu == pytest.approx(fresh.mu, abs=2.0e-12)
+    assert resumed.residual_rms == pytest.approx(
+        fresh.residual_rms, abs=2.0e-12)
+
+
 @pytest.mark.parametrize(
     'canonical_continuation,electron_number,expected_route', [
         (True, None, 'canonical'),
