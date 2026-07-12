@@ -225,9 +225,6 @@ class GrandCanonicalConfig:
     diis_backtrack_factor: float = 0.5
     diis_initial_damping: float = 1.0
     diis_max_backtracks: int = 8
-    diis_model_max_backtracks: int = 2
-    diis_max_trust_model_repairs: int = 2
-    diis_trust_interpolation_residual_increase: float = 0.10
     diis_min_residual_reduction: float = 1.0e-3
     diis_max_objective_increase: float = 1.0e-5
     diis_max_delta_nelec: float = 5.0e-2
@@ -235,7 +232,6 @@ class GrandCanonicalConfig:
     diis_trust_expand_ratio: float = 0.75
     diis_trust_expansion: float = 2.0
     diis_trust_expand_min_relative_reduction: float = 2.0e-2
-    diis_max_restoration_residual_increase: float = 0.0
 
     # Optional fixed-mu globalization through canonical continuation.  Each
     # inner solve fixes N; the outer scalar Brent iteration zeros the optimized
@@ -290,7 +286,6 @@ class GrandCanonicalConfig:
     line_search_nelec_trust_expand: float = 2.0
     line_search_nelec_trust_bad_ratio: float = 2.5e-1
     line_search_nelec_trust_good_ratio: float = 7.5e-1
-    diis_preserve_accepted_history: bool = False
 
     # Experimental low-temperature NLCG controls.  These fields are appended
     # to retain positional compatibility with earlier GrandCanonicalConfig
@@ -1109,8 +1104,6 @@ class GrandCanonicalKRKS:
                 'nlcg_residual_filter_rms')
 
     def _validate_diis_config(self) -> None:
-        if not isinstance(self.config.diis_preserve_accepted_history, bool):
-            raise TypeError('diis_preserve_accepted_history must be boolean')
         switch = self.config.diis_switch_residual_rms
         if switch is not None:
             switch = _as_float(switch, 'diis_switch_residual_rms')
@@ -1123,18 +1116,12 @@ class GrandCanonicalKRKS:
                     'conv_tol_residual_rms')
             self.config.diis_switch_residual_rms = switch
         for name, minimum in (
-                ('diis_space', 2), ('diis_max_backtracks', 0),
-                ('diis_model_max_backtracks', 0),
-                ('diis_max_trust_model_repairs', 0)):
+                ('diis_space', 2), ('diis_max_backtracks', 0)):
             value = getattr(self.config, name)
             if (not isinstance(value, int) or isinstance(value, bool) or
                     value < minimum):
                 relation = 'at least 2' if minimum == 2 else 'nonnegative'
                 raise ValueError(f'{name} must be an integer that is {relation}')
-        if self.config.diis_model_max_backtracks > self.config.diis_max_backtracks:
-            raise ValueError(
-                'diis_model_max_backtracks may not exceed '
-                'diis_max_backtracks')
         positive = (
             'diis_regularization', 'diis_max_condition',
             'diis_max_coefficient_l1', 'diis_max_objective_increase',
@@ -1148,16 +1135,6 @@ class GrandCanonicalKRKS:
         if not np.isfinite(reduction) or not 0.0 <= reduction < 1.0:
             raise ValueError(
                 'diis_min_residual_reduction must lie in [0, 1)')
-        restoration = self.config.diis_max_restoration_residual_increase
-        if not np.isfinite(restoration) or not 0.0 <= restoration < 1.0:
-            raise ValueError(
-                'diis_max_restoration_residual_increase must lie in [0, 1)')
-        interpolation = (
-            self.config.diis_trust_interpolation_residual_increase)
-        if not np.isfinite(interpolation) or not 0.0 <= interpolation < 1.0:
-            raise ValueError(
-                'diis_trust_interpolation_residual_increase must lie in '
-                '[0, 1)')
         factor = self.config.diis_backtrack_factor
         if not np.isfinite(factor) or not 0.0 < factor < 1.0:
             raise ValueError('diis_backtrack_factor must lie strictly between 0 and 1')
@@ -2263,26 +2240,10 @@ class GrandCanonicalKRKS:
         return next_damping, float(ratio)
 
     def _diis_trial_acceptable(
-            self, state: _GCState, trial: _GCState,
-            residual_target_rms: Optional[float] = None,
-            allow_restoration: bool = False,
-            best_residual_rms: Optional[float] = None) -> tuple[bool, str]:
+            self, state: _GCState, trial: _GCState) -> tuple[bool, str]:
         residual_limit = state.residual_rms * (
             1.0 - self.config.diis_min_residual_reduction)
-        if residual_target_rms is not None:
-            residual_limit = min(residual_limit, residual_target_rms)
-        monotone = trial.residual_rms < residual_limit
-        restoration = False
-        if (not monotone and allow_restoration and
-                self.config.diis_max_restoration_residual_increase > 0.0 and
-                best_residual_rms is not None):
-            restoration_limit = best_residual_rms * (
-                1.0 +
-                self.config.diis_max_restoration_residual_increase)
-            restoration = (
-                trial.residual_rms <= restoration_limit and
-                trial.objective < state.objective)
-        if not monotone and not restoration:
+        if not trial.residual_rms < residual_limit:
             return False, 'residual did not satisfy the trust envelope'
         objective_increase = trial.objective - state.objective
         if objective_increase > self.config.diis_max_objective_increase:
@@ -2295,30 +2256,19 @@ class GrandCanonicalKRKS:
 
     def _try_diis_target(self, state: _GCState, target: Sequence,
                          starting_damping: float = 1.0,
-                         max_backtracks: Optional[int] = None,
-                         residual_target_rms: Optional[float] = None,
-                         allow_restoration: bool = False,
-                         best_residual_rms: Optional[float] = None,
-                         ) -> tuple[Optional[_GCState], float, str,
-                                    Optional[_GCState]]:
+                         ) -> tuple[Optional[_GCState], float, str]:
         direction = self.axpy(-1.0, state.h_orth, target)
         if not self.all_finite(direction) or self.norm(direction) == 0.0:
-            return None, 0.0, 'zero or nonfinite DIIS direction', None
+            return None, 0.0, 'zero or nonfinite DIIS direction'
         damping = min(1.0, max(
             self.config.line_search_alpha_min, starting_damping))
-        if max_backtracks is None:
-            max_backtracks = self.config.diis_max_backtracks
         last_reason = 'no DIIS trial evaluated'
-        best_rejected = None
-        rejected_samples: list[tuple[float, float]] = []
-        for _ in range(max_backtracks + 1):
+        for _ in range(self.config.diis_max_backtracks + 1):
             trial = self._trial(
                 state, direction, damping, allow_nelec_projection=False)
             if trial is not None:
                 acceptable, last_reason = self._diis_trial_acceptable(
-                    state, trial, residual_target_rms=residual_target_rms,
-                    allow_restoration=allow_restoration,
-                    best_residual_rms=best_residual_rms)
+                    state, trial)
                 self.log.debug(
                     'DIIS trust trial: damping = %.6g, residual %.6g -> '
                     '%.6g, delta objective = %.3g, delta N = %.3g: %s',
@@ -2327,116 +2277,22 @@ class GrandCanonicalKRKS:
                     trial.electron_number - state.electron_number,
                     'accepted' if acceptable else last_reason)
                 if acceptable:
-                    return trial, damping, '', best_rejected
-                interpolation_limit = state.residual_rms * (
-                    1.0 +
-                    self.config.diis_trust_interpolation_residual_increase)
-                # Damping decreases monotonically, so retain the first
-                # rejected point inside the interpolation envelope.  It is
-                # the most widely separated local secant and avoids filling
-                # the model with nearly duplicate tiny-step trials.
-                if (best_rejected is None and
-                        trial.residual_rms <= interpolation_limit):
-                    best_rejected = trial
-                rejected_samples.append((damping, trial.residual_rms))
-                if len(rejected_samples) >= 2:
-                    (alpha0, residual0), (alpha1, residual1) = (
-                        rejected_samples[-2:])
-                    slope = ((residual1 - residual0) /
-                             (alpha1 - alpha0))
-                    intercept = residual1 - slope * alpha1
-                    residual_limit = state.residual_rms * (
-                        1.0 - self.config.diis_min_residual_reduction)
-                    if residual_target_rms is not None:
-                        residual_limit = min(
-                            residual_limit, residual_target_rms)
-                    # If the two smallest sampled trust radii extrapolate to
-                    # an unacceptable residual even at zero radius, another
-                    # expensive Fock trial cannot repair this DIIS model.
-                    # Return the nearby rejected state so the outer model can
-                    # augment or prune its history immediately.
-                    local_samples = (
-                        max(residual0, residual1) <= interpolation_limit)
-                    if (local_samples and np.isfinite(slope) and slope > 0.0 and
-                            np.isfinite(intercept) and
-                            intercept >= residual_limit):
-                        last_reason = (
-                            'backtracking secant predicts no acceptable '
-                            'residual for this DIIS model')
-                        break
+                    return trial, damping, ''
             else:
                 last_reason = 'DIIS trial evaluation failed'
             damping *= self.config.diis_backtrack_factor
-        return None, 0.0, last_reason, best_rejected
+        return None, 0.0, last_reason
 
     def _diis_step(
             self, state: _GCState,
             history: list[_DIISItem], starting_damping: float = 1.0,
-            residual_target_rms: Optional[float] = None,
-            allow_restoration: bool = False,
-            best_residual_rms: Optional[float] = None,
             ) -> tuple[_LineSearchResult, float, float, str, float]:
         start_nfev = self.nfev
-        action_parts = []
-        model_repairs = 0
-        while True:
-            accepted_history = (
-                list(history)
-                if self.config.diis_preserve_accepted_history else None)
-            coefficients, condition, coefficient_l1, coefficient_action = (
-                self._diis_coefficients(history))
-            if coefficient_action:
-                action_parts.append(coefficient_action)
-            target = self._diis_target(history, coefficients)
-            max_backtracks = (
-                self.config.diis_model_max_backtracks
-                if len(history) > 1 else self.config.diis_max_backtracks)
-            trial, damping, rejection, rejected_state = self._try_diis_target(
-                state, target, starting_damping, max_backtracks,
-                residual_target_rms=residual_target_rms,
-                allow_restoration=allow_restoration,
-                best_residual_rms=best_residual_rms)
-            if accepted_history is not None:
-                model_history_size = len(history)
-                history[:] = accepted_history
-                if trial is not None:
-                    if len(accepted_history) != model_history_size:
-                        action_parts.append(
-                            'restored accepted DIIS history after temporary '
-                            'coefficient pruning')
-                    break
-                if model_history_size > 1:
-                    fallback_target = self.copy_blocks(history[-1].fock)
-                    (trial, damping, fallback_rejection,
-                     _) = self._try_diis_target(
-                         state, fallback_target, starting_damping,
-                         self.config.diis_max_backtracks,
-                         residual_target_rms=residual_target_rms,
-                         allow_restoration=allow_restoration,
-                         best_residual_rms=best_residual_rms)
-                    action_parts.append(
-                        'preserved accepted DIIS history; tried latest-Fock '
-                        'fallback after rejected model')
-                    if trial is not None:
-                        break
-                    rejection = fallback_rejection
-                break
-            if trial is not None:
-                break
-            if (rejected_state is not None and
-                    model_repairs <
-                    self.config.diis_max_trust_model_repairs):
-                self._append_diis_item(history, rejected_state)
-                model_repairs += 1
-                action_parts.append(
-                    'augmented DIIS model with rejected trust trial')
-                continue
-            if len(history) == 1:
-                break
-            del history[0]
-            action_parts.append(
-                'dropped oldest DIIS vector after rejected model')
-        action = '; '.join(dict.fromkeys(action_parts))
+        coefficients, condition, coefficient_l1, action = (
+            self._diis_coefficients(history))
+        target = self._diis_target(history, coefficients)
+        trial, damping, rejection = self._try_diis_target(
+            state, target, starting_damping)
         nfev = self.nfev - start_nfev
         if trial is None:
             message = 'residual-DIIS failed: ' + rejection
@@ -5045,8 +4901,6 @@ class GrandCanonicalKRKS:
         converged = False
         message = 'maximum cycles reached during residual-DIIS polishing'
         damping_hint = self.config.diis_initial_damping
-        best_residual_rms = state.residual_rms
-        restoration_pending = False
 
         for cycle in range(cycle_start, self.config.max_cycle):
             if state.residual_rms < self.config.conv_tol_residual_rms:
@@ -5055,29 +4909,13 @@ class GrandCanonicalKRKS:
                 break
             self._append_diis_item(diis_history, state)
             starting_damping = damping_hint
-            residual_target_rms = (
-                best_residual_rms *
-                (1.0 - self.config.diis_min_residual_reduction)
-                if restoration_pending else None)
             (step, condition, coefficient_l1, history_action,
              predicted_residual_rms) = self._diis_step(
-                 state, diis_history, starting_damping,
-                 residual_target_rms=residual_target_rms,
-                 allow_restoration=not restoration_pending,
-                 best_residual_rms=best_residual_rms)
+                 state, diis_history, starting_damping)
             if not step.success or step.state is None:
                 message = step.message
                 break
             new_state = step.state
-            used_restoration = new_state.residual_rms >= best_residual_rms
-            if used_restoration:
-                history_action = ((history_action + '; ')
-                                  if history_action else '') + (
-                    'accepted bounded nonmonotone restoration')
-                restoration_pending = True
-            else:
-                best_residual_rms = new_state.residual_rms
-                restoration_pending = False
             damping_hint, trust_ratio = self._next_diis_damping(
                 state, new_state, predicted_residual_rms, step.alpha,
                 starting_damping)

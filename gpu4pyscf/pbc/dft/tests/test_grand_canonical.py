@@ -833,6 +833,7 @@ def test_diis_trial_explicitly_disables_occupation_projection(monkeypatch):
     _, solver = _solver(
         line_search_nelec_guard_mode='fermi-response',
         line_search_nelec_trust_initial=1.0e-3)
+    solver.config.diis_max_backtracks = 0
     state = solver.evaluate([
         cp.asarray([[-0.3, 0.08 + 0.03j],
                     [0.08 - 0.03j, 0.2]])])
@@ -845,12 +846,10 @@ def test_diis_trial_explicitly_disables_occupation_projection(monkeypatch):
         return None
 
     monkeypatch.setattr(solver, '_trial', failed_trial)
-    trial, damping, reason, rejected = solver._try_diis_target(
-        state, target, max_backtracks=0)
+    trial, damping, reason = solver._try_diis_target(state, target)
 
     assert trial is None
     assert damping == 0.0
-    assert rejected is None
     assert reason == 'DIIS trial evaluation failed'
     assert projection_flags == [False]
 
@@ -1697,7 +1696,6 @@ def test_line_search_dispatch_can_disable_hz_residual_filter(monkeypatch):
 def test_residual_diis_configuration_and_pulay_coefficients():
     _, solver = _solver(diis_switch_residual_rms=1.0e-3)
     assert solver.config.diis_switch_residual_rms == 1.0e-3
-    assert not solver.config.diis_preserve_accepted_history
     with pytest.raises(ValueError, match='may not be smaller'):
         _solver(diis_switch_residual_rms=1.0e-8)
 
@@ -1712,6 +1710,36 @@ def test_residual_diis_configuration_and_pulay_coefficients():
     assert condition == pytest.approx(1.0)
     assert coefficient_l1 == pytest.approx(1.0)
     assert np.allclose(coefficients, [0.5, 0.5])
+
+
+def test_residual_diis_prunes_unsafe_condition_and_coefficients():
+    zero = [cp.zeros((2, 2), dtype=cp.complex128)]
+    duplicate = [cp.diag(cp.asarray([1.0, 0.0]))]
+    _, solver = _solver()
+    solver.config.diis_max_condition = 1.0e6
+    history = [
+        _DIISItem(zero, zero, duplicate),
+        _DIISItem(zero, zero, duplicate),
+    ]
+    _, condition, _, action = solver._diis_coefficients(history)
+    assert condition > solver.config.diis_max_condition
+    assert len(history) == 1
+    assert action == 'reset ill-conditioned DIIS history'
+
+    # These nearly parallel residuals have a tolerable Gram condition number,
+    # but their cancellation requires coefficients with a large L1 norm.
+    _, solver = _solver()
+    solver.config.diis_max_condition = 1.0e12
+    solver.config.diis_max_coefficient_l1 = 10.0
+    history = [
+        _DIISItem(zero, zero, [cp.diag(cp.asarray([1.0, 0.0]))]),
+        _DIISItem(
+            zero, zero, [cp.diag(cp.asarray([1.01, 0.01]))]),
+    ]
+    _, condition, _, action = solver._diis_coefficients(history)
+    assert condition < solver.config.diis_max_condition
+    assert len(history) == 1
+    assert action == 'reset ill-conditioned DIIS history'
 
 
 def test_residual_diis_trust_ratio_updates_next_damping():
@@ -1763,32 +1791,9 @@ def test_residual_diis_trust_ratio_updates_next_damping():
             config=config)
 
 
-def test_diis_backtracking_stops_when_local_secant_cannot_reduce_residual():
+def test_diis_backtracks_until_trial_reduces_residual():
     _, solver = _solver(diis_switch_residual_rms=1.0e-3)
-    state = solver.evaluate([
-        cp.asarray([[-0.3, 0.08 + 0.03j],
-                    [0.08 - 0.03j, 0.2]])])
-    target = solver.axpy(
-        0.1, [cp.eye(2, dtype=cp.complex128)], state.h_orth)
-    calls = []
-
-    def trial(current, direction, alpha, allow_nelec_projection=True):
-        assert not allow_nelec_projection
-        calls.append(alpha)
-        factor = 1.01 if len(calls) == 1 else 1.005
-        return replace(current, residual_rms=factor * current.residual_rms)
-
-    solver._trial = trial
-    accepted, _, reason, rejected = solver._try_diis_target(
-        state, target, starting_damping=0.1, max_backtracks=8)
-    assert accepted is None
-    assert len(calls) == 2
-    assert 'secant predicts no acceptable residual' in reason
-    assert rejected is not None
-
-
-def test_diis_secant_does_not_extrapolate_grossly_nonlinear_trials():
-    _, solver = _solver(diis_switch_residual_rms=1.0e-3)
+    solver.config.diis_max_backtracks = 8
     state = solver.evaluate([
         cp.asarray([[-0.3, 0.08 + 0.03j],
                     [0.08 - 0.03j, 0.2]])])
@@ -1804,195 +1809,12 @@ def test_diis_secant_does_not_extrapolate_grossly_nonlinear_trials():
             current, residual_rms=next(factors) * current.residual_rms)
 
     solver._trial = trial
-    accepted, damping, reason, _ = solver._try_diis_target(
-        state, target, starting_damping=0.1, max_backtracks=8)
+    accepted, damping, reason = solver._try_diis_target(
+        state, target, starting_damping=0.1)
     assert accepted is not None
     assert damping == pytest.approx(0.025)
     assert reason == ''
     assert calls == pytest.approx([0.1, 0.05, 0.025])
-
-
-def test_residual_diis_repairs_rejected_model_by_pruning_oldest_vector():
-    _, solver = _solver(diis_switch_residual_rms=1.0e-3)
-    state = solver.evaluate([
-        cp.asarray([[-0.3, 0.08 + 0.03j],
-                    [0.08 - 0.03j, 0.2]])])
-    zero = [cp.zeros((2, 2), dtype=cp.complex128)]
-    history = [
-        _DIISItem(zero, zero, [cp.diag(cp.asarray([1.0, 0.0]))]),
-        _DIISItem(zero, zero, [cp.diag(cp.asarray([0.0, 1.0]))]),
-        _DIISItem(zero, zero, [cp.asarray([[0.0, 1.0j], [-1.0j, 0.0]])]),
-    ]
-    calls = []
-
-    def try_model(unused_state, unused_target, starting_damping,
-                  max_backtracks, **unused_kwargs):
-        calls.append((starting_damping, max_backtracks))
-        if len(calls) == 1:
-            return None, 0.0, 'rejected test model', None
-        return replace(
-            state, residual_rms=0.5 * state.residual_rms), 0.25, '', None
-
-    solver._try_diis_target = try_model
-    step, _, _, action, _ = solver._diis_step(
-        state, history, starting_damping=0.5)
-    assert step.success
-    assert step.alpha == pytest.approx(0.25)
-    assert calls == [(0.5, 2), (0.5, 2)]
-    assert len(history) == 2
-    assert 'dropped oldest DIIS vector' in action
-
-
-def test_residual_diis_uses_rejected_trial_as_trust_interpolation_point():
-    _, solver = _solver(diis_switch_residual_rms=1.0e-3)
-    state = solver.evaluate([
-        cp.asarray([[-0.3, 0.08 + 0.03j],
-                    [0.08 - 0.03j, 0.2]])])
-    zero = [cp.zeros((2, 2), dtype=cp.complex128)]
-    history = [
-        _DIISItem(zero, zero, [cp.diag(cp.asarray([1.0, 0.0]))]),
-        _DIISItem(zero, zero, [cp.diag(cp.asarray([0.0, 1.0]))]),
-    ]
-    rejected = replace(state, residual_rms=1.1 * state.residual_rms)
-    accepted = replace(state, residual_rms=0.5 * state.residual_rms)
-    calls = []
-
-    def coefficients(items):
-        size = len(items)
-        return np.full(size, 1.0 / size), 1.0, 1.0, ''
-
-    def try_model(unused_state, unused_target, starting_damping,
-                  max_backtracks, **unused_kwargs):
-        calls.append((starting_damping, max_backtracks))
-        if len(calls) == 1:
-            return None, 0.0, 'rejected test model', rejected
-        return accepted, 0.25, '', None
-
-    solver._diis_coefficients = coefficients
-    solver._try_diis_target = try_model
-    step, _, _, action, _ = solver._diis_step(
-        state, history, starting_damping=0.5)
-    assert step.success
-    assert calls == [(0.5, 2), (0.5, 2)]
-    assert len(history) == 3
-    assert 'augmented DIIS model with rejected trust trial' in action
-
-
-def test_diis_preserves_accepted_history_after_temporary_pruning():
-    _, solver = _solver(diis_switch_residual_rms=1.0e-3)
-    solver.config.diis_preserve_accepted_history = True
-    state = solver.evaluate([
-        cp.asarray([[-0.3, 0.08 + 0.03j],
-                    [0.08 - 0.03j, 0.2]])])
-    zero = [cp.zeros((2, 2), dtype=cp.complex128)]
-    history = [
-        _DIISItem(zero, [cp.eye(2)], [cp.diag(cp.asarray([1.0, 0.0]))]),
-        _DIISItem(zero, [2.0 * cp.eye(2)],
-                  [cp.diag(cp.asarray([0.0, 1.0]))]),
-        _DIISItem(zero, [3.0 * cp.eye(2)],
-                  [cp.asarray([[0.0, 1.0j], [-1.0j, 0.0]])]),
-    ]
-    accepted_items = list(history)
-    accepted = replace(state, residual_rms=0.5 * state.residual_rms)
-
-    def coefficients(items):
-        del items[0]
-        return np.full(2, 0.5), 1.0, 1.0, 'temporary test pruning'
-
-    solver._diis_coefficients = coefficients
-    solver._try_diis_target = lambda *args, **kwargs: (
-        accepted, 0.25, '', None)
-    step, _, _, action, _ = solver._diis_step(
-        state, history, starting_damping=0.5)
-
-    assert step.success
-    assert len(history) == len(accepted_items)
-    assert all(actual is expected
-               for actual, expected in zip(history, accepted_items))
-    assert 'restored accepted DIIS history' in action
-
-
-def test_diis_preserved_history_uses_latest_fock_fallback():
-    _, solver = _solver(diis_switch_residual_rms=1.0e-3)
-    solver.config.diis_preserve_accepted_history = True
-    solver.config.diis_model_max_backtracks = 2
-    solver.config.diis_max_backtracks = 7
-    state = solver.evaluate([
-        cp.asarray([[-0.3, 0.08 + 0.03j],
-                    [0.08 - 0.03j, 0.2]])])
-    zero = [cp.zeros((2, 2), dtype=cp.complex128)]
-    history = [
-        _DIISItem(zero, [cp.eye(2)], [cp.diag(cp.asarray([1.0, 0.0]))]),
-        _DIISItem(zero, [3.0 * cp.eye(2)],
-                  [cp.diag(cp.asarray([0.0, 1.0]))]),
-    ]
-    accepted_items = list(history)
-    rejected = replace(state, residual_rms=1.1 * state.residual_rms)
-    accepted = replace(state, residual_rms=0.5 * state.residual_rms)
-    calls = []
-
-    solver._diis_coefficients = lambda items: (
-        np.full(len(items), 1.0 / len(items)), 1.0, 1.0, '')
-
-    def try_target(unused_state, target, starting_damping,
-                   max_backtracks, **unused_kwargs):
-        calls.append((solver.copy_blocks(target), starting_damping,
-                      max_backtracks))
-        if len(calls) == 1:
-            return None, 0.0, 'rejected test model', rejected
-        return accepted, 0.125, '', None
-
-    solver._try_diis_target = try_target
-    step, _, _, action, _ = solver._diis_step(
-        state, history, starting_damping=0.5)
-
-    assert step.success
-    assert step.state is accepted
-    assert step.alpha == pytest.approx(0.125)
-    assert [call[2] for call in calls] == [2, 7]
-    assert all(call[1] == pytest.approx(0.5) for call in calls)
-    assert float(cp.max(cp.abs(
-        calls[1][0][0] - accepted_items[-1].fock[0])).item()) < 1.0e-14
-    assert all(actual is expected
-               for actual, expected in zip(history, accepted_items))
-    assert rejected not in history
-    assert 'latest-Fock fallback' in action
-
-
-def test_residual_diis_allows_one_bounded_nonmonotone_restoration():
-    _, solver = _solver(diis_switch_residual_rms=1.0e-3)
-    solver.config.diis_max_restoration_residual_increase = 0.05
-    state = solver.evaluate([
-        cp.asarray([[-0.3, 0.08 + 0.03j],
-                    [0.08 - 0.03j, 0.2]])])
-    restoration = replace(
-        state, residual_rms=1.02 * state.residual_rms,
-        objective=state.objective - 1.0e-4)
-    acceptable, reason = solver._diis_trial_acceptable(
-        state, restoration, allow_restoration=True,
-        best_residual_rms=state.residual_rms)
-    assert acceptable
-    assert reason == ''
-
-    uphill = replace(restoration, objective=state.objective + 1.0e-8)
-    acceptable, reason = solver._diis_trial_acceptable(
-        state, uphill, allow_restoration=True,
-        best_residual_rms=state.residual_rms)
-    assert not acceptable
-    assert 'trust envelope' in reason
-
-    target = state.residual_rms * (
-        1.0 - solver.config.diis_min_residual_reduction)
-    not_recovered = replace(
-        restoration, residual_rms=0.9995 * state.residual_rms)
-    acceptable, _ = solver._diis_trial_acceptable(
-        restoration, not_recovered, residual_target_rms=target)
-    assert not acceptable
-    recovered = replace(
-        restoration, residual_rms=0.998 * state.residual_rms)
-    acceptable, _ = solver._diis_trial_acceptable(
-        restoration, recovered, residual_target_rms=target)
-    assert acceptable
 
 
 def test_residual_diis_accepts_noise_scale_objective_change_but_not_charge_jump():
