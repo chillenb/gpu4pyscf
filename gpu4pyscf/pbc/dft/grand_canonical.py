@@ -188,6 +188,17 @@ class GrandCanonicalConfig:
     # NLCG hand off to the occupation-projected strong-Wolfe L-BFGS path.
     lbfgs_switch_residual_rms: Optional[float] = None
     lbfgs_switch_line_search_method: str = 'strong-wolfe'
+    # Optional fixed-mu NLCG/Hager--Zhang prefix for automatic canonical
+    # continuation.  The prefix stops once the scalar-gauge-free canonical
+    # shape and the cheap one-Fock electron-number estimate are both ready.
+    canonical_continuation_precondition_residual_rms: Optional[float] = None
+    canonical_continuation_precondition_max_delta_nelec: float = 5.0e-2
+    canonical_continuation_precondition_min_fock_evaluations: int = 8
+    canonical_continuation_precondition_min_iterations: int = 3
+    canonical_continuation_precondition_confirmations: int = 1
+    canonical_continuation_precondition_max_fock_evaluations: int = 24
+    canonical_continuation_precondition_initial_delta_nelec: float = 2.0e-2
+    canonical_continuation_handoff_delta_mu: float = 2.0e-4
 
 
 @dataclass(frozen=True)
@@ -461,6 +472,15 @@ class GrandCanonicalResult:
     lbfgs_switch_cycle: int = -1
     lbfgs_switch_nfev: int = -1
     lbfgs_switch_actual_residual_rms: float = np.nan
+    canonical_precondition_iterations: int = 0
+    canonical_precondition_evaluations: int = 0
+    canonical_precondition_residual_rms: float = np.nan
+    canonical_precondition_canonical_residual_rms: float = np.nan
+    canonical_precondition_delta_nelec: float = np.nan
+    canonical_precondition_electron_number: float = np.nan
+    canonical_precondition_mu_proxy: float = np.nan
+    canonical_precondition_trigger: str = ''
+    canonical_continuation_mu_error_source: str = ''
 
 
 def _as_float(value: Any, name: str = 'value') -> float:
@@ -673,6 +693,16 @@ class GrandCanonicalKRKS:
         self.lbfgs_switch_cycle = -1
         self.lbfgs_switch_nfev = -1
         self.lbfgs_switch_actual_residual_rms = np.nan
+        self.canonical_precondition_iterations = 0
+        self.canonical_precondition_evaluations = 0
+        self.canonical_precondition_residual_rms = np.nan
+        self.canonical_precondition_canonical_residual_rms = np.nan
+        self.canonical_precondition_delta_nelec = np.nan
+        self.canonical_precondition_electron_number = np.nan
+        self.canonical_precondition_mu_proxy = np.nan
+        self.canonical_precondition_trigger = ''
+        self._canonical_precondition_streak = 0
+        self._canonical_precondition_last_nfev = -1
         self._nlcg_residual_previous_alpha: Optional[float] = None
         self._prepare_fixed_basis_data()
         bytes_per_pair = 2 * sum(
@@ -1126,6 +1156,7 @@ class GrandCanonicalKRKS:
             'canonical_continuation_bracketed_residual_tol',
             'canonical_continuation_handoff_delta_nelec',
             'canonical_continuation_unbracketed_handoff_delta_nelec',
+            'canonical_continuation_handoff_delta_mu',
             'canonical_continuation_initial_delta_nelec',
             'canonical_continuation_max_delta_nelec',
             'canonical_continuation_min_delta_nelec',
@@ -1164,6 +1195,75 @@ class GrandCanonicalKRKS:
         if self.config.canonical_continuation_final_damping > 1.0:
             raise ValueError(
                 'canonical_continuation_final_damping may not exceed 1')
+        switch = (
+            self.config.canonical_continuation_precondition_residual_rms)
+        if switch is not None:
+            switch = _as_float(
+                switch,
+                'canonical_continuation_precondition_residual_rms')
+            if switch <= 0.0:
+                raise ValueError(
+                    'canonical_continuation_precondition_residual_rms must '
+                    'be positive when enabled')
+            self.config.canonical_continuation_precondition_residual_rms = (
+                switch)
+            if not self.config.canonical_continuation:
+                raise ValueError(
+                    'canonical-continuation preconditioning requires '
+                    'canonical_continuation=True')
+            if self.fixed_electron_number:
+                raise ValueError(
+                    'canonical-continuation preconditioning is available '
+                    'only at fixed chemical potential')
+            if (self.config.optimizer != 'nlcg' or
+                    self.config.line_search_method != 'hager-zhang' or
+                    self.config.nlcg_nelec_projection_strategy !=
+                    'direction'):
+                raise ValueError(
+                    'canonical-continuation preconditioning requires NLCG, '
+                    'Hager-Zhang, and fixed-direction occupation projection')
+        for name in (
+                'canonical_continuation_precondition_max_delta_nelec',
+                'canonical_continuation_precondition_initial_delta_nelec'):
+            value = getattr(self.config, name)
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f'{name} must be finite and positive')
+        for name in (
+                'canonical_continuation_precondition_min_fock_evaluations',
+                'canonical_continuation_precondition_confirmations',
+                'canonical_continuation_precondition_max_fock_evaluations'):
+            value = getattr(self.config, name)
+            if (not isinstance(value, int) or isinstance(value, bool) or
+                    value < 1):
+                raise ValueError(f'{name} must be a positive integer')
+        minimum_iterations = (
+            self.config.canonical_continuation_precondition_min_iterations)
+        if (not isinstance(minimum_iterations, int) or
+                isinstance(minimum_iterations, bool) or
+                minimum_iterations < 0):
+            raise ValueError(
+                'canonical_continuation_precondition_min_iterations must '
+                'be a nonnegative integer')
+        if (self.config.
+                canonical_continuation_precondition_max_fock_evaluations <
+                self.config.
+                canonical_continuation_precondition_min_fock_evaluations):
+            raise ValueError(
+                'canonical_continuation_precondition_max_fock_evaluations '
+                'may not be smaller than the minimum')
+        if (self.config.
+                canonical_continuation_precondition_initial_delta_nelec >
+                self.config.canonical_continuation_max_delta_nelec):
+            raise ValueError(
+                'canonical_continuation_precondition_initial_delta_nelec '
+                'may not exceed canonical_continuation_max_delta_nelec')
+        if (self.config.
+                canonical_continuation_precondition_initial_delta_nelec <
+                self.config.canonical_continuation_min_delta_nelec):
+            raise ValueError(
+                'canonical_continuation_precondition_initial_delta_nelec '
+                'may not be smaller than '
+                'canonical_continuation_min_delta_nelec')
 
     def _prepare_fixed_basis_data(self) -> None:
         required = ('cell', 'kpts', 'get_ovlp', 'get_hcore', 'get_veff',
@@ -2075,6 +2175,107 @@ class GrandCanonicalKRKS:
     def _should_start_lbfgs(self, state: _GCState) -> bool:
         threshold = self.config.lbfgs_switch_residual_rms
         return threshold is not None and state.residual_rms <= threshold
+
+    def _canonical_precondition_enabled(self) -> bool:
+        return (
+            self.config.canonical_continuation and
+            not self.fixed_electron_number and
+            self.config.
+            canonical_continuation_precondition_residual_rms is not None)
+
+    def _canonical_precondition_metrics(
+            self, state: _GCState) -> tuple[float, float, float, float]:
+        """Return canonical-shape RMS, charge defect, gauge, and mu proxy."""
+        mismatch = self.hermitize_blocks([
+            h - f for h, f in zip(state.h_orth, state.fock_orth)])
+        gauge_shift = self.trace_mean(mismatch)
+        canonical_mismatch = [
+            value - gauge_shift * identity
+            for value, identity in zip(mismatch, self.identity)]
+        canonical_residual_rms = self.rms(canonical_mismatch)
+        self.ncheap_nelec_evaluations += 1
+        delta_nelec = (
+            self._electron_number_at_mu(state.fock_orth, self.mu) -
+            state.electron_number)
+        return (canonical_residual_rms, delta_nelec, gauge_shift,
+                self.mu - gauge_shift)
+
+    def _should_start_canonical_continuation(
+            self, state: _GCState, niter: int) -> bool:
+        if not self._canonical_precondition_enabled():
+            return False
+        if self._canonical_precondition_last_nfev == self.nfev:
+            return bool(self.canonical_precondition_trigger)
+        (canonical_residual_rms, delta_nelec, gauge_shift,
+         mu_proxy) = self._canonical_precondition_metrics(state)
+        self.canonical_precondition_residual_rms = state.residual_rms
+        self.canonical_precondition_canonical_residual_rms = (
+            canonical_residual_rms)
+        self.canonical_precondition_delta_nelec = delta_nelec
+        self.canonical_precondition_electron_number = state.electron_number
+        self.canonical_precondition_mu_proxy = mu_proxy
+        self._canonical_precondition_last_nfev = self.nfev
+
+        warmed_up = (
+            self.nfev >= self.config.
+            canonical_continuation_precondition_min_fock_evaluations and
+            niter >= self.config.
+            canonical_continuation_precondition_min_iterations)
+        eligible = (
+            warmed_up and
+            canonical_residual_rms <= self.config.
+            canonical_continuation_precondition_residual_rms and
+            abs(delta_nelec) <= self.config.
+            canonical_continuation_precondition_max_delta_nelec)
+        if eligible:
+            self._canonical_precondition_streak += 1
+        else:
+            self._canonical_precondition_streak = 0
+        if (self._canonical_precondition_streak >= self.config.
+                canonical_continuation_precondition_confirmations):
+            self.canonical_precondition_trigger = 'criteria-confirmed'
+        elif (self.nfev >= self.config.
+                canonical_continuation_precondition_max_fock_evaluations):
+            self.canonical_precondition_trigger = 'max-fock-budget'
+
+        self.log.info(
+            'Canonical precondition probe: Fock %d, accepted %d, full '
+            'residual %.6g, canonical residual %.6g, gauge %.6g, mu proxy '
+            '%.12g, delta N_FP %.6g, streak %d, trigger %s',
+            self.nfev, niter, state.residual_rms,
+            canonical_residual_rms, gauge_shift, mu_proxy, delta_nelec,
+            self._canonical_precondition_streak,
+            self.canonical_precondition_trigger or 'none')
+        return bool(self.canonical_precondition_trigger)
+
+    def _start_canonical_continuation_from_prefix(
+            self, state: _GCState, niter: int, *,
+            trigger: Optional[str] = None) -> GrandCanonicalResult:
+        """Hand an evaluated fixed-mu state to fixed-N continuation."""
+        if self._canonical_precondition_last_nfev != self.nfev:
+            (canonical_residual_rms, delta_nelec, _,
+             mu_proxy) = self._canonical_precondition_metrics(state)
+            self.canonical_precondition_residual_rms = state.residual_rms
+            self.canonical_precondition_canonical_residual_rms = (
+                canonical_residual_rms)
+            self.canonical_precondition_delta_nelec = delta_nelec
+            self.canonical_precondition_electron_number = (
+                state.electron_number)
+            self.canonical_precondition_mu_proxy = mu_proxy
+            self._canonical_precondition_last_nfev = self.nfev
+        if trigger is not None:
+            self.canonical_precondition_trigger = trigger
+        self.canonical_precondition_iterations = niter
+        self.canonical_precondition_evaluations = self.nfev
+        self.log.info(
+            'Fixed-mu electron-number estimate ready after %d accepted '
+            'steps and %d Fock evaluations (N = %.12g, trigger = %s); '
+            'starting canonical continuation',
+            niter, self.nfev, state.electron_number,
+            self.canonical_precondition_trigger)
+        return self._kernel_canonical_continuation(
+            seed_state=state, prefix_history=list(self.history),
+            prefix_niter=niter, prefix_nfev=self.nfev)
 
     def _append_diis_item(self, history: list[_DIISItem],
                           state: _GCState) -> None:
@@ -3095,7 +3296,8 @@ class GrandCanonicalKRKS:
             self, state: _GCState, direction: Sequence,
             alpha_init: Optional[float] = None,
             alpha_cap_override: Optional[float] = None,
-            nelec_limit_override: Optional[float] = None, *,
+            nelec_limit_override: Optional[float] = None,
+            max_evals_override: Optional[int] = None, *,
             residual_filter_enabled: bool = True
             ) -> _LineSearchResult:
         """Cached Hager--Zhang weak/approximate-Wolfe line search."""
@@ -3108,6 +3310,14 @@ class GrandCanonicalKRKS:
             self.config.nlcg_residual_filter_rms is not None and
             state.residual_rms <= self.config.nlcg_residual_filter_rms)
         maximum_evals = self.config.hager_zhang_max_evals
+        if max_evals_override is not None:
+            if (not isinstance(max_evals_override, int) or
+                    isinstance(max_evals_override, bool) or
+                    max_evals_override < 0):
+                raise ValueError(
+                    'Hager-Zhang max_evals_override must be a nonnegative '
+                    'integer or None')
+            maximum_evals = min(maximum_evals, max_evals_override)
         if (filter_active and
                 self.config.nlcg_residual_filter_max_evals is not None):
             maximum_evals = min(
@@ -3413,6 +3623,7 @@ class GrandCanonicalKRKS:
             allow_nelec_projection: bool = True,
             nelec_limit_override: Optional[float] = None,
             method_override: Optional[str] = None,
+            max_evals_override: Optional[int] = None,
             residual_filter_enabled: bool = True
             ) -> _LineSearchResult:
         method = (self.config.line_search_method
@@ -3423,7 +3634,11 @@ class GrandCanonicalKRKS:
                 state, direction, alpha_init=alpha_init,
                 alpha_cap_override=alpha_cap_override,
                 nelec_limit_override=nelec_limit_override,
+                max_evals_override=max_evals_override,
                 residual_filter_enabled=residual_filter_enabled)
+        if max_evals_override is not None:
+            raise ValueError(
+                'max_evals_override is supported only by Hager-Zhang')
 
         start_nfev = self.nfev
         cheap_start = self.ncheap_nelec_evaluations
@@ -3904,6 +4119,41 @@ class GrandCanonicalKRKS:
 
     # ---- fixed-mu canonical continuation --------------------------------
 
+    def _fixed_n_view(self, state: _GCState) -> _GCState:
+        """Reinterpret an evaluated fixed-mu state at its current fixed N."""
+        if not self.fixed_electron_number:
+            raise AssertionError('fixed-N state view requires fixed N')
+        if abs(state.electron_number - self.target_electron_number) > max(
+                self.config.mu_electron_number_tol, 1.0e-9):
+            raise ValueError(
+                'fixed-N state view target does not match the source state')
+        h = self.copy_blocks(state.h_orth)
+        fock = self.copy_blocks(state.fock_orth)
+        mismatch = self.hermitize_blocks([
+            hk - fk for hk, fk in zip(h, fock)])
+        gauge_shift = self.trace_mean(mismatch)
+        mismatch = [
+            value - gauge_shift * identity
+            for value, identity in zip(mismatch, self.identity)]
+        mismatch = self.hermitize_blocks(mismatch)
+        chemical_potential = state.auxiliary_mu - gauge_shift
+        gradient = self._exact_gradient(
+            h, fock, state.eigenvalues, state.u, state.occupations)
+        z = self.hermitize_blocks([0.5 * value for value in mismatch])
+        residual = self.scale_blocks(-1.0, z)
+        grand_potential = (
+            state.free_energy -
+            chemical_potential * state.electron_number)
+        return _GCState(
+            h, state.gamma, state.eigenvalues, state.u, state.occupations,
+            state.p_orth, state.dm_ao, state.veff, state.fock_ao, fock,
+            state.auxiliary_mu, chemical_potential, gauge_shift,
+            state.electronic_energy, state.nuclear_energy,
+            state.dft_total_energy, state.electron_number, state.entropy,
+            state.entropy_energy, state.free_energy, grand_potential,
+            state.free_energy, gradient, z, residual,
+            self.rms(gradient), self.rms(mismatch))
+
     def _reset_run_diagnostics(self) -> None:
         self.ncheap_nelec_reject = 0
         self._last_trial_rejected_by_nelec = False
@@ -3929,6 +4179,16 @@ class GrandCanonicalKRKS:
         self.lbfgs_switch_cycle = -1
         self.lbfgs_switch_nfev = -1
         self.lbfgs_switch_actual_residual_rms = np.nan
+        self.canonical_precondition_iterations = 0
+        self.canonical_precondition_evaluations = 0
+        self.canonical_precondition_residual_rms = np.nan
+        self.canonical_precondition_canonical_residual_rms = np.nan
+        self.canonical_precondition_delta_nelec = np.nan
+        self.canonical_precondition_electron_number = np.nan
+        self.canonical_precondition_mu_proxy = np.nan
+        self.canonical_precondition_trigger = ''
+        self._canonical_precondition_streak = 0
+        self._canonical_precondition_last_nfev = -1
 
     def _canonical_continuation_config(
             self, residual_tolerance: float,
@@ -3941,6 +4201,7 @@ class GrandCanonicalKRKS:
             checkpoint_interval=0,
             initial_electron_number=None,
             lbfgs_switch_residual_rms=None,
+            canonical_continuation_precondition_residual_rms=None,
             conv_tol_residual_rms=residual_tolerance,
             # Canonical continuation is a fixed-point globalization.  Enter
             # residual DIIS immediately instead of spending low-temperature
@@ -4053,29 +4314,59 @@ class GrandCanonicalKRKS:
             for record in records]
 
     def _kernel_canonical_continuation(
-            self, dm0: Any = None, h0: Any = None) -> GrandCanonicalResult:
+            self, dm0: Any = None, h0: Any = None, *,
+            seed_state: Optional[_GCState] = None,
+            prefix_history: Optional[Sequence[IterationRecord]] = None,
+            prefix_niter: int = 0,
+            prefix_nfev: int = 0) -> GrandCanonicalResult:
         """Globalize a fixed-mu solve through automatic fixed-N continuation."""
         if self.fixed_electron_number:
             raise AssertionError('canonical continuation requires fixed mu')
-
-        self.history = []
-        self.nfev = 0
-        self._reset_run_diagnostics()
-        h = self._initial_h(dm0, h0)
-        initialization_evaluations = self.nfev
-        current_nelec = self._electron_number_at_mu(h, self.mu)
+        if seed_state is None:
+            self.history = []
+            self.nfev = 0
+            self._reset_run_diagnostics()
+            h = self._initial_h(dm0, h0)
+            initialization_evaluations = self.nfev
+            current_nelec = self._electron_number_at_mu(h, self.mu)
+            prefix_records: list[IterationRecord] = []
+            prefix_niter = 0
+            prefix_nfev = 0
+        else:
+            if dm0 is not None or h0 is not None:
+                raise ValueError(
+                    'an evaluated canonical seed may not be combined with '
+                    'dm0 or h0')
+            if prefix_nfev != self.nfev:
+                raise ValueError(
+                    'canonical prefix Fock count does not match the solver')
+            h = self.copy_blocks(seed_state.h_orth)
+            current_nelec = seed_state.electron_number
+            initialization_evaluations = 0
+            prefix_records = [replace(
+                record,
+                restart_reason=(
+                    'fixed-mu canonical precondition' +
+                    (('; ' + record.restart_reason)
+                     if record.restart_reason else '')))
+                for record in (prefix_history or ())]
         samples: list[tuple[float, float]] = []
         state_samples: list[tuple[float, float, list]] = []
         continuation_history: list[IterationRecord] = []
         continuation_evaluations = 0
         continuation_iterations = 0
         best_error = np.inf
+        best_error_source = 'none'
         best_handoff_delta_nelec = np.inf
+        best_handoff_score = np.inf
         best_h = self.copy_blocks(h)
         outer_steps = 0
         interpolated_refinement_used = False
         next_is_interpolated_refinement = False
         outer_trust_radius = (
+            self.config.
+            canonical_continuation_precondition_initial_delta_nelec
+            if seed_state is not None else
             self.config.canonical_continuation_initial_delta_nelec)
 
         for outer in range(self.config.canonical_continuation_max_outer):
@@ -4098,13 +4389,23 @@ class GrandCanonicalKRKS:
                 config=self._canonical_continuation_config(
                     residual_tolerance, initial_damping),
                 electron_number=current_nelec)
-            canonical_result = canonical_solver.kernel(h0=h)
+            if outer == 0 and seed_state is not None:
+                canonical_solver.history = []
+                canonical_solver.nfev = 0
+                canonical_solver._reset_run_diagnostics()
+                canonical_state = canonical_solver._fixed_n_view(seed_state)
+                canonical_result = canonical_solver._kernel_diis(
+                    canonical_state, None, niter=0, cycle_start=0)
+            else:
+                canonical_result = canonical_solver.kernel(h0=h)
             outer_steps += 1
             stage_evaluation_offset = (
-                initialization_evaluations + continuation_evaluations)
+                prefix_nfev + initialization_evaluations +
+                continuation_evaluations)
             continuation_evaluations += canonical_result.nfev
             stage_history = self._continuation_history(
-                canonical_result.history, continuation_iterations,
+                canonical_result.history,
+                prefix_niter + continuation_iterations,
                 current_nelec, stage_evaluation_offset)
             continuation_history.extend(stage_history)
             continuation_iterations += canonical_result.niter
@@ -4113,8 +4414,9 @@ class GrandCanonicalKRKS:
             target_nelec = self._electron_number_at_mu(h, self.mu)
             handoff_delta_nelec = target_nelec - current_nelec
             samples.append((current_nelec, error))
-            state_samples.append(
-                (current_nelec, error, self.copy_blocks(h)))
+            if canonical_result.converged:
+                state_samples.append(
+                    (current_nelec, error, self.copy_blocks(h)))
             bracketed = (
                 any(value < 0.0 for _, value in samples) and
                 any(value > 0.0 for _, value in samples))
@@ -4126,9 +4428,19 @@ class GrandCanonicalKRKS:
                 canonical_result.residual_rms, handoff_delta_nelec,
                 canonical_result.nfev)
 
-            if abs(handoff_delta_nelec) < abs(best_handoff_delta_nelec):
+            handoff_score = max(
+                abs(handoff_delta_nelec) /
+                (self.config.canonical_continuation_handoff_delta_nelec
+                 if bracketed else
+                 self.config.
+                 canonical_continuation_unbracketed_handoff_delta_nelec),
+                abs(error) /
+                self.config.canonical_continuation_handoff_delta_mu)
+            if handoff_score < best_handoff_score:
+                best_handoff_score = handoff_score
                 best_handoff_delta_nelec = handoff_delta_nelec
                 best_error = error
+                best_error_source = 'evaluated'
                 best_h = self.copy_blocks(h)
 
             # A sign-changing pair of converged canonical Fock matrices also
@@ -4141,7 +4453,7 @@ class GrandCanonicalKRKS:
             interpolated_h = None
             interpolated_delta_nelec = np.inf
             interpolated_bracket_width = np.inf
-            if bracketed:
+            if bracketed and canonical_result.converged:
                 negative_states = [item for item in state_samples
                                    if item[1] < 0.0]
                 positive_states = [item for item in state_samples
@@ -4164,27 +4476,39 @@ class GrandCanonicalKRKS:
                         self._electron_number_at_mu(
                             interpolated_h, self.mu) -
                         interpolated_nelec)
-                    if (abs(interpolated_delta_nelec) <
-                            abs(best_handoff_delta_nelec)):
+                    # The secant construction has zero *model* mu error.  It
+                    # is retained as a candidate only when its independently
+                    # evaluated frozen-H charge defect is also safe.
+                    interpolated_score = (
+                        abs(interpolated_delta_nelec) /
+                        self.config.
+                        canonical_continuation_handoff_delta_nelec)
+                    if interpolated_score < best_handoff_score:
+                        best_handoff_score = interpolated_score
                         best_handoff_delta_nelec = interpolated_delta_nelec
                         best_error = 0.0
+                        best_error_source = 'secant-model'
                         best_h = self.copy_blocks(interpolated_h)
 
             # Continuation is a globalization device, not the final solver.
-            # Measure handoff safety by the frozen-H Fermi response rather
-            # than an absolute mu window: the same delta mu is benign in a
-            # gap but can move many electrons when sigma is small.  This
-            # projection is cheap and does not require knowing the final N.
+            # Require both a safe frozen-H Fermi response and a physically
+            # meaningful optimized chemical potential.  The charge test is
+            # essential at low temperature because the same delta mu is
+            # benign in a gap but can move many electrons near a crossing.
             unbracketed_handoff_limit = (
                 self.config.canonical_continuation_unbracketed_handoff_delta_nelec)
             handoff_limit = (
                 self.config.canonical_continuation_handoff_delta_nelec
                 if bracketed else unbracketed_handoff_limit)
-            if (canonical_result.converged and
+            mu_handoff_ready = (
+                abs(error) <=
+                self.config.canonical_continuation_handoff_delta_mu)
+            if (canonical_result.converged and mu_handoff_ready and
                     abs(handoff_delta_nelec) <= handoff_limit):
                 best_h = self.copy_blocks(h)
                 best_handoff_delta_nelec = handoff_delta_nelec
                 best_error = error
+                best_error_source = 'evaluated'
                 self.log.info(
                     'Canonical continuation reached the fixed-mu handoff '
                     'window (delta N = %.3g, delta mu = %.3g, bracketed = '
@@ -4209,12 +4533,14 @@ class GrandCanonicalKRKS:
                     continue
                 if not interpolated_refinement_used:
                     self.log.info(
-                        'Canonical continuation secant-interpolated handoff '
-                        '(delta N = %.3g); starting fixed-mu polish',
+                        'Canonical continuation secant-model handoff '
+                        '(model delta mu = 0, frozen delta N = %.3g); '
+                        'starting fixed-mu polish',
                         interpolated_delta_nelec)
                     best_h = self.copy_blocks(interpolated_h)
                     best_handoff_delta_nelec = interpolated_delta_nelec
                     best_error = 0.0
+                    best_error_source = 'secant-model'
                     break
                 # After a broad bracket required canonical refinement, keep
                 # solving the cheap scalar N root until an actual canonical
@@ -4248,8 +4574,21 @@ class GrandCanonicalKRKS:
 
         h = best_h
 
-        pre_evaluations = initialization_evaluations + continuation_evaluations
-        pre_iterations = continuation_iterations
+        pre_evaluations = (
+            prefix_nfev + initialization_evaluations +
+            continuation_evaluations)
+        pre_iterations = prefix_niter + continuation_iterations
+        precondition_diagnostics = {
+            'iterations': self.canonical_precondition_iterations,
+            'evaluations': self.canonical_precondition_evaluations,
+            'residual_rms': self.canonical_precondition_residual_rms,
+            'canonical_residual_rms': (
+                self.canonical_precondition_canonical_residual_rms),
+            'delta_nelec': self.canonical_precondition_delta_nelec,
+            'electron_number': self.canonical_precondition_electron_number,
+            'mu_proxy': self.canonical_precondition_mu_proxy,
+            'trigger': self.canonical_precondition_trigger,
+        }
         saved_initial_damping = self.config.diis_initial_damping
         saved_max_coefficient_l1 = self.config.diis_max_coefficient_l1
         self.config.diis_initial_damping = min(
@@ -4260,7 +4599,8 @@ class GrandCanonicalKRKS:
             self.config.canonical_continuation_diis_max_coefficient_l1)
         try:
             if self.config.optimizer == 'nlcg':
-                final_result = self._kernel_nlcg(h0=h)
+                final_result = self._kernel_nlcg(
+                    h0=h, allow_canonical_handoff=False)
             elif self.config.optimizer == 'lbfgs':
                 final_result = self._kernel_lbfgs(h0=h)
             else:  # pragma: no cover - validated during construction
@@ -4279,7 +4619,8 @@ class GrandCanonicalKRKS:
             restart_reason=(record.restart_reason.split('; ', 1)[1]
                             if '; ' in record.restart_reason else ''))
             for record in final_history]
-        combined_history = continuation_history + final_history
+        combined_history = (
+            prefix_records + continuation_history + final_history)
         total_evaluations = pre_evaluations + final_result.nfev
         total_iterations = pre_iterations + final_result.niter
         switch_cycle = final_result.lbfgs_switch_cycle
@@ -4291,12 +4632,63 @@ class GrandCanonicalKRKS:
         self.nfev = total_evaluations
         self.ncheap_nelec_reject = final_result.cheap_nelec_rejections
         self.history = combined_history
+        self.canonical_precondition_iterations = (
+            precondition_diagnostics['iterations'])
+        self.canonical_precondition_evaluations = (
+            precondition_diagnostics['evaluations'])
+        self.canonical_precondition_residual_rms = (
+            precondition_diagnostics['residual_rms'])
+        self.canonical_precondition_canonical_residual_rms = (
+            precondition_diagnostics['canonical_residual_rms'])
+        self.canonical_precondition_delta_nelec = (
+            precondition_diagnostics['delta_nelec'])
+        self.canonical_precondition_electron_number = (
+            precondition_diagnostics['electron_number'])
+        self.canonical_precondition_mu_proxy = (
+            precondition_diagnostics['mu_proxy'])
+        self.canonical_precondition_trigger = (
+            precondition_diagnostics['trigger'])
+        self.mf.canonical_precondition_iterations_gc = (
+            self.canonical_precondition_iterations)
+        self.mf.canonical_precondition_evaluations_gc = (
+            self.canonical_precondition_evaluations)
+        self.mf.canonical_precondition_residual_rms_gc = (
+            self.canonical_precondition_residual_rms)
+        self.mf.canonical_precondition_canonical_residual_rms_gc = (
+            self.canonical_precondition_canonical_residual_rms)
+        self.mf.canonical_precondition_delta_nelec_gc = (
+            self.canonical_precondition_delta_nelec)
+        self.mf.canonical_precondition_electron_number_gc = (
+            self.canonical_precondition_electron_number)
+        self.mf.canonical_precondition_mu_proxy_gc = (
+            self.canonical_precondition_mu_proxy)
+        self.mf.canonical_precondition_trigger_gc = (
+            self.canonical_precondition_trigger)
+        self.mf.canonical_continuation_mu_error_source_gc = (
+            best_error_source)
         self.mf.scf_summary.update({
             'canonical_continuation_steps': outer_steps,
             'canonical_continuation_evaluations': continuation_evaluations,
             'canonical_continuation_mu_error': best_error,
+            'canonical_continuation_mu_error_source': best_error_source,
             'canonical_continuation_delta_nelec': (
                 best_handoff_delta_nelec),
+            'canonical_precondition_iterations': (
+                self.canonical_precondition_iterations),
+            'canonical_precondition_evaluations': (
+                self.canonical_precondition_evaluations),
+            'canonical_precondition_residual_rms': (
+                self.canonical_precondition_residual_rms),
+            'canonical_precondition_canonical_residual_rms': (
+                self.canonical_precondition_canonical_residual_rms),
+            'canonical_precondition_delta_nelec': (
+                self.canonical_precondition_delta_nelec),
+            'canonical_precondition_electron_number': (
+                self.canonical_precondition_electron_number),
+            'canonical_precondition_mu_proxy': (
+                self.canonical_precondition_mu_proxy),
+            'canonical_precondition_trigger': (
+                self.canonical_precondition_trigger),
             'fock_evaluations_total': total_evaluations,
             'lbfgs_switch_cycle_gc': switch_cycle,
             'lbfgs_switch_nfev_gc': switch_nfev,
@@ -4318,15 +4710,33 @@ class GrandCanonicalKRKS:
             canonical_continuation_steps=outer_steps,
             canonical_continuation_evaluations=continuation_evaluations,
             canonical_continuation_mu_error=best_error,
+            canonical_continuation_mu_error_source=best_error_source,
             canonical_continuation_delta_nelec=best_handoff_delta_nelec,
             lbfgs_switch_cycle=switch_cycle,
             lbfgs_switch_nfev=switch_nfev,
+            canonical_precondition_iterations=(
+                self.canonical_precondition_iterations),
+            canonical_precondition_evaluations=(
+                self.canonical_precondition_evaluations),
+            canonical_precondition_residual_rms=(
+                self.canonical_precondition_residual_rms),
+            canonical_precondition_canonical_residual_rms=(
+                self.canonical_precondition_canonical_residual_rms),
+            canonical_precondition_delta_nelec=(
+                self.canonical_precondition_delta_nelec),
+            canonical_precondition_electron_number=(
+                self.canonical_precondition_electron_number),
+            canonical_precondition_mu_proxy=(
+                self.canonical_precondition_mu_proxy),
+            canonical_precondition_trigger=(
+                self.canonical_precondition_trigger),
         )
 
     def kernel(self, dm0: Any = None, h0: Any = None) -> GrandCanonicalResult:
         """Run the configured safeguarded direct minimizer."""
         if (self.config.canonical_continuation and
-                not self.fixed_electron_number):
+                not self.fixed_electron_number and
+                not self._canonical_precondition_enabled()):
             return self._kernel_canonical_continuation(dm0=dm0, h0=h0)
         if self.config.optimizer == 'nlcg':
             return self._kernel_nlcg(dm0=dm0, h0=h0)
@@ -4335,7 +4745,9 @@ class GrandCanonicalKRKS:
         raise AssertionError('validated optimizer is unreachable')
 
     def _kernel_nlcg(self, dm0: Any = None,
-                     h0: Any = None) -> GrandCanonicalResult:
+                     h0: Any = None, *,
+                     allow_canonical_handoff: bool = True
+                     ) -> GrandCanonicalResult:
         """Run safeguarded fixed-mu or fixed-electron nonlinear CG."""
         self.history = []
         self.nfev = 0
@@ -4350,22 +4762,32 @@ class GrandCanonicalKRKS:
         message = 'maximum cycles reached'
         converged = False
         niter = 0
+        canonical_prefix = (
+            allow_canonical_handoff and
+            self._canonical_precondition_enabled())
 
         for cycle in range(self.config.max_cycle):
+            if (canonical_prefix and
+                    self._should_start_canonical_continuation(state, niter)):
+                return self._start_canonical_continuation_from_prefix(
+                    state, niter)
             if self._meets_convergence(state, previous):
+                if canonical_prefix:
+                    return self._start_canonical_continuation_from_prefix(
+                        state, niter, trigger='fixed-mu-converged')
                 consecutive += 1
                 if previous is None or consecutive >= self.config.required_consecutive_conv:
                     converged, message = True, 'converged'
                     break
             else:
                 consecutive = 0
-            if self._should_start_diis(state):
+            if not canonical_prefix and self._should_start_diis(state):
                 self.log.info(
                     'Switching from NLCG to residual DIIS at |F-H|_rms = %.6g; '
                     'CG memory reset', state.residual_rms)
                 return self._kernel_diis(
                     state, previous, niter=niter, cycle_start=cycle)
-            if self._should_start_lbfgs(state):
+            if not canonical_prefix and self._should_start_lbfgs(state):
                 self.nlbfgs_switches += 1
                 self.lbfgs_switch_cycle = cycle
                 self.lbfgs_switch_nfev = self.nfev
@@ -4381,6 +4803,9 @@ class GrandCanonicalKRKS:
                     residual_filter_enabled=False)
             direction, restarted, restart_reason = self._ensure_descent(state, direction)
             if not self._is_descent(state, direction):
+                if canonical_prefix:
+                    return self._start_canonical_continuation_from_prefix(
+                        state, niter, trigger='loss-of-descent')
                 if state.grad_rms < self.config.conv_tol_grad_rms and state.residual_rms < self.config.conv_tol_residual_rms:
                     converged, message = True, 'stationary initial state'
                 else:
@@ -4389,6 +4814,9 @@ class GrandCanonicalKRKS:
             if self._alpha_cap(direction) < self.config.line_search_alpha_min:
                 direction, cap_reason = self._restart_direction(state)
                 if self._alpha_cap(direction) < self.config.line_search_alpha_min:
+                    if canonical_prefix:
+                        return self._start_canonical_continuation_from_prefix(
+                            state, niter, trigger='step-cap-failure')
                     message = 'stagnation: step cap below minimum'
                     break
                 restarted, restart_reason = True, 'step cap restart; ' + cap_reason
@@ -4408,6 +4836,10 @@ class GrandCanonicalKRKS:
                     prepare_reason + '; ' + failed_preparation + '; ' +
                     prepared.message)
             if not prepared.success:
+                if canonical_prefix:
+                    return self._start_canonical_continuation_from_prefix(
+                        state, niter,
+                        trigger='direction-preparation-failure')
                 message = 'direction preparation failure: ' + prepared.message
                 break
             direction = prepared.direction
@@ -4417,12 +4849,28 @@ class GrandCanonicalKRKS:
                 np.isfinite(prepared.trust_radius) else None)
             dphi0 = self.inner(state.gradient, direction)
             alpha_init = self._nlcg_residual_alpha_init(state)
+            prefix_remaining_evaluations = None
+            if canonical_prefix:
+                prefix_remaining_evaluations = max(
+                    0,
+                    self.config.
+                    canonical_continuation_precondition_max_fock_evaluations -
+                    self.nfev)
             line_search = self._line_search(
                 state, direction,
                 alpha_init=alpha_init,
                 alpha_cap_override=prepared.alpha_cap,
                 allow_nelec_projection=not fixed_direction_projection,
-                nelec_limit_override=nelec_limit)
+                nelec_limit_override=nelec_limit,
+                max_evals_override=prefix_remaining_evaluations)
+            if not line_search.success and canonical_prefix:
+                trigger = (
+                    'max-fock-budget'
+                    if self.nfev >= self.config.
+                    canonical_continuation_precondition_max_fock_evaluations
+                    else 'line-search-failure')
+                return self._start_canonical_continuation_from_prefix(
+                    state, niter, trigger=trigger)
             if not line_search.success:
                 primary_line_search = line_search
                 direction, fallback_reason = self._restart_direction(state)
@@ -4509,6 +4957,9 @@ class GrandCanonicalKRKS:
                 restart_reason = descent_reason
         else:
             # The loop did not break; evaluate the just-accepted final state.
+            if canonical_prefix:
+                return self._start_canonical_continuation_from_prefix(
+                    state, niter, trigger='maximum-cycles')
             if self._meets_convergence(state, previous):
                 consecutive += 1
                 if consecutive >= self.config.required_consecutive_conv:
@@ -4781,6 +5232,22 @@ class GrandCanonicalKRKS:
         self.mf.lbfgs_switch_nfev_gc = self.lbfgs_switch_nfev
         self.mf.lbfgs_switch_residual_rms_gc = (
             self.lbfgs_switch_actual_residual_rms)
+        self.mf.canonical_precondition_iterations_gc = (
+            self.canonical_precondition_iterations)
+        self.mf.canonical_precondition_evaluations_gc = (
+            self.canonical_precondition_evaluations)
+        self.mf.canonical_precondition_residual_rms_gc = (
+            self.canonical_precondition_residual_rms)
+        self.mf.canonical_precondition_canonical_residual_rms_gc = (
+            self.canonical_precondition_canonical_residual_rms)
+        self.mf.canonical_precondition_delta_nelec_gc = (
+            self.canonical_precondition_delta_nelec)
+        self.mf.canonical_precondition_electron_number_gc = (
+            self.canonical_precondition_electron_number)
+        self.mf.canonical_precondition_mu_proxy_gc = (
+            self.canonical_precondition_mu_proxy)
+        self.mf.canonical_precondition_trigger_gc = (
+            self.canonical_precondition_trigger)
         self.mf.fixed_electron_number = self.fixed_electron_number
         self.mf.target_electron_number = self.target_electron_number
         self.mf.h_aux_gc = self.copy_blocks(state.h_orth)
@@ -4830,6 +5297,22 @@ class GrandCanonicalKRKS:
             'lbfgs_switch_nfev_gc': self.lbfgs_switch_nfev,
             'lbfgs_switch_residual_rms_gc': (
                 self.lbfgs_switch_actual_residual_rms),
+            'canonical_precondition_iterations': (
+                self.canonical_precondition_iterations),
+            'canonical_precondition_evaluations': (
+                self.canonical_precondition_evaluations),
+            'canonical_precondition_residual_rms': (
+                self.canonical_precondition_residual_rms),
+            'canonical_precondition_canonical_residual_rms': (
+                self.canonical_precondition_canonical_residual_rms),
+            'canonical_precondition_delta_nelec': (
+                self.canonical_precondition_delta_nelec),
+            'canonical_precondition_electron_number': (
+                self.canonical_precondition_electron_number),
+            'canonical_precondition_mu_proxy': (
+                self.canonical_precondition_mu_proxy),
+            'canonical_precondition_trigger': (
+                self.canonical_precondition_trigger),
             'fixed_electron_number': self.fixed_electron_number,
         })
         return GrandCanonicalResult(
@@ -4873,4 +5356,20 @@ class GrandCanonicalKRKS:
             lbfgs_switch_cycle=self.lbfgs_switch_cycle,
             lbfgs_switch_nfev=self.lbfgs_switch_nfev,
             lbfgs_switch_actual_residual_rms=(
-                self.lbfgs_switch_actual_residual_rms))
+                self.lbfgs_switch_actual_residual_rms),
+            canonical_precondition_iterations=(
+                self.canonical_precondition_iterations),
+            canonical_precondition_evaluations=(
+                self.canonical_precondition_evaluations),
+            canonical_precondition_residual_rms=(
+                self.canonical_precondition_residual_rms),
+            canonical_precondition_canonical_residual_rms=(
+                self.canonical_precondition_canonical_residual_rms),
+            canonical_precondition_delta_nelec=(
+                self.canonical_precondition_delta_nelec),
+            canonical_precondition_electron_number=(
+                self.canonical_precondition_electron_number),
+            canonical_precondition_mu_proxy=(
+                self.canonical_precondition_mu_proxy),
+            canonical_precondition_trigger=(
+                self.canonical_precondition_trigger))
