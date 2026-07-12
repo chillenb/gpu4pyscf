@@ -34,6 +34,167 @@ __all__ = [
 
 
 @dataclass
+class _BrentRoot:
+    """Stateful safeguarded Brent--Dekker scalar root iteration.
+
+    ``a`` and ``b`` always bracket a root and ``b`` is the endpoint with the
+    smaller residual magnitude.  A proposal must be evaluated and supplied to
+    :meth:`update` before another proposal is requested.  Keeping this state
+    outside the fixed-N solver is important: each scalar function evaluation
+    is itself a fully converged electronic-structure calculation.
+    """
+
+    a: float
+    fa: float
+    b: float
+    fb: float
+    xtol: float
+    c: float
+    fc: float
+    d: float
+    mflag: bool = True
+    pending: Optional[float] = None
+    last_method: str = 'initial-bracket'
+    interpolation_steps: int = 0
+    bisection_steps: int = 0
+
+    @classmethod
+    def from_bracket(
+            cls, x0: float, f0: float, x1: float, f1: float,
+            xtol: float) -> '_BrentRoot':
+        values = (x0, f0, x1, f1, xtol)
+        if not all(np.isfinite(value) for value in values):
+            raise ValueError('Brent bracket values and tolerance must be finite')
+        if xtol <= 0.0:
+            raise ValueError('Brent x tolerance must be positive')
+        if x0 == x1:
+            raise ValueError('Brent bracket endpoints must be distinct')
+        if f0 == 0.0 or f1 == 0.0 or np.signbit(f0) == np.signbit(f1):
+            raise ValueError('Brent bracket must have strictly opposite signs')
+        a, fa, b, fb = float(x0), float(f0), float(x1), float(f1)
+        if abs(fa) < abs(fb):
+            a, b = b, a
+            fa, fb = fb, fa
+        return cls(
+            a=a, fa=fa, b=b, fb=fb, xtol=float(xtol),
+            c=a, fc=fa, d=a)
+
+    @property
+    def bracket(self) -> tuple[float, float]:
+        return tuple(sorted((self.a, self.b)))
+
+    @property
+    def width(self) -> float:
+        return abs(self.b - self.a)
+
+    @property
+    def converged(self) -> bool:
+        """Whether the root or its representable x interval is resolved."""
+        lo, hi = self.bracket
+        return (
+            self.fb == 0.0 or self.width <= self.xtol or
+            not lo < np.nextafter(lo, hi) < hi)
+
+    def proposal(self) -> float:
+        """Return the next inverse-quadratic/secant or bisection proposal."""
+        if self.pending is not None:
+            raise RuntimeError('the pending Brent proposal has not been updated')
+        if self.converged:
+            raise RuntimeError('the Brent root interval has converged')
+
+        use_iqi = (
+            self.fa != self.fc and self.fb != self.fc and
+            self.fa != self.fb)
+        if use_iqi:
+            s = (
+                self.a * self.fb * self.fc /
+                ((self.fa - self.fb) * (self.fa - self.fc)) +
+                self.b * self.fa * self.fc /
+                ((self.fb - self.fa) * (self.fb - self.fc)) +
+                self.c * self.fa * self.fb /
+                ((self.fc - self.fa) * (self.fc - self.fb)))
+            method = 'inverse-quadratic'
+        else:
+            denominator = self.fb - self.fa
+            s = (self.b - self.fb * (self.b - self.a) / denominator
+                 if denominator != 0.0 else np.nan)
+            method = 'secant'
+
+        # Brent's acceptance tests reject interpolation that is outside the
+        # protected part of the bracket or is not contracting quickly enough.
+        protected = 0.75 * self.a + 0.25 * self.b
+        protected_lo, protected_hi = sorted((protected, self.b))
+        reject = (
+            not np.isfinite(s) or
+            not (protected_lo < s < protected_hi) or
+            (self.mflag and
+             abs(s - self.b) >= 0.5 * abs(self.b - self.c)) or
+            (not self.mflag and
+             abs(s - self.b) >= 0.5 * abs(self.c - self.d)) or
+            (self.mflag and abs(self.b - self.c) < self.xtol) or
+            (not self.mflag and abs(self.c - self.d) < self.xtol))
+        if reject:
+            s = self.a + 0.5 * (self.b - self.a)
+            self.mflag = True
+            method = 'bisection'
+        else:
+            self.mflag = False
+
+        # Roundoff must not turn a valid interpolation into an endpoint
+        # reevaluation.  Enforce the usual minimum move toward the opposite
+        # endpoint; ``converged`` handles intervals too narrow to resolve.
+        lo, hi = self.bracket
+        minimum_step = min(self.xtol, 0.5 * (hi - lo))
+        if abs(s - self.b) < minimum_step:
+            s = self.b + np.copysign(minimum_step, self.a - self.b)
+            self.mflag = True
+            method = 'bisection'
+        if not (lo < s < hi):
+            s = lo + 0.5 * (hi - lo)
+            self.mflag = True
+            method = 'bisection'
+        if not (lo < s < hi):  # pragma: no cover - guarded by converged
+            raise RuntimeError('no representable point inside Brent bracket')
+        if method == 'bisection':
+            self.bisection_steps += 1
+        else:
+            self.interpolation_steps += 1
+        self.pending = float(s)
+        self.last_method = method
+        return self.pending
+
+    def update(self, x: float, fx: float) -> None:
+        """Update the sign-changing bracket with an evaluated proposal."""
+        if self.pending is None:
+            raise RuntimeError('Brent update requires a pending proposal')
+        scale = max(1.0, abs(self.pending), abs(x))
+        if abs(x - self.pending) > 32.0 * np.finfo(float).eps * scale:
+            raise ValueError('Brent update does not match its pending proposal')
+        if not np.isfinite(fx):
+            raise ValueError('Brent function value must be finite')
+        lo, hi = self.bracket
+        x_value = self.pending
+        if not lo < x_value < hi:
+            raise ValueError('Brent update must lie strictly inside its bracket')
+
+        old_b, old_fb = self.b, self.fb
+        self.d = self.c
+        self.c = old_b
+        self.fc = old_fb
+        if fx == 0.0:
+            self.a, self.fa = old_b, old_fb
+            self.b, self.fb = x_value, 0.0
+        elif np.signbit(self.fa) != np.signbit(fx):
+            self.b, self.fb = x_value, float(fx)
+        else:
+            self.a, self.fa = x_value, float(fx)
+        if abs(self.fa) < abs(self.fb):
+            self.a, self.b = self.b, self.a
+            self.fa, self.fb = self.fb, self.fa
+        self.pending = None
+
+
+@dataclass
 class GrandCanonicalConfig:
     max_cycle: int = 100
     conv_tol_omega: float = 1.0e-8
@@ -92,14 +253,16 @@ class GrandCanonicalConfig:
     diis_max_restoration_residual_increase: float = 0.0
 
     # Optional fixed-mu globalization through canonical continuation.  Each
-    # inner solve fixes N; the outer scalar iteration approaches the requested
-    # mu until the frozen-H charge response is safe for a fixed-mu polish.
+    # inner solve fixes N; the outer scalar Brent iteration zeros the optimized
+    # chemical-potential error before a one-Fock fixed-mu verification.
+    # Iterative fixed-mu polishing remains available as an opt-in compatibility
+    # mode.
     canonical_continuation: bool = False
     canonical_continuation_max_outer: int = 16
     canonical_continuation_coarse_residual_tol: float = 4.0e-6
-    canonical_continuation_bracketed_residual_tol: float = 1.0e-7
-    canonical_continuation_handoff_delta_nelec: float = 5.0e-2
-    canonical_continuation_unbracketed_handoff_delta_nelec: float = 1.0e-3
+    canonical_continuation_bracketed_residual_tol: float = 1.0e-8
+    canonical_continuation_handoff_delta_nelec: float = 2.0e-5
+    canonical_continuation_unbracketed_handoff_delta_nelec: float = 2.0e-5
     canonical_continuation_initial_delta_nelec: float = 3.0e-2
     canonical_continuation_max_delta_nelec: float = 1.0
     canonical_continuation_min_delta_nelec: float = 1.0e-5
@@ -198,7 +361,11 @@ class GrandCanonicalConfig:
     canonical_continuation_precondition_confirmations: int = 1
     canonical_continuation_precondition_max_fock_evaluations: int = 24
     canonical_continuation_precondition_initial_delta_nelec: float = 2.0e-2
-    canonical_continuation_handoff_delta_mu: float = 2.0e-4
+    canonical_continuation_handoff_delta_mu: float = 1.0e-6
+    canonical_continuation_final_polish: bool = False
+    canonical_continuation_verification_residual_tol: float = 1.0e-6
+    canonical_continuation_verification_density_tol: float = 1.0e-9
+    canonical_continuation_root_nelec_tol: float = 1.0e-8
 
 
 @dataclass(frozen=True)
@@ -481,6 +648,14 @@ class GrandCanonicalResult:
     canonical_precondition_mu_proxy: float = np.nan
     canonical_precondition_trigger: str = ''
     canonical_continuation_mu_error_source: str = ''
+    canonical_verification_attempts: int = 0
+    canonical_verification_evaluations: int = 0
+    canonical_verification_failures: int = 0
+    canonical_verification_residual_rms: float = np.nan
+    canonical_verification_grad_rms: float = np.nan
+    canonical_verification_delta_nelec: float = np.nan
+    canonical_verification_density_rms: float = np.nan
+    canonical_terminal_mode: str = ''
 
 
 def _as_float(value: Any, name: str = 'value') -> float:
@@ -701,6 +876,14 @@ class GrandCanonicalKRKS:
         self.canonical_precondition_electron_number = np.nan
         self.canonical_precondition_mu_proxy = np.nan
         self.canonical_precondition_trigger = ''
+        self.canonical_verification_attempts = 0
+        self.canonical_verification_evaluations = 0
+        self.canonical_verification_failures = 0
+        self.canonical_verification_residual_rms = np.nan
+        self.canonical_verification_grad_rms = np.nan
+        self.canonical_verification_delta_nelec = np.nan
+        self.canonical_verification_density_rms = np.nan
+        self.canonical_terminal_mode = ''
         self._canonical_precondition_streak = 0
         self._canonical_precondition_last_nfev = -1
         self._nlcg_residual_previous_alpha: Optional[float] = None
@@ -1164,6 +1347,9 @@ class GrandCanonicalKRKS:
             'canonical_continuation_final_damping',
             'canonical_continuation_diis_max_coefficient_l1',
             'canonical_continuation_interpolation_refine_width',
+            'canonical_continuation_verification_residual_tol',
+            'canonical_continuation_verification_density_tol',
+            'canonical_continuation_root_nelec_tol',
         )
         for name in positive:
             value = getattr(self.config, name)
@@ -1195,6 +1381,10 @@ class GrandCanonicalKRKS:
         if self.config.canonical_continuation_final_damping > 1.0:
             raise ValueError(
                 'canonical_continuation_final_damping may not exceed 1')
+        if not isinstance(
+                self.config.canonical_continuation_final_polish, bool):
+            raise TypeError(
+                'canonical_continuation_final_polish must be boolean')
         switch = (
             self.config.canonical_continuation_precondition_residual_rms)
         if switch is not None:
@@ -1762,11 +1952,12 @@ class GrandCanonicalKRKS:
                 h, self.config.initial_electron_number)
         return h
 
-    def _checkpoint(self, state: _GCState, cycle: int) -> None:
+    def _checkpoint(self, state: _GCState, cycle: int, *,
+                    force: bool = False) -> None:
         filename = self.config.checkpoint_path
         if not filename or self.config.checkpoint_interval <= 0:
             return
-        if cycle % self.config.checkpoint_interval:
+        if not force and cycle % self.config.checkpoint_interval:
             return
         values = {f'h_{k}': h.get() for k, h in enumerate(state.h_orth)}
         values.update({
@@ -4119,6 +4310,35 @@ class GrandCanonicalKRKS:
 
     # ---- fixed-mu canonical continuation --------------------------------
 
+    def _canonical_fixed_mu_candidate(
+            self, result: GrandCanonicalResult
+            ) -> tuple[list, float, float, float]:
+        """Return the density-preserving fixed-mu H and physical defects.
+
+        A fixed-N auxiliary Hamiltonian has an arbitrary scalar gauge.  Its
+        optimized chemical potential is physical, while its Fock matrix is
+        already vacuum aligned.  Removing the H-F gauge and shifting from the
+        optimized to the requested chemical potential preserves H-mu, hence
+        every occupation and the density, exactly.
+        """
+        if self.fixed_electron_number:
+            raise AssertionError(
+                'a fixed-mu candidate requires a fixed-mu parent solver')
+        mismatch = self.hermitize_blocks([
+            h - f for h, f in zip(result.h_orth, result.fock_orth)])
+        gauge_shift = self.trace_mean(mismatch)
+        scalar_shift = self.mu - result.mu - gauge_shift
+        h_fixed_mu = self._sanitize_h([
+            h + scalar_shift * identity
+            for h, identity in zip(result.h_orth, self.identity)])
+        predicted_mismatch = self.hermitize_blocks([
+            h - f for h, f in zip(h_fixed_mu, result.fock_orth)])
+        delta_nelec = (
+            self._electron_number_at_mu(result.fock_orth, self.mu) -
+            result.electron_number)
+        return (h_fixed_mu, gauge_shift, delta_nelec,
+                self.rms(predicted_mismatch))
+
     def _fixed_n_view(self, state: _GCState) -> _GCState:
         """Reinterpret an evaluated fixed-mu state at its current fixed N."""
         if not self.fixed_electron_number:
@@ -4187,6 +4407,14 @@ class GrandCanonicalKRKS:
         self.canonical_precondition_electron_number = np.nan
         self.canonical_precondition_mu_proxy = np.nan
         self.canonical_precondition_trigger = ''
+        self.canonical_verification_attempts = 0
+        self.canonical_verification_evaluations = 0
+        self.canonical_verification_failures = 0
+        self.canonical_verification_residual_rms = np.nan
+        self.canonical_verification_grad_rms = np.nan
+        self.canonical_verification_delta_nelec = np.nan
+        self.canonical_verification_density_rms = np.nan
+        self.canonical_terminal_mode = ''
         self._canonical_precondition_streak = 0
         self._canonical_precondition_last_nfev = -1
 
@@ -4216,77 +4444,37 @@ class GrandCanonicalKRKS:
 
     def _canonical_continuation_proposal(
             self, samples: Sequence[tuple[float, float]],
-            h_orth: Sequence, current_nelec: float,
+            physical_fock: Sequence, current_nelec: float,
             maximum_step: float) -> float:
-        """Propose N using a bracketed secant or a free Fermi projection."""
-        negative = [(n, error) for n, error in samples if error < 0.0]
-        positive = [(n, error) for n, error in samples if error > 0.0]
+        """Propose N before a chemical-potential root has been bracketed."""
         minimum_step = self.config.canonical_continuation_min_delta_nelec
-
         proposal = None
-        bracket = None
+        negative = any(error < 0.0 for _, error in samples)
+        positive = any(error > 0.0 for _, error in samples)
         if negative and positive:
-            lower = max(negative, key=lambda item: item[0])
-            upper = min(positive, key=lambda item: item[0])
-            if lower[0] > upper[0]:
-                lower = min(negative, key=lambda item: abs(item[1]))
-                upper = min(positive, key=lambda item: abs(item[1]))
-            lo, hi = sorted((lower[0], upper[0]))
-            bracket = (lo, hi)
+            raise ValueError(
+                'a bracketed canonical root must use Brent--Dekker')
 
-            # Once a global sign-changing bracket exists, prefer the two most
-            # recent distinct points if their local dmu/dN is positive and
-            # their secant remains inside that bracket.  This keeps the
-            # superlinear local convergence of a secant without giving up the
-            # global safeguard.
-            current_n, current_error = samples[-1]
-            previous = next(
-                ((n, error) for n, error in reversed(samples[:-1])
-                 if abs(n - current_n) >= minimum_step), None)
-            if previous is not None:
-                slope = ((current_error - previous[1]) /
-                         (current_n - previous[0]))
-                if np.isfinite(slope) and slope > 0.0:
-                    local = current_n - current_error / slope
-                    if (np.isfinite(local) and
-                            lo + minimum_step <= local <= hi - minimum_step):
-                        proposal = local
-
-        if proposal is None and bracket is not None:
-            denominator = upper[1] - lower[1]
-            if denominator != 0.0:
-                proposal = (lower[0] - lower[1] *
-                            (upper[0] - lower[0]) / denominator)
-            else:
-                proposal = 0.5 * (lower[0] + upper[0])
-            lo, hi = bracket
-            if hi - lo > 2.0 * minimum_step:
-                proposal = min(hi - minimum_step,
-                               max(lo + minimum_step, proposal))
-            else:
-                proposal = 0.5 * (lo + hi)
-        elif proposal is None:
-            # Before a bracket exists, use the measured screened dmu/dN once
-            # two canonical states are available.  The frozen-H Fermi
-            # projection is useful for the first move but can be extremely
-            # aggressive at low temperature; a positive local secant avoids
-            # geometrically growing past a distant target mu.
-            current_n, current_error = samples[-1]
-            previous = next(
-                ((n, error) for n, error in reversed(samples[:-1])
-                 if abs(n - current_n) >= minimum_step), None)
-            if previous is not None:
-                slope = ((current_error - previous[1]) /
-                         (current_n - previous[0]))
-                if np.isfinite(slope) and slope > 0.0:
-                    local = current_n - current_error / slope
-                    if np.isfinite(local):
-                        proposal = local
-            if proposal is None:
-                proposal = self._electron_number_at_mu(h_orth, self.mu)
-            if abs(proposal - current_nelec) < minimum_step:
-                error = samples[-1][1]
-                proposal = current_nelec - np.sign(error) * minimum_step
+        # Use the measured screened dmu/dN once two canonical states are
+        # available.  The vacuum-aligned Fock projection is useful for the
+        # first move but can be extremely aggressive at low temperature; a
+        # positive local secant avoids geometrically growing past the root.
+        current_n, current_error = samples[-1]
+        previous = next(
+            ((n, error) for n, error in reversed(samples[:-1])
+             if abs(n - current_n) >= minimum_step), None)
+        if previous is not None:
+            slope = ((current_error - previous[1]) /
+                     (current_n - previous[0]))
+            if np.isfinite(slope) and slope > 0.0:
+                local = current_n - current_error / slope
+                if np.isfinite(local):
+                    proposal = local
+        if proposal is None:
+            proposal = self._electron_number_at_mu(physical_fock, self.mu)
+        if abs(proposal - current_nelec) < minimum_step:
+            proposal = (
+                current_nelec - np.sign(current_error or 1.0) * minimum_step)
 
         delta = min(maximum_step,
                     max(-maximum_step, proposal - current_nelec))
@@ -4296,6 +4484,21 @@ class GrandCanonicalKRKS:
         margin = min(minimum_step, 0.25 * capacity)
         return min(capacity - margin,
                    max(margin, current_nelec + delta))
+
+    def _canonical_brent_from_samples(
+            self, samples: Sequence[tuple[float, float]]) -> Optional[_BrentRoot]:
+        """Build Brent state from the narrowest evaluated sign bracket."""
+        negative = [(n, error) for n, error in samples if error < 0.0]
+        positive = [(n, error) for n, error in samples if error > 0.0]
+        if not negative or not positive:
+            return None
+        left, right = min(
+            ((negative_item, positive_item)
+             for negative_item in negative for positive_item in positive),
+            key=lambda pair: abs(pair[0][0] - pair[1][0]))
+        return _BrentRoot.from_bracket(
+            left[0], left[1], right[0], right[1],
+            self.config.canonical_continuation_root_nelec_tol)
 
     @staticmethod
     def _continuation_history(
@@ -4351,7 +4554,9 @@ class GrandCanonicalKRKS:
                      if record.restart_reason else '')))
                 for record in (prefix_history or ())]
         samples: list[tuple[float, float]] = []
-        state_samples: list[tuple[float, float, list]] = []
+        sample_residuals: list[float] = []
+        sample_focks: list[list] = []
+        brent_root: Optional[_BrentRoot] = None
         continuation_history: list[IterationRecord] = []
         continuation_evaluations = 0
         continuation_iterations = 0
@@ -4360,9 +4565,23 @@ class GrandCanonicalKRKS:
         best_handoff_delta_nelec = np.inf
         best_handoff_score = np.inf
         best_h = self.copy_blocks(h)
+        best_canonical_result: Optional[GrandCanonicalResult] = None
+        last_canonical_result: Optional[GrandCanonicalResult] = None
         outer_steps = 0
-        interpolated_refinement_used = False
-        next_is_interpolated_refinement = False
+        force_tight_refinement = False
+        failed_inner_nelec: Optional[float] = None
+        verification_repair_nelec: Optional[float] = None
+        verified_state: Optional[_GCState] = None
+        verified_source_result: Optional[GrandCanonicalResult] = None
+        last_verification_state: Optional[_GCState] = None
+        last_verification_source: Optional[GrandCanonicalResult] = None
+        canonical_verification_attempts = 0
+        canonical_verification_evaluations = 0
+        canonical_verification_failures = 0
+        canonical_verification_residual_rms = np.nan
+        canonical_verification_grad_rms = np.nan
+        canonical_verification_delta_nelec = np.nan
+        canonical_verification_density_rms = np.nan
         outer_trust_radius = (
             self.config.
             canonical_continuation_precondition_initial_delta_nelec
@@ -4370,14 +4589,17 @@ class GrandCanonicalKRKS:
             self.config.canonical_continuation_initial_delta_nelec)
 
         for outer in range(self.config.canonical_continuation_max_outer):
-            is_interpolated_refinement = next_is_interpolated_refinement
-            next_is_interpolated_refinement = False
             had_bracket = (
-                any(value < 0.0 for _, value in samples) and
-                any(value > 0.0 for _, value in samples))
+                brent_root is not None or
+                (any(value < 0.0 for _, value in samples) and
+                 any(value > 0.0 for _, value in samples)))
+            tight_canonical_solve = (
+                not self.config.canonical_continuation_final_polish and
+                (had_bracket or force_tight_refinement))
+            force_tight_refinement = False
             residual_tolerance = (
                 self.config.canonical_continuation_bracketed_residual_tol
-                if had_bracket and not is_interpolated_refinement else
+                if (tight_canonical_solve or had_bracket) else
                 self.config.canonical_continuation_coarse_residual_tol)
             # A conservative fixed-point seed is cheaper than trying and
             # rejecting several over-aggressive full DIIS extrapolations.
@@ -4398,10 +4620,12 @@ class GrandCanonicalKRKS:
                     canonical_state, None, niter=0, cycle_start=0)
             else:
                 canonical_result = canonical_solver.kernel(h0=h)
+            last_canonical_result = canonical_result
             outer_steps += 1
             stage_evaluation_offset = (
                 prefix_nfev + initialization_evaluations +
-                continuation_evaluations)
+                continuation_evaluations +
+                canonical_verification_evaluations)
             continuation_evaluations += canonical_result.nfev
             stage_history = self._continuation_history(
                 canonical_result.history,
@@ -4411,19 +4635,52 @@ class GrandCanonicalKRKS:
             continuation_iterations += canonical_result.niter
             h = canonical_result.h_orth
             error = canonical_result.mu - self.mu
-            target_nelec = self._electron_number_at_mu(h, self.mu)
-            handoff_delta_nelec = target_nelec - current_nelec
-            samples.append((current_nelec, error))
+            target_nelec = self._electron_number_at_mu(
+                canonical_result.fock_orth, self.mu)
+            handoff_delta_nelec = (
+                target_nelec - canonical_result.electron_number)
             if canonical_result.converged:
-                state_samples.append(
-                    (current_nelec, error, self.copy_blocks(h)))
-            bracketed = (
-                any(value < 0.0 for _, value in samples) and
-                any(value > 0.0 for _, value in samples))
+                duplicate = next(
+                    (index for index, (sample_nelec, _) in enumerate(samples)
+                     if abs(sample_nelec - current_nelec) <=
+                     32.0 * np.finfo(float).eps *
+                     max(1.0, abs(sample_nelec), abs(current_nelec))), None)
+                if duplicate is None:
+                    samples.append((current_nelec, error))
+                    sample_residuals.append(canonical_result.residual_rms)
+                    sample_focks.append(self.copy_blocks(
+                        canonical_result.fock_orth))
+                    if brent_root is not None:
+                        if (brent_root.pending is not None and
+                                abs(brent_root.pending - current_nelec) <=
+                                32.0 * np.finfo(float).eps *
+                                max(1.0, abs(current_nelec))):
+                            brent_root.update(current_nelec, error)
+                        else:
+                            # A safeguarded recovery can deliberately leave a
+                            # pending interpolation.  Reconstruct the bracket
+                            # from evaluated data rather than pretending that
+                            # unevaluated point updated Brent's history.
+                            brent_root = None
+                else:
+                    # A coarse-to-tight solve at exactly the same N refines a
+                    # function value; it is not another scalar-root step.
+                    if (canonical_result.residual_rms <=
+                            sample_residuals[duplicate]):
+                        samples[duplicate] = (current_nelec, error)
+                        sample_residuals[duplicate] = (
+                            canonical_result.residual_rms)
+                        sample_focks[duplicate] = self.copy_blocks(
+                            canonical_result.fock_orth)
+                    brent_root = None
+                if brent_root is None:
+                    brent_root = self._canonical_brent_from_samples(samples)
+                failed_inner_nelec = None
+            bracketed = brent_root is not None
             self.log.info(
                 'Canonical continuation %d: N = %.12g, optimized mu = '
                 '%.12g, target mu = %.12g, delta mu = %.3g, residual = %.3g, '
-                'frozen delta N = %.3g, Fock evaluations = %d',
+                'physical delta N = %.3g, Fock evaluations = %d',
                 outer, current_nelec, canonical_result.mu, self.mu, error,
                 canonical_result.residual_rms, handoff_delta_nelec,
                 canonical_result.nfev)
@@ -4436,62 +4693,234 @@ class GrandCanonicalKRKS:
                  canonical_continuation_unbracketed_handoff_delta_nelec),
                 abs(error) /
                 self.config.canonical_continuation_handoff_delta_mu)
-            if handoff_score < best_handoff_score:
+            if (canonical_result.converged and
+                    handoff_score < best_handoff_score):
                 best_handoff_score = handoff_score
                 best_handoff_delta_nelec = handoff_delta_nelec
                 best_error = error
                 best_error_source = 'evaluated'
-                best_h = self.copy_blocks(h)
+                best_h = self._canonical_fixed_mu_candidate(
+                    canonical_result)[0]
+                best_canonical_result = canonical_result
 
-            # A sign-changing pair of converged canonical Fock matrices also
-            # supplies a cheap approximation to the fixed-mu solution.  The
-            # auxiliary Hamiltonian is smooth in N even when the frozen-H
-            # Fermi response is very sharp.  Interpolate it to zero mu error,
-            # then require that its fixed-mu electron number agree with the
-            # same secant interpolation.  This can avoid another accurately
-            # converged fixed-N solve without relaxing the charge safeguard.
-            interpolated_h = None
-            interpolated_delta_nelec = np.inf
-            interpolated_bracket_width = np.inf
-            if bracketed and canonical_result.converged:
-                negative_states = [item for item in state_samples
-                                   if item[1] < 0.0]
-                positive_states = [item for item in state_samples
-                                   if item[1] > 0.0]
-                lower, upper = min(
-                    ((lo, hi) for lo in negative_states
-                     for hi in positive_states),
-                    key=lambda pair: abs(pair[0][0] - pair[1][0]))
-                denominator = upper[1] - lower[1]
-                if denominator != 0.0:
-                    interpolated_bracket_width = abs(upper[0] - lower[0])
-                    fraction = -lower[1] / denominator
-                    interpolated_nelec = (
-                        (1.0 - fraction) * lower[0] +
-                        fraction * upper[0])
-                    interpolated_h = self.hermitize_blocks([
-                        (1.0 - fraction) * hlo + fraction * hhi
-                        for hlo, hhi in zip(lower[2], upper[2])])
-                    interpolated_delta_nelec = (
+            if not self.config.canonical_continuation_final_polish:
+                if not canonical_result.converged:
+                    self.log.warn(
+                        'Canonical continuation inner solve did not '
+                        'converge: %s', canonical_result.message)
+                    if best_canonical_result is None:
+                        break
+                    same_failure = (
+                        failed_inner_nelec is not None and
+                        abs(failed_inner_nelec - current_nelec) <=
+                        32.0 * np.finfo(float).eps *
+                        max(1.0, abs(current_nelec)))
+                    if not same_failure:
+                        # A failed solve is not a scalar observation.  Retry
+                        # its N once from the best physical Fock while leaving
+                        # the evaluated sign bracket untouched.
+                        failed_inner_nelec = current_nelec
+                        brent_root = self._canonical_brent_from_samples(samples)
+                        h = self.copy_blocks(
+                            best_canonical_result.fock_orth)
+                        force_tight_refinement = True
+                        self.log.warn(
+                            'Retrying failed fixed-N solve once at N = %.12g',
+                            current_nelec)
+                        continue
+
+                    retry_nelec = None
+                    brent_root = self._canonical_brent_from_samples(samples)
+                    if brent_root is not None and not brent_root.converged:
+                        lo, hi = brent_root.bracket
+                        retry_nelec = lo + 0.5 * (hi - lo)
+                        if abs(retry_nelec - current_nelec) <= (
+                                32.0 * np.finfo(float).eps *
+                                max(1.0, abs(current_nelec))):
+                            # The failed point was already the midpoint.  Split
+                            # its interval to Brent's best endpoint instead of
+                            # immediately abandoning a valid outer bracket.
+                            retry_nelec = (
+                                current_nelec +
+                                0.5 * (brent_root.b - current_nelec))
+                    elif samples:
+                        retry_nelec = 0.5 * (
+                            current_nelec + samples[-1][0])
+                    if (retry_nelec is not None and
+                            abs(retry_nelec - current_nelec) >
+                            1.0e-14 * max(1.0, abs(current_nelec))):
+                        outer_trust_radius = max(
+                            self.config.canonical_continuation_min_delta_nelec,
+                            0.5 * outer_trust_radius)
+                        h = self.copy_blocks(
+                            best_canonical_result.fock_orth)
+                        current_nelec = retry_nelec
+                        brent_root = None
+                        failed_inner_nelec = None
+                        force_tight_refinement = True
+                        self.log.warn(
+                            'Retrying fixed-N continuation at safeguarded '
+                            'N = %.12g', current_nelec)
+                        continue
+                    break
+                (h_fixed_mu, _, physical_delta_nelec,
+                 predicted_residual_rms) = (
+                    self._canonical_fixed_mu_candidate(canonical_result))
+                canonical_ready = (
+                    canonical_result.residual_rms <=
+                    self.config.
+                    canonical_continuation_bracketed_residual_tol and
+                    abs(error) <=
+                    self.config.canonical_continuation_handoff_delta_mu and
+                    abs(physical_delta_nelec) <=
+                    self.config.
+                    canonical_continuation_handoff_delta_nelec and
+                    predicted_residual_rms <=
+                    self.config.
+                    canonical_continuation_verification_residual_tol)
+                if canonical_ready:
+                    self.nfev = (
+                        prefix_nfev + initialization_evaluations +
+                        continuation_evaluations +
+                        canonical_verification_evaluations)
+                    before_verification = self.nfev
+                    candidate_state = self.evaluate(h_fixed_mu)
+                    verification_work = self.nfev - before_verification
+                    canonical_verification_attempts += 1
+                    canonical_verification_evaluations += verification_work
+                    canonical_verification_residual_rms = (
+                        candidate_state.residual_rms)
+                    canonical_verification_grad_rms = candidate_state.grad_rms
+                    canonical_verification_delta_nelec = (
                         self._electron_number_at_mu(
-                            interpolated_h, self.mu) -
-                        interpolated_nelec)
-                    # The secant construction has zero *model* mu error.  It
-                    # is retained as a candidate only when its independently
-                    # evaluated frozen-H charge defect is also safe.
-                    interpolated_score = (
-                        abs(interpolated_delta_nelec) /
+                            candidate_state.fock_orth, self.mu) -
+                        candidate_state.electron_number)
+                    canonical_verification_density_rms = self.rms(
+                        self.axpy(-1.0, canonical_result.p_orth,
+                                  candidate_state.p_orth))
+                    verification_ok = (
+                        verification_work == 1 and
+                        candidate_state.residual_rms <=
                         self.config.
-                        canonical_continuation_handoff_delta_nelec)
-                    if interpolated_score < best_handoff_score:
-                        best_handoff_score = interpolated_score
-                        best_handoff_delta_nelec = interpolated_delta_nelec
-                        best_error = 0.0
-                        best_error_source = 'secant-model'
-                        best_h = self.copy_blocks(interpolated_h)
+                        canonical_continuation_verification_residual_tol and
+                        abs(canonical_verification_delta_nelec) <=
+                        self.config.
+                        canonical_continuation_handoff_delta_nelec and
+                        canonical_verification_density_rms <=
+                        self.config.
+                        canonical_continuation_verification_density_tol)
+                    last_verification_state = candidate_state
+                    last_verification_source = canonical_result
+                    if verification_ok:
+                        verified_state = candidate_state
+                        verified_source_result = canonical_result
+                        best_error = error
+                        best_error_source = 'evaluated'
+                        best_handoff_delta_nelec = physical_delta_nelec
+                        self.log.info(
+                            'Canonical root verified at fixed mu with one '
+                            'Fock build: delta mu = %.3g, delta N = %.3g, '
+                            'residual = %.3g, gradient = %.3g',
+                            error, physical_delta_nelec,
+                            candidate_state.residual_rms,
+                            candidate_state.grad_rms)
+                        break
+                    canonical_verification_failures += 1
+                    self.log.warn(
+                        'One-Fock fixed-mu verification failed: residual '
+                        '%.3g, gradient %.3g, delta N %.3g, density change '
+                        '%.3g; resuming fixed-N refinement',
+                        candidate_state.residual_rms,
+                        candidate_state.grad_rms,
+                        canonical_verification_delta_nelec,
+                        canonical_verification_density_rms)
+                    same_repair = (
+                        verification_repair_nelec is not None and
+                        abs(verification_repair_nelec -
+                            canonical_result.electron_number) <=
+                        32.0 * np.finfo(float).eps * max(
+                            1.0, abs(canonical_result.electron_number)))
+                    if not same_repair:
+                        # Verification exposed residual shape error rather than
+                        # a new scalar observation.  Re-solve the same N once
+                        # from the newly evaluated physical Fock.
+                        verification_repair_nelec = (
+                            canonical_result.electron_number)
+                        h = self.copy_blocks(candidate_state.fock_orth)
+                        current_nelec = canonical_result.electron_number
+                        brent_root = self._canonical_brent_from_samples(samples)
+                        force_tight_refinement = True
+                        continue
 
+                    # A persistent failure must not cycle forever at the same
+                    # N.  Use the verification Fock response only to choose a
+                    # safeguarded interior recovery point; its optimized mu is
+                    # evaluated by the next fixed-N solve before Brent sees it.
+                    brent_root = self._canonical_brent_from_samples(samples)
+                    if brent_root is not None and not brent_root.converged:
+                        lo, hi = brent_root.bracket
+                        preferred = (
+                            canonical_result.electron_number +
+                            canonical_verification_delta_nelec)
+                        margin = min(
+                            self.config.canonical_continuation_root_nelec_tol,
+                            0.25 * (hi - lo))
+                        if lo + margin < preferred < hi - margin:
+                            retry_nelec = preferred
+                        else:
+                            retry_nelec = lo + 0.5 * (hi - lo)
+                        h = self.copy_blocks(candidate_state.fock_orth)
+                        current_nelec = retry_nelec
+                        brent_root = None
+                        verification_repair_nelec = None
+                        force_tight_refinement = True
+                        continue
+                    self.log.warn(
+                        'Persistent fixed-mu verification failure left no '
+                        'resolvable Brent interval')
+                    break
+
+                root_coordinates_ready = (
+                    abs(error) <=
+                    self.config.canonical_continuation_handoff_delta_mu and
+                    abs(physical_delta_nelec) <=
+                    self.config.
+                    canonical_continuation_handoff_delta_nelec)
+                if root_coordinates_ready:
+                    # The scalar root is ready but the fixed-N shape is not;
+                    # converge the same physical state to the tight inner
+                    # tolerance before spending the verification Fock.
+                    h = self.copy_blocks(canonical_result.h_orth)
+                    current_nelec = canonical_result.electron_number
+                    force_tight_refinement = True
+                    continue
+
+            if brent_root is not None:
+                # A coarse value can supply the first sign change but may not
+                # be accurate enough to steer an expensive Brent iteration.
+                # Re-solve the best endpoint before trusting the bracket, and
+                # tighten again near the root so the requested physical charge
+                # tolerance is not dominated by fixed-N residual noise.
+                endpoint_index = next(
+                    (index for index, (sample_nelec, _) in enumerate(samples)
+                     if abs(sample_nelec - brent_root.b) <=
+                     32.0 * np.finfo(float).eps * max(
+                         1.0, abs(sample_nelec), abs(brent_root.b))), None)
+                endpoint_tolerance = (
+                    self.config.canonical_continuation_bracketed_residual_tol)
+                if (endpoint_index is not None and
+                        sample_residuals[endpoint_index] > endpoint_tolerance):
+                    h = self.copy_blocks(sample_focks[endpoint_index])
+                    current_nelec = brent_root.b
+                    force_tight_refinement = True
+                    self.log.info(
+                        'Refining Brent endpoint N = %.12g from residual %.3g '
+                        'to %.3g before the next root proposal',
+                        current_nelec, sample_residuals[endpoint_index],
+                        endpoint_tolerance)
+                    continue
             # Continuation is a globalization device, not the final solver.
-            # Require both a safe frozen-H Fermi response and a physically
+            # Require both a safe physical-Fock Fermi response and a physically
             # meaningful optimized chemical potential.  The charge test is
             # essential at low temperature because the same delta mu is
             # benign in a gap but can move many electrons near a crossing.
@@ -4503,9 +4932,11 @@ class GrandCanonicalKRKS:
             mu_handoff_ready = (
                 abs(error) <=
                 self.config.canonical_continuation_handoff_delta_mu)
-            if (canonical_result.converged and mu_handoff_ready and
+            if (self.config.canonical_continuation_final_polish and
+                    canonical_result.converged and mu_handoff_ready and
                     abs(handoff_delta_nelec) <= handoff_limit):
-                best_h = self.copy_blocks(h)
+                best_h = self._canonical_fixed_mu_candidate(
+                    canonical_result)[0]
                 best_handoff_delta_nelec = handoff_delta_nelec
                 best_error = error
                 best_error_source = 'evaluated'
@@ -4515,39 +4946,6 @@ class GrandCanonicalKRKS:
                     '%s); starting fixed-mu polish', handoff_delta_nelec,
                     error, bracketed)
                 break
-            if (canonical_result.converged and interpolated_h is not None and
-                    abs(interpolated_delta_nelec) <= handoff_limit):
-                if (not interpolated_refinement_used and
-                        interpolated_bracket_width >
-                        self.config.
-                        canonical_continuation_interpolation_refine_width):
-                    self.log.info(
-                        'Canonical continuation secant interpolation is '
-                        'inside the charge window (delta N = %.3g); using '
-                        'it to seed one fixed-N refinement',
-                        interpolated_delta_nelec)
-                    h = interpolated_h
-                    current_nelec = interpolated_nelec
-                    interpolated_refinement_used = True
-                    next_is_interpolated_refinement = True
-                    continue
-                if not interpolated_refinement_used:
-                    self.log.info(
-                        'Canonical continuation secant-model handoff '
-                        '(model delta mu = 0, frozen delta N = %.3g); '
-                        'starting fixed-mu polish',
-                        interpolated_delta_nelec)
-                    best_h = self.copy_blocks(interpolated_h)
-                    best_handoff_delta_nelec = interpolated_delta_nelec
-                    best_error = 0.0
-                    best_error_source = 'secant-model'
-                    break
-                # After a broad bracket required canonical refinement, keep
-                # solving the cheap scalar N root until an actual canonical
-                # state reaches the handoff window.  A second interpolation
-                # can have a tiny charge mismatch yet a noisy fixed-mu DIIS
-                # model, causing far more Fock trials than one final fixed-N
-                # solve.
             if not canonical_result.converged:
                 self.log.warn(
                     'Canonical continuation inner solve did not converge: %s; '
@@ -4560,17 +4958,240 @@ class GrandCanonicalKRKS:
                 outer_trust_radius = min(
                     self.config.canonical_continuation_max_delta_nelec,
                     2.0 * outer_trust_radius)
-            proposal = self._canonical_continuation_proposal(
-                samples, h, current_nelec, outer_trust_radius)
-            if abs(proposal - current_nelec) < (
-                    self.config.canonical_continuation_min_delta_nelec):
-                continue
+            if brent_root is not None:
+                if brent_root.converged:
+                    self.log.warn(
+                        'Canonical continuation Brent interval resolved at '
+                        'width %.3g without satisfying physical verification',
+                        brent_root.width)
+                    break
+                proposal = brent_root.proposal()
+                endpoint_focks = []
+                for endpoint in (brent_root.a, brent_root.b):
+                    endpoint_index = next(
+                        (index for index, (sample_nelec, _) in
+                         enumerate(samples)
+                         if abs(sample_nelec - endpoint) <=
+                         32.0 * np.finfo(float).eps *
+                         max(1.0, abs(sample_nelec), abs(endpoint))), None)
+                    endpoint_focks.append(
+                        None if endpoint_index is None else
+                        sample_focks[endpoint_index])
+                proposal_h = None
+                if all(value is not None for value in endpoint_focks):
+                    fraction = ((proposal - brent_root.a) /
+                                (brent_root.b - brent_root.a))
+                    proposal_h = self._sanitize_h([
+                        (1.0 - fraction) * h_a + fraction * h_b
+                        for h_a, h_b in zip(*endpoint_focks)])
+                self.log.info(
+                    'Canonical continuation Brent %s proposal N = %.12g '
+                    'inside [%.12g, %.12g]',
+                    brent_root.last_method, proposal,
+                    brent_root.bracket[0], brent_root.bracket[1])
+            else:
+                proposal = self._canonical_continuation_proposal(
+                    samples, canonical_result.fock_orth,
+                    current_nelec, outer_trust_radius)
+                proposal_h = None
+            if abs(proposal - current_nelec) <= (
+                    1.0e-14 * max(1.0, abs(current_nelec))):
+                self.log.warn(
+                    'Canonical continuation scalar root stagnated at '
+                    'N = %.12g', current_nelec)
+                break
+            h = (proposal_h if proposal_h is not None else
+                 self.copy_blocks(canonical_result.fock_orth))
             current_nelec = proposal
         else:
             self.log.warn(
                 'Canonical continuation reached its maximum of %d outer steps; '
                 'proceeding to fixed-mu verification',
                 self.config.canonical_continuation_max_outer)
+
+        if not self.config.canonical_continuation_final_polish:
+            terminal_success = verified_state is not None
+            terminal_state = verified_state
+            terminal_source = verified_source_result
+            if terminal_state is None:
+                reuse_last_verification = (
+                    last_verification_state is not None and
+                    (best_canonical_result is None or
+                     last_verification_source is best_canonical_result))
+                if reuse_last_verification:
+                    terminal_state = last_verification_state
+                    terminal_source = last_verification_source
+                else:
+                    terminal_source = (
+                        best_canonical_result or last_canonical_result)
+                    if terminal_source is None:  # pragma: no cover
+                        raise RuntimeError(
+                            'canonical continuation produced no state')
+                    (fallback_h, _, fallback_delta_nelec,
+                     _) = self._canonical_fixed_mu_candidate(terminal_source)
+                    self.nfev = (
+                        prefix_nfev + initialization_evaluations +
+                        continuation_evaluations +
+                        canonical_verification_evaluations)
+                    before_verification = self.nfev
+                    terminal_state = self.evaluate(fallback_h)
+                    verification_work = self.nfev - before_verification
+                    canonical_verification_attempts += 1
+                    canonical_verification_evaluations += verification_work
+                    canonical_verification_failures += 1
+                    canonical_verification_residual_rms = (
+                        terminal_state.residual_rms)
+                    canonical_verification_grad_rms = terminal_state.grad_rms
+                    canonical_verification_delta_nelec = (
+                        self._electron_number_at_mu(
+                            terminal_state.fock_orth, self.mu) -
+                        terminal_state.electron_number)
+                    canonical_verification_density_rms = self.rms(
+                        self.axpy(-1.0, terminal_source.p_orth,
+                                  terminal_state.p_orth))
+                    best_handoff_delta_nelec = fallback_delta_nelec
+
+            if terminal_source is None:  # pragma: no cover
+                raise RuntimeError(
+                    'fixed-mu verification lacks its canonical source')
+            source_error = terminal_source.mu - self.mu
+            (_, _, source_delta_nelec,
+             _) = self._canonical_fixed_mu_candidate(terminal_source)
+            best_error = source_error
+            best_error_source = 'evaluated'
+            best_handoff_delta_nelec = source_delta_nelec
+            total_evaluations = (
+                prefix_nfev + initialization_evaluations +
+                continuation_evaluations +
+                canonical_verification_evaluations)
+            total_iterations = prefix_niter + continuation_iterations
+            combined_history = prefix_records + continuation_history
+            self.nfev = total_evaluations
+            self.history = combined_history
+            density_change = self.rms(
+                self.axpy(-1.0, terminal_source.p_orth,
+                          terminal_state.p_orth))
+            terminal_mode = (
+                'canonical-verification' if terminal_success else
+                'canonical-verification-failed')
+            message = (
+                f'canonical continuation ({outer_steps} outer steps, '
+                f'{continuation_evaluations} fixed-N Fock evaluations, '
+                f'{canonical_verification_evaluations} verification '
+                f'evaluations); ' +
+                ('converged by one-Fock fixed-mu verification'
+                 if terminal_success else
+                 'failed to satisfy canonical root verification'))
+            self.canonical_verification_attempts = (
+                canonical_verification_attempts)
+            self.canonical_verification_evaluations = (
+                canonical_verification_evaluations)
+            self.canonical_verification_failures = (
+                canonical_verification_failures)
+            self.canonical_verification_residual_rms = (
+                canonical_verification_residual_rms)
+            self.canonical_verification_grad_rms = (
+                canonical_verification_grad_rms)
+            self.canonical_verification_delta_nelec = (
+                canonical_verification_delta_nelec)
+            self.canonical_verification_density_rms = (
+                canonical_verification_density_rms)
+            self.canonical_terminal_mode = terminal_mode
+            self._checkpoint(terminal_state, total_iterations, force=True)
+            final_result = self._finalize(
+                terminal_state, terminal_success, message,
+                total_iterations, density_change)
+            self.mf.canonical_continuation_mu_error_source_gc = (
+                best_error_source)
+            self.mf.canonical_verification_attempts_gc = (
+                canonical_verification_attempts)
+            self.mf.canonical_verification_evaluations_gc = (
+                canonical_verification_evaluations)
+            self.mf.canonical_verification_failures_gc = (
+                canonical_verification_failures)
+            self.mf.canonical_terminal_mode_gc = terminal_mode
+            self.mf.scf_summary.update({
+                'canonical_continuation_steps': outer_steps,
+                'canonical_continuation_evaluations': (
+                    continuation_evaluations),
+                'canonical_continuation_mu_error': best_error,
+                'canonical_continuation_mu_error_source': best_error_source,
+                'canonical_continuation_delta_nelec': (
+                    best_handoff_delta_nelec),
+                'canonical_precondition_iterations': (
+                    self.canonical_precondition_iterations),
+                'canonical_precondition_evaluations': (
+                    self.canonical_precondition_evaluations),
+                'canonical_precondition_residual_rms': (
+                    self.canonical_precondition_residual_rms),
+                'canonical_precondition_canonical_residual_rms': (
+                    self.canonical_precondition_canonical_residual_rms),
+                'canonical_precondition_delta_nelec': (
+                    self.canonical_precondition_delta_nelec),
+                'canonical_precondition_electron_number': (
+                    self.canonical_precondition_electron_number),
+                'canonical_precondition_mu_proxy': (
+                    self.canonical_precondition_mu_proxy),
+                'canonical_precondition_trigger': (
+                    self.canonical_precondition_trigger),
+                'canonical_verification_attempts': (
+                    canonical_verification_attempts),
+                'canonical_verification_evaluations': (
+                    canonical_verification_evaluations),
+                'canonical_verification_failures': (
+                    canonical_verification_failures),
+                'canonical_verification_residual_rms': (
+                    canonical_verification_residual_rms),
+                'canonical_verification_grad_rms': (
+                    canonical_verification_grad_rms),
+                'canonical_verification_delta_nelec': (
+                    canonical_verification_delta_nelec),
+                'canonical_verification_density_rms': (
+                    canonical_verification_density_rms),
+                'canonical_terminal_mode': terminal_mode,
+                'fock_evaluations_total': total_evaluations,
+            })
+            return replace(
+                final_result,
+                canonical_continuation_steps=outer_steps,
+                canonical_continuation_evaluations=(
+                    continuation_evaluations),
+                canonical_continuation_mu_error=best_error,
+                canonical_continuation_mu_error_source=best_error_source,
+                canonical_continuation_delta_nelec=(
+                    best_handoff_delta_nelec),
+                canonical_precondition_iterations=(
+                    self.canonical_precondition_iterations),
+                canonical_precondition_evaluations=(
+                    self.canonical_precondition_evaluations),
+                canonical_precondition_residual_rms=(
+                    self.canonical_precondition_residual_rms),
+                canonical_precondition_canonical_residual_rms=(
+                    self.canonical_precondition_canonical_residual_rms),
+                canonical_precondition_delta_nelec=(
+                    self.canonical_precondition_delta_nelec),
+                canonical_precondition_electron_number=(
+                    self.canonical_precondition_electron_number),
+                canonical_precondition_mu_proxy=(
+                    self.canonical_precondition_mu_proxy),
+                canonical_precondition_trigger=(
+                    self.canonical_precondition_trigger),
+                canonical_verification_attempts=(
+                    canonical_verification_attempts),
+                canonical_verification_evaluations=(
+                    canonical_verification_evaluations),
+                canonical_verification_failures=(
+                    canonical_verification_failures),
+                canonical_verification_residual_rms=(
+                    canonical_verification_residual_rms),
+                canonical_verification_grad_rms=(
+                    canonical_verification_grad_rms),
+                canonical_verification_delta_nelec=(
+                    canonical_verification_delta_nelec),
+                canonical_verification_density_rms=(
+                    canonical_verification_density_rms),
+                canonical_terminal_mode=terminal_mode,
+            )
 
         h = best_h
 
@@ -4664,8 +5285,25 @@ class GrandCanonicalKRKS:
             self.canonical_precondition_mu_proxy)
         self.mf.canonical_precondition_trigger_gc = (
             self.canonical_precondition_trigger)
+        self.mf.canonical_verification_attempts_gc = (
+            self.canonical_verification_attempts)
+        self.mf.canonical_verification_evaluations_gc = (
+            self.canonical_verification_evaluations)
+        self.mf.canonical_verification_failures_gc = (
+            self.canonical_verification_failures)
+        self.mf.canonical_verification_residual_rms_gc = (
+            self.canonical_verification_residual_rms)
+        self.mf.canonical_verification_grad_rms_gc = (
+            self.canonical_verification_grad_rms)
+        self.mf.canonical_verification_delta_nelec_gc = (
+            self.canonical_verification_delta_nelec)
+        self.mf.canonical_verification_density_rms_gc = (
+            self.canonical_verification_density_rms)
+        self.mf.canonical_terminal_mode_gc = self.canonical_terminal_mode
         self.mf.canonical_continuation_mu_error_source_gc = (
             best_error_source)
+        self.canonical_terminal_mode = 'fixed-mu-polish'
+        self.mf.canonical_terminal_mode_gc = 'fixed-mu-polish'
         self.mf.scf_summary.update({
             'canonical_continuation_steps': outer_steps,
             'canonical_continuation_evaluations': continuation_evaluations,
@@ -4689,6 +5327,7 @@ class GrandCanonicalKRKS:
                 self.canonical_precondition_mu_proxy),
             'canonical_precondition_trigger': (
                 self.canonical_precondition_trigger),
+            'canonical_terminal_mode': 'fixed-mu-polish',
             'fock_evaluations_total': total_evaluations,
             'lbfgs_switch_cycle_gc': switch_cycle,
             'lbfgs_switch_nfev_gc': switch_nfev,
@@ -4730,6 +5369,7 @@ class GrandCanonicalKRKS:
                 self.canonical_precondition_mu_proxy),
             canonical_precondition_trigger=(
                 self.canonical_precondition_trigger),
+            canonical_terminal_mode='fixed-mu-polish',
         )
 
     def kernel(self, dm0: Any = None, h0: Any = None) -> GrandCanonicalResult:
@@ -5248,6 +5888,21 @@ class GrandCanonicalKRKS:
             self.canonical_precondition_mu_proxy)
         self.mf.canonical_precondition_trigger_gc = (
             self.canonical_precondition_trigger)
+        self.mf.canonical_verification_attempts_gc = (
+            self.canonical_verification_attempts)
+        self.mf.canonical_verification_evaluations_gc = (
+            self.canonical_verification_evaluations)
+        self.mf.canonical_verification_failures_gc = (
+            self.canonical_verification_failures)
+        self.mf.canonical_verification_residual_rms_gc = (
+            self.canonical_verification_residual_rms)
+        self.mf.canonical_verification_grad_rms_gc = (
+            self.canonical_verification_grad_rms)
+        self.mf.canonical_verification_delta_nelec_gc = (
+            self.canonical_verification_delta_nelec)
+        self.mf.canonical_verification_density_rms_gc = (
+            self.canonical_verification_density_rms)
+        self.mf.canonical_terminal_mode_gc = self.canonical_terminal_mode
         self.mf.fixed_electron_number = self.fixed_electron_number
         self.mf.target_electron_number = self.target_electron_number
         self.mf.h_aux_gc = self.copy_blocks(state.h_orth)
@@ -5313,6 +5968,21 @@ class GrandCanonicalKRKS:
                 self.canonical_precondition_mu_proxy),
             'canonical_precondition_trigger': (
                 self.canonical_precondition_trigger),
+            'canonical_verification_attempts': (
+                self.canonical_verification_attempts),
+            'canonical_verification_evaluations': (
+                self.canonical_verification_evaluations),
+            'canonical_verification_failures': (
+                self.canonical_verification_failures),
+            'canonical_verification_residual_rms': (
+                self.canonical_verification_residual_rms),
+            'canonical_verification_grad_rms': (
+                self.canonical_verification_grad_rms),
+            'canonical_verification_delta_nelec': (
+                self.canonical_verification_delta_nelec),
+            'canonical_verification_density_rms': (
+                self.canonical_verification_density_rms),
+            'canonical_terminal_mode': self.canonical_terminal_mode,
             'fixed_electron_number': self.fixed_electron_number,
         })
         return GrandCanonicalResult(
@@ -5372,4 +6042,19 @@ class GrandCanonicalKRKS:
             canonical_precondition_mu_proxy=(
                 self.canonical_precondition_mu_proxy),
             canonical_precondition_trigger=(
-                self.canonical_precondition_trigger))
+                self.canonical_precondition_trigger),
+            canonical_verification_attempts=(
+                self.canonical_verification_attempts),
+            canonical_verification_evaluations=(
+                self.canonical_verification_evaluations),
+            canonical_verification_failures=(
+                self.canonical_verification_failures),
+            canonical_verification_residual_rms=(
+                self.canonical_verification_residual_rms),
+            canonical_verification_grad_rms=(
+                self.canonical_verification_grad_rms),
+            canonical_verification_delta_nelec=(
+                self.canonical_verification_delta_nelec),
+            canonical_verification_density_rms=(
+                self.canonical_verification_density_rms),
+            canonical_terminal_mode=self.canonical_terminal_mode)
