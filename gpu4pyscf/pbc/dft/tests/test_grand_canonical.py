@@ -6,7 +6,7 @@ from pyscf.pbc import gto
 
 from gpu4pyscf.lib.cupy_helper import tag_array
 from gpu4pyscf.pbc.dft.grand_canonical import (
-    GrandCanonicalConfig, GrandCanonicalKRKS, _DIISItem, _LBFGSPair,
+    GrandCanonicalConfig, GrandCanonicalKRKS, _BrentRoot, _DIISItem, _LBFGSPair,
     _LineSearchResult, _TrialInfo, fermi_divided_difference, fermi_entropy,
     fermi_occupations,
 )
@@ -112,6 +112,9 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             canonical_continuation_precondition_min_iterations=3,
             canonical_continuation_precondition_confirmations=1,
             canonical_continuation_precondition_max_fock_evaluations=24,
+            canonical_continuation_final_polish=False,
+            canonical_continuation_verification_residual_tol=1.0e-6,
+            canonical_continuation_verification_density_tol=1.0e-9,
             line_search_method='strong-wolfe',
             line_search_c2=0.1,
             line_search_max_evals=12,
@@ -178,6 +181,12 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             canonical_continuation_precondition_confirmations),
         canonical_continuation_precondition_max_fock_evaluations=(
             canonical_continuation_precondition_max_fock_evaluations),
+        canonical_continuation_final_polish=(
+            canonical_continuation_final_polish),
+        canonical_continuation_verification_residual_tol=(
+            canonical_continuation_verification_residual_tol),
+        canonical_continuation_verification_density_tol=(
+            canonical_continuation_verification_density_tol),
         line_search_method=line_search_method,
         line_search_c2=line_search_c2,
         line_search_max_evals=line_search_max_evals,
@@ -2476,15 +2485,13 @@ def test_automatic_canonical_continuation_finds_fixed_mu_electron_number():
     assert result.canonical_continuation_steps >= 1
     assert result.canonical_continuation_evaluations >= 1
     assert np.isfinite(result.canonical_continuation_mu_error)
-    assert result.canonical_continuation_mu_error_source in (
-        'evaluated', 'secant-model')
-    if result.canonical_continuation_mu_error_source == 'secant-model':
-        assert result.canonical_continuation_mu_error == 0.0
+    assert result.canonical_continuation_mu_error_source == 'evaluated'
     assert abs(result.canonical_continuation_mu_error) <= (
         solver.config.canonical_continuation_handoff_delta_mu)
     assert abs(result.canonical_continuation_delta_nelec) <= (
         solver.config.canonical_continuation_handoff_delta_nelec)
-    assert abs(result.electron_number - expected_nelec) < 1.0e-10
+    assert abs(result.electron_number - expected_nelec) <= (
+        solver.config.canonical_continuation_handoff_delta_nelec)
     assert result.nfev == mf.veff_calls
     assert result.nfev > result.canonical_continuation_evaluations
     assert solver.config.diis_max_coefficient_l1 == pytest.approx(10.0)
@@ -2660,12 +2667,371 @@ def test_unbracketed_canonical_continuation_uses_screened_secant():
     assert proposal == pytest.approx(1.12)
 
 
+def test_canonical_brent_accepts_secant_then_inverse_quadratic():
+    root = _BrentRoot.from_bracket(1.0, -1.0, 2.0, 2.0, 1.0e-12)
+    proposal = root.proposal()
+    assert proposal == pytest.approx(4.0 / 3.0)
+    assert root.last_method == 'secant'
+    root.update(proposal, proposal**2 - 2.0)
+    assert root.bracket == pytest.approx((4.0 / 3.0, 2.0))
+
+    proposal = root.proposal()
+    assert proposal == pytest.approx(149.0 / 105.0)
+    assert root.last_method == 'inverse-quadratic'
+    assert root.bracket[0] < proposal < root.bracket[1]
+
+
+def test_canonical_brent_bisects_an_unsafe_imbalanced_interpolation():
+    root = _BrentRoot.from_bracket(0.0, -10.0, 1.0, 1.0, 1.0e-12)
+    proposal = root.proposal()
+    assert proposal == pytest.approx(10.0 / 11.0)
+    assert root.last_method == 'secant'
+    root.update(proposal, 0.9)
+
+    proposal = root.proposal()
+    assert proposal == pytest.approx(5.0 / 11.0)
+    assert root.last_method == 'bisection'
+    assert root.bisection_steps == 1
+
+
+def test_canonical_brent_uses_optimized_mu_not_physical_charge_root():
+    _, solver = _solver(canonical_continuation=True)
+    mu_samples = [(1.0, -0.4), (2.0, 0.6)]
+    physical_charge_samples = [(1.0, -0.1), (2.0, 0.9)]
+    root = solver._canonical_brent_from_samples(mu_samples)
+    assert root is not None
+    assert root.proposal() == pytest.approx(1.4)
+
+    charge_root = solver._canonical_brent_from_samples(
+        physical_charge_samples)
+    assert charge_root is not None
+    assert charge_root.proposal() == pytest.approx(1.1)
+
+
+def test_canonical_brent_bracket_is_nested_for_reversed_endpoints():
+    root = _BrentRoot.from_bracket(2.0, 6.0, 0.0, -2.0, 1.0e-10)
+    old_width = root.width
+    proposals = 0
+    for _ in range(12):
+        if root.converged:
+            break
+        proposal = root.proposal()
+        proposals += 1
+        lo, hi = root.bracket
+        assert lo < proposal < hi
+        root.update(proposal, proposal**3 - 2.0)
+        assert root.width < old_width
+        assert root.fb == 0.0 or np.signbit(root.fa) != np.signbit(root.fb)
+        assert abs(root.fb) <= abs(root.fa)
+        old_width = root.width
+    assert root.interpolation_steps + root.bisection_steps == proposals
+
+
+def test_canonical_brent_reports_exact_and_interval_convergence():
+    exact = _BrentRoot.from_bracket(1.0, -1.0, 2.0, 1.0, 1.0e-12)
+    proposal = exact.proposal()
+    exact.update(proposal, 0.0)
+    assert exact.converged
+    assert exact.fb == 0.0
+    with pytest.raises(RuntimeError, match='interval has converged'):
+        exact.proposal()
+
+    interval = _BrentRoot.from_bracket(
+        1.0, -1.0, 1.0 + 5.0e-7, 1.0, 1.0e-6)
+    assert interval.converged
+    with pytest.raises(RuntimeError, match='interval has converged'):
+        interval.proposal()
+
+    lo = 1.0
+    hi = np.nextafter(lo, np.inf)
+    adjacent = _BrentRoot.from_bracket(lo, -1.0, hi, 1.0, 1.0e-20)
+    assert adjacent.converged
+    with pytest.raises(RuntimeError, match='interval has converged'):
+        adjacent.proposal()
+
+
 def test_canonical_continuation_default_handoff_charge_is_conservative():
     _, solver = _solver(canonical_continuation=True)
     assert (solver.config.canonical_continuation_handoff_delta_nelec ==
-            pytest.approx(0.05))
+            pytest.approx(2.0e-5))
     assert (solver.config.canonical_continuation_interpolation_refine_width ==
             pytest.approx(0.05))
+
+
+def test_canonical_only_terminal_defaults_are_tight():
+    _, solver = _solver(canonical_continuation=True)
+    assert not solver.config.canonical_continuation_final_polish
+    assert solver.config.canonical_continuation_handoff_delta_mu == pytest.approx(
+        1.0e-6)
+    assert (solver.config.canonical_continuation_handoff_delta_nelec ==
+            pytest.approx(2.0e-5))
+    assert (solver.config.canonical_continuation_unbracketed_handoff_delta_nelec ==
+            pytest.approx(2.0e-5))
+    assert (solver.config.canonical_continuation_verification_residual_tol ==
+            pytest.approx(1.0e-6))
+    assert (solver.config.canonical_continuation_verification_density_tol ==
+            pytest.approx(1.0e-9))
+    assert solver.config.canonical_continuation_root_nelec_tol == pytest.approx(
+        1.0e-8)
+    assert (solver.config.canonical_continuation_bracketed_residual_tol ==
+            pytest.approx(1.0e-8))
+
+
+def test_canonical_fixed_mu_candidate_is_gauge_exact_and_uses_fock_charge():
+    fock0 = cp.asarray([[-0.7, 0.12 + 0.04j],
+                       [0.12 - 0.04j, 0.3]], dtype=cp.complex128)
+    mf = _FixedFockKRKS([fock0, fock0.conj()])
+    mf.kpts = np.asarray([[0.25, 0.0, 0.0], [-0.25, 0.0, 0.0]])
+    config = GrandCanonicalConfig(
+        check_time_reversal=True, enforce_time_reversal=True)
+    target_mu = -0.1
+    fixed_mu_solver = GrandCanonicalKRKS(
+        mf, mu=target_mu, sigma=0.15, config=replace(config))
+    target_nelec = fixed_mu_solver._electron_number_at_mu(
+        fixed_mu_solver.hcore_ao, target_mu)
+    fixed_n_solver = GrandCanonicalKRKS(
+        mf, mu=target_mu, sigma=0.15, config=replace(config),
+        electron_number=target_nelec)
+
+    gauge = 0.37
+    h_fixed_n = [
+        fock + gauge * identity
+        for fock, identity in zip(
+            fixed_n_solver.hcore_ao, fixed_n_solver.identity)]
+    state = fixed_n_solver.evaluate(h_fixed_n)
+    canonical = fixed_n_solver._finalize(
+        state, True, 'synthetic converged fixed-N state', 0, 0.0)
+    assert canonical.mu == pytest.approx(target_mu, abs=2.0e-12)
+
+    nfev_before = fixed_mu_solver.nfev
+    veff_before = mf.veff_calls
+    candidate, measured_gauge, delta_nelec, predicted_residual = (
+        fixed_mu_solver._canonical_fixed_mu_candidate(canonical))
+    assert fixed_mu_solver.nfev == nfev_before
+    assert mf.veff_calls == veff_before
+    assert measured_gauge == pytest.approx(gauge, abs=2.0e-12)
+    assert delta_nelec == pytest.approx(0.0, abs=2.0e-12)
+    assert predicted_residual == pytest.approx(0.0, abs=2.0e-12)
+    assert fixed_mu_solver.max_block_rms(fixed_mu_solver.axpy(
+        -1.0, fixed_mu_solver.hcore_ao, candidate)) < 2.0e-12
+    assert fixed_mu_solver._electron_number_at_mu(
+        candidate, target_mu) == pytest.approx(target_nelec, abs=2.0e-12)
+
+    # Using the canonical auxiliary H directly would make this gate depend on
+    # its arbitrary scalar gauge and reject an otherwise exact physical Fock.
+    wrong_delta_nelec = (
+        fixed_mu_solver._electron_number_at_mu(
+            canonical.h_orth, target_mu) - canonical.electron_number)
+    assert abs(wrong_delta_nelec) > 1.0e-2
+
+    extra_gauge = -0.23
+    shifted = replace(canonical, h_orth=[
+        h + extra_gauge * identity
+        for h, identity in zip(canonical.h_orth, fixed_mu_solver.identity)])
+    shifted_candidate, shifted_gauge, shifted_delta, shifted_residual = (
+        fixed_mu_solver._canonical_fixed_mu_candidate(shifted))
+    assert shifted_gauge == pytest.approx(
+        measured_gauge + extra_gauge, abs=2.0e-12)
+    assert shifted_delta == pytest.approx(delta_nelec, abs=2.0e-12)
+    assert shifted_residual == pytest.approx(
+        predicted_residual, abs=2.0e-12)
+    assert fixed_mu_solver.max_block_rms(fixed_mu_solver.axpy(
+        -1.0, candidate, shifted_candidate)) < 2.0e-12
+    assert float(cp.max(cp.abs(
+        shifted_candidate[1] - shifted_candidate[0].conj())).item()) < 2.0e-12
+
+
+@pytest.mark.parametrize('optimizer', ('nlcg', 'lbfgs'))
+def test_canonical_continuation_uses_one_gauge_exact_verification_fock(
+        monkeypatch, optimizer):
+    mf, solver = _solver(
+        mu=-0.1, optimizer=optimizer, canonical_continuation=True,
+        lbfgs_initial_metric='scalar')
+    target_mu = solver.mu
+    canonical_candidates = []
+    original_candidate = solver._canonical_fixed_mu_candidate
+
+    def observed_candidate(canonical_result):
+        canonical_candidates.append(canonical_result)
+        return original_candidate(canonical_result)
+
+    monkeypatch.setattr(
+        solver, '_canonical_fixed_mu_candidate', observed_candidate)
+
+    verification_h = []
+    original_evaluate = solver.evaluate
+    reported_grad_rms = 100.0 * solver.config.conv_tol_grad_rms
+
+    def observed_evaluate(h_orth):
+        verification_h.append(solver.copy_blocks(h_orth))
+        # Canonical/fixed-point termination is governed by the physical Fock
+        # residual.  The exact direct-minimization gradient is retained as a
+        # diagnostic but must not veto an otherwise verified canonical root.
+        return replace(
+            original_evaluate(h_orth), grad_rms=reported_grad_rms)
+
+    monkeypatch.setattr(solver, 'evaluate', observed_evaluate)
+
+    def unexpected_fixed_mu_optimizer(*args, **kwargs):
+        raise AssertionError(
+            'canonical continuation entered an iterative fixed-mu polish')
+
+    # These are instance attributes, so fixed-N child solvers retain their
+    # ordinary class methods while either possible fixed-mu polish is blocked.
+    monkeypatch.setattr(solver, '_kernel_nlcg', unexpected_fixed_mu_optimizer)
+    monkeypatch.setattr(solver, '_kernel_lbfgs', unexpected_fixed_mu_optimizer)
+    monkeypatch.setattr(solver, '_kernel_diis', unexpected_fixed_mu_optimizer)
+
+    result = solver.kernel(h0=[
+        cp.asarray([[0.25, 0.18 - 0.07j],
+                    [0.18 + 0.07j, -0.15]])])
+
+    assert result.converged, result.message
+    assert not result.fixed_electron_number
+    assert result.mu == pytest.approx(target_mu, abs=1.0e-14)
+    assert result.canonical_continuation_mu_error_source == 'evaluated'
+    assert result.canonical_verification_attempts == 1
+    assert result.canonical_verification_evaluations == 1
+    assert result.canonical_verification_failures == 0
+    assert result.canonical_verification_residual_rms <= (
+        solver.config.canonical_continuation_verification_residual_tol)
+    assert result.canonical_verification_grad_rms == pytest.approx(
+        reported_grad_rms)
+    assert abs(result.canonical_verification_delta_nelec) <= (
+        solver.config.canonical_continuation_handoff_delta_nelec)
+    assert result.canonical_verification_density_rms <= (
+        solver.config.canonical_continuation_verification_density_tol)
+    assert result.canonical_terminal_mode == 'canonical-verification'
+    assert len(verification_h) == 1
+    assert canonical_candidates
+
+    # A fixed-N result reports the physical optimized mu after removing its
+    # scalar gauge g = mean(H-F).  The unique fixed-mu auxiliary Hamiltonian
+    # that preserves its occupations is therefore
+    # H_mu = H_N - g I + (mu_target - mu_opt) I.
+    candidates = []
+    for canonical in canonical_candidates:
+        gauge = solver.trace_mean([
+            h - f for h, f in zip(
+                canonical.h_orth, canonical.fock_orth)])
+        shifted = [
+            h + (target_mu - canonical.mu - gauge) * identity
+            for h, identity in zip(canonical.h_orth, solver.identity)]
+        error = solver.max_block_rms(
+            solver.axpy(-1.0, shifted, verification_h[0]))
+        candidates.append((error, canonical))
+    shift_error, source = min(candidates, key=lambda item: item[0])
+    assert shift_error < 1.0e-12
+
+    assert result.electron_number == pytest.approx(
+        source.electron_number, abs=2.0e-10)
+    assert float(cp.max(cp.abs(result.dm_ao - source.dm_ao)).item()) < 2.0e-10
+    for actual, expected in zip(result.occupations, source.occupations):
+        assert float(cp.max(cp.abs(actual - expected)).item()) < 2.0e-10
+    assert result.grand_potential == pytest.approx(
+        result.free_energy - target_mu * result.electron_number,
+        abs=1.0e-12)
+
+    # The verification is an evaluation, not an optimizer iteration.
+    assert result.nfev == mf.veff_calls
+    assert result.nfev == (
+        result.canonical_continuation_evaluations +
+        result.canonical_verification_evaluations)
+    assert result.niter == len(result.history)
+    fock_counts = [record.fock_evaluations for record in result.history]
+    assert fock_counts == sorted(fock_counts)
+    assert all(value < result.nfev for value in fock_counts)
+    assert mf.canonical_verification_attempts_gc == 1
+    assert mf.canonical_verification_evaluations_gc == 1
+    assert mf.canonical_verification_failures_gc == 0
+    assert mf.canonical_terminal_mode_gc == 'canonical-verification'
+    for name in (
+            'canonical_verification_attempts',
+            'canonical_verification_evaluations',
+            'canonical_verification_failures',
+            'canonical_verification_residual_rms',
+            'canonical_verification_grad_rms',
+            'canonical_verification_delta_nelec',
+            'canonical_verification_density_rms',
+            'canonical_terminal_mode'):
+        assert mf.scf_summary[name] == getattr(result, name)
+    assert mf.scf_summary['fock_evaluations_total'] == result.nfev
+
+
+def test_failed_canonical_verification_resumes_fixed_n_continuation(
+        monkeypatch):
+    mf, solver = _solver(
+        mu=-0.1, canonical_continuation=True,
+        canonical_continuation_precondition_residual_rms=None)
+    original_evaluate = solver.evaluate
+    verification_calls = 0
+
+    def fail_first_verification(h_orth):
+        nonlocal verification_calls
+        verification_calls += 1
+        state = original_evaluate(h_orth)
+        if verification_calls == 1:
+            return replace(
+                state,
+                residual_rms=(
+                    10.0 * solver.config.
+                    canonical_continuation_verification_residual_tol))
+        return state
+
+    monkeypatch.setattr(solver, 'evaluate', fail_first_verification)
+
+    def unexpected_fixed_mu_optimizer(*args, **kwargs):
+        raise AssertionError(
+            'failed verification entered an iterative fixed-mu polish')
+
+    monkeypatch.setattr(solver, '_kernel_nlcg', unexpected_fixed_mu_optimizer)
+    monkeypatch.setattr(solver, '_kernel_lbfgs', unexpected_fixed_mu_optimizer)
+
+    # Starting at the physical Fock makes the first fixed-N root exact.  The
+    # injected verification failure must therefore trigger another fixed-N
+    # refinement/verification, rather than being hidden by root-search error.
+    result = solver._kernel_canonical_continuation(h0=solver.hcore_ao)
+
+    assert result.converged, result.message
+    assert verification_calls == 2
+    assert result.canonical_verification_attempts == 2
+    assert result.canonical_verification_evaluations == 2
+    assert result.canonical_verification_failures == 1
+    assert result.canonical_terminal_mode == 'canonical-verification'
+    assert result.canonical_continuation_steps >= 2
+    assert result.canonical_continuation_mu_error_source == 'evaluated'
+    assert result.nfev == mf.veff_calls
+    assert result.nfev == (
+        result.canonical_continuation_evaluations +
+        result.canonical_verification_evaluations)
+
+
+def test_legacy_canonical_fixed_mu_polish_remains_opt_in(monkeypatch):
+    mf, solver = _solver(
+        mu=-0.1, optimizer='lbfgs', lbfgs_initial_metric='scalar',
+        canonical_continuation=True,
+        canonical_continuation_final_polish=True)
+    original_lbfgs = solver._kernel_lbfgs
+    polish_calls = 0
+
+    def observed_lbfgs(*args, **kwargs):
+        nonlocal polish_calls
+        polish_calls += 1
+        return original_lbfgs(*args, **kwargs)
+
+    monkeypatch.setattr(solver, '_kernel_lbfgs', observed_lbfgs)
+    result = solver.kernel(h0=[
+        cp.asarray([[0.25, 0.18 - 0.07j],
+                    [0.18 + 0.07j, -0.15]])])
+
+    assert result.converged, result.message
+    assert polish_calls == 1
+    assert result.canonical_terminal_mode == 'fixed-mu-polish'
+    assert result.canonical_verification_attempts == 0
+    assert result.canonical_verification_evaluations == 0
+    assert result.canonical_verification_failures == 0
+    assert mf.canonical_terminal_mode_gc == 'fixed-mu-polish'
+    assert mf.scf_summary['canonical_terminal_mode'] == 'fixed-mu-polish'
 
 
 def test_fock_evaluation_count_includes_fresh_initial_guess_build():
