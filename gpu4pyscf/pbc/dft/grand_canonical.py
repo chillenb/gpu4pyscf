@@ -557,6 +557,63 @@ class _GCWorkspace:
     enforce_time_reversal: bool
 
 
+@dataclass(frozen=True)
+class _KernelOutcome:
+    """Internal optimizer outcome that has not been published to ``mf``."""
+
+    state: _GCState
+    previous: Optional[_GCState]
+    converged: bool
+    message: str
+    niter: int
+    density_change: float
+
+
+@dataclass(frozen=True)
+class _FixedNPoint:
+    """Private fixed-N result used by canonical continuation."""
+
+    state: _GCState
+    converged: bool
+    message: str
+    niter: int
+    nfev: int
+    history: tuple[IterationRecord, ...]
+    density_change: float
+
+    @property
+    def h_orth(self) -> list:
+        return self.state.h_orth
+
+    @property
+    def fock_orth(self) -> list:
+        return self.state.fock_orth
+
+    @property
+    def p_orth(self) -> list:
+        return self.state.p_orth
+
+    @property
+    def dm_ao(self) -> cp.ndarray:
+        return self.state.dm_ao
+
+    @property
+    def occupations(self) -> list:
+        return self.state.occupations
+
+    @property
+    def mu(self) -> float:
+        return self.state.chemical_potential
+
+    @property
+    def electron_number(self) -> float:
+        return self.state.electron_number
+
+    @property
+    def residual_rms(self) -> float:
+        return self.state.residual_rms
+
+
 @dataclass
 class GrandCanonicalResult:
     converged: bool
@@ -3920,7 +3977,7 @@ class GrandCanonicalKRKS:
     # ---- fixed-mu canonical continuation --------------------------------
 
     def _canonical_fixed_mu_candidate(
-            self, result: GrandCanonicalResult
+            self, result: GrandCanonicalResult | _FixedNPoint
             ) -> tuple[list, float, float, float]:
         """Return the density-preserving fixed-mu H and physical defects.
 
@@ -3982,6 +4039,32 @@ class GrandCanonicalKRKS:
             state.entropy_energy, state.free_energy, grand_potential,
             state.free_energy, gradient, z, residual,
             self.rms(gradient), self.rms(mismatch))
+
+    def _solve_fixed_n_point(
+            self, h0: Any,
+            seed_state: Optional[_GCState] = None) -> _FixedNPoint:
+        """Converge one canonical point without publishing it to ``mf``."""
+        if not self.fixed_electron_number:
+            raise AssertionError('fixed-N point solve requires fixed N')
+        self.history = []
+        self.nfev = 0
+        self._reset_run_diagnostics()
+        self._diis_history = []
+        if seed_state is None:
+            state = self.evaluate(self._initial_h(h0=h0))
+        else:
+            state = self._fixed_n_view(seed_state)
+        outcome = self._run_diis(
+            state, None, niter=0, cycle_start=0)
+        return _FixedNPoint(
+            state=outcome.state,
+            converged=outcome.converged,
+            message=outcome.message,
+            niter=outcome.niter,
+            nfev=self.nfev,
+            history=tuple(self.history),
+            density_change=outcome.density_change,
+        )
 
     def _reset_run_diagnostics(self) -> None:
         self.ncheap_nelec_reject = 0
@@ -4167,16 +4250,16 @@ class GrandCanonicalKRKS:
         best_error = np.inf
         best_handoff_delta_nelec = np.inf
         best_handoff_score = np.inf
-        best_canonical_result: Optional[GrandCanonicalResult] = None
-        last_canonical_result: Optional[GrandCanonicalResult] = None
+        best_canonical_result: Optional[_FixedNPoint] = None
+        last_canonical_result: Optional[_FixedNPoint] = None
         outer_steps = 0
         force_tight_refinement = False
         failed_inner_nelec: Optional[float] = None
         verification_repair_nelec: Optional[float] = None
         verified_state: Optional[_GCState] = None
-        verified_source_result: Optional[GrandCanonicalResult] = None
+        verified_source_result: Optional[_FixedNPoint] = None
         last_verification_state: Optional[_GCState] = None
-        last_verification_source: Optional[GrandCanonicalResult] = None
+        last_verification_source: Optional[_FixedNPoint] = None
         canonical_verification_attempts = 0
         canonical_verification_evaluations = 0
         canonical_verification_failures = 0
@@ -4210,15 +4293,8 @@ class GrandCanonicalKRKS:
                 current_nelec,
                 self._canonical_continuation_config(
                     residual_tolerance, initial_damping))
-            if outer == 0 and seed_state is not None:
-                canonical_solver.history = []
-                canonical_solver.nfev = 0
-                canonical_solver._reset_run_diagnostics()
-                canonical_state = canonical_solver._fixed_n_view(seed_state)
-                canonical_result = canonical_solver._kernel_diis(
-                    canonical_state, None, niter=0, cycle_start=0)
-            else:
-                canonical_result = canonical_solver.kernel(h0=h)
+            canonical_result = canonical_solver._solve_fixed_n_point(
+                h, seed_state=(seed_state if outer == 0 else None))
             last_canonical_result = canonical_result
             outer_steps += 1
             stage_evaluation_offset = (
@@ -4961,9 +5037,9 @@ class GrandCanonicalKRKS:
         density_change = (0.0 if previous is None else self._metrics(state, previous)[2])
         return self._finalize(state, converged, message, niter, density_change)
 
-    def _kernel_diis(self, state: _GCState, previous: Optional[_GCState],
-                     niter: int, cycle_start: int) -> GrandCanonicalResult:
-        """Polish a locally converged direct-minimization state with DIIS."""
+    def _run_diis(self, state: _GCState, previous: Optional[_GCState],
+                  niter: int, cycle_start: int) -> _KernelOutcome:
+        """Run DIIS and return an unpublished internal outcome."""
         diis_history: list[_DIISItem] = []
         self._diis_history = diis_history
         converged = False
@@ -5018,7 +5094,16 @@ class GrandCanonicalKRKS:
                 message = 'converged residual-DIIS fixed point at maximum cycle'
         density_change = (0.0 if previous is None
                           else self._metrics(state, previous)[2])
-        return self._finalize(state, converged, message, niter, density_change)
+        return _KernelOutcome(
+            state, previous, converged, message, niter, density_change)
+
+    def _kernel_diis(self, state: _GCState, previous: Optional[_GCState],
+                     niter: int, cycle_start: int) -> GrandCanonicalResult:
+        """Run DIIS and publish its terminal state for a public solve."""
+        outcome = self._run_diis(state, previous, niter, cycle_start)
+        return self._finalize(
+            outcome.state, outcome.converged, outcome.message,
+            outcome.niter, outcome.density_change)
 
     # ---- public state finalisation ----------------------------------------
 
