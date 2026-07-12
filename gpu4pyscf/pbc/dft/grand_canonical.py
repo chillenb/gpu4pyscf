@@ -470,7 +470,6 @@ class _FixedNPoint:
     """Private fixed-N result used by canonical continuation."""
 
     state: _GCState
-    target_electron_number: float
     converged: bool
     message: str
     niter: int
@@ -2931,44 +2930,7 @@ class GrandCanonicalKRKS:
         return (h_fixed_mu, gauge_shift, delta_nelec,
                 self.rms(predicted_mismatch))
 
-    def _fixed_n_view(self, state: _GCState) -> _GCState:
-        """Reinterpret an evaluated fixed-mu state at its current fixed N."""
-        if not self.fixed_electron_number:
-            raise AssertionError('fixed-N state view requires fixed N')
-        if abs(state.electron_number - self.target_electron_number) > max(
-                self.config.mu_electron_number_tol, 1.0e-9):
-            raise ValueError(
-                'fixed-N state view target does not match the source state')
-        h = self.copy_blocks(state.h_orth)
-        fock = self.copy_blocks(state.fock_orth)
-        mismatch = self.hermitize_blocks([
-            hk - fk for hk, fk in zip(h, fock)])
-        gauge_shift = self.trace_mean(mismatch)
-        mismatch = [
-            value - gauge_shift * identity
-            for value, identity in zip(mismatch, self.identity)]
-        mismatch = self.hermitize_blocks(mismatch)
-        chemical_potential = state.auxiliary_mu - gauge_shift
-        gradient = self._exact_gradient(
-            h, fock, state.eigenvalues, state.u, state.occupations)
-        z = self.hermitize_blocks([0.5 * value for value in mismatch])
-        residual = self.scale_blocks(-1.0, z)
-        grand_potential = (
-            state.free_energy -
-            chemical_potential * state.electron_number)
-        return _GCState(
-            h, state.gamma, state.eigenvalues, state.u, state.occupations,
-            state.p_orth, state.dm_ao, state.veff, state.fock_ao, fock,
-            state.auxiliary_mu, chemical_potential, gauge_shift,
-            state.electronic_energy, state.nuclear_energy,
-            state.dft_total_energy, state.electron_number, state.entropy,
-            state.entropy_energy, state.free_energy, grand_potential,
-            state.free_energy, gradient, z, residual,
-            self.rms(gradient), self.rms(mismatch))
-
-    def _solve_fixed_n_point(
-            self, h0: Any,
-            seed_state: Optional[_GCState] = None) -> _FixedNPoint:
+    def _solve_fixed_n_point(self, h0: Any) -> _FixedNPoint:
         """Converge one canonical point without publishing it to ``mf``."""
         if not self.fixed_electron_number:
             raise AssertionError('fixed-N point solve requires fixed N')
@@ -2976,15 +2938,11 @@ class GrandCanonicalKRKS:
         self.nfev = 0
         self._reset_run_diagnostics()
         self._diis_history = []
-        if seed_state is None:
-            state = self.evaluate(self._initial_h(h0=h0))
-        else:
-            state = self._fixed_n_view(seed_state)
+        state = self.evaluate(self._initial_h(h0=h0))
         outcome = self._run_diis(
             state, None, niter=0, cycle_start=0)
         return _FixedNPoint(
             state=outcome.state,
-            target_electron_number=float(self.target_electron_number),
             converged=outcome.converged,
             message=outcome.message,
             niter=outcome.niter,
@@ -3129,27 +3087,15 @@ class GrandCanonicalKRKS:
 
     def _solve_canonical_point(
             self, h: Sequence, electron_number: float,
-            residual_tolerance: float, work: _CanonicalWork,
-            refinement_seed: Optional[_FixedNPoint] = None) -> _FixedNPoint:
+            residual_tolerance: float,
+            work: _CanonicalWork) -> _FixedNPoint:
         """Solve and account for one unpublished fixed-N root observation."""
         canonical_solver = self._spawn_fixed_n(
             electron_number,
             self._canonical_continuation_config(
                 residual_tolerance,
                 self.config.canonical_continuation_initial_damping))
-        seed_state = None
-        if refinement_seed is not None:
-            scale = max(
-                1.0, abs(electron_number),
-                abs(refinement_seed.target_electron_number))
-            if abs(
-                    refinement_seed.target_electron_number -
-                    electron_number) > 32.0 * np.finfo(float).eps * scale:
-                raise AssertionError(
-                    'fixed-N refinement seed does not match requested N')
-            seed_state = refinement_seed.state
-        point = canonical_solver._solve_fixed_n_point(
-            h, seed_state=seed_state)
+        point = canonical_solver._solve_fixed_n_point(h)
         stage_evaluation_offset = work.total_nfev
         work.fixed_n_nfev += point.nfev
         work.history.extend(self._continuation_history(
@@ -3287,7 +3233,6 @@ class GrandCanonicalKRKS:
         best_handoff_score = np.inf
         best_canonical_result: Optional[_FixedNPoint] = None
         last_canonical_result: Optional[_FixedNPoint] = None
-        refinement_seed: Optional[_FixedNPoint] = None
         outer_steps = 0
         force_tight_refinement = False
         failed_inner_nelec: Optional[float] = None
@@ -3307,11 +3252,8 @@ class GrandCanonicalKRKS:
                 self.config.canonical_continuation_bracketed_residual_tol
                 if (tight_canonical_solve or had_bracket) else
                 self.config.canonical_continuation_coarse_residual_tol)
-            # Consume an exact-same-N seed once; every other point starts from
-            # its supplied Hamiltonian and a fresh DIIS model.
             canonical_result = self._solve_canonical_point(
-                h, current_nelec, residual_tolerance, work, refinement_seed)
-            refinement_seed = None
+                h, current_nelec, residual_tolerance, work)
             last_canonical_result = canonical_result
             outer_steps += 1
             h = canonical_result.h_orth
@@ -3504,7 +3446,6 @@ class GrandCanonicalKRKS:
                 # tolerance before spending the verification Fock.
                 h = self.copy_blocks(canonical_result.h_orth)
                 current_nelec = canonical_result.electron_number
-                refinement_seed = canonical_result
                 force_tight_refinement = True
                 continue
 
@@ -3523,14 +3464,6 @@ class GrandCanonicalKRKS:
                         endpoint_tolerance):
                     h = self.copy_blocks(samples[endpoint_index].fock_orth)
                     current_nelec = brent_root.b
-                    scale = max(
-                        1.0, abs(current_nelec),
-                        abs(canonical_result.target_electron_number))
-                    if abs(
-                            canonical_result.target_electron_number -
-                            current_nelec) <= (
-                                32.0 * np.finfo(float).eps * scale):
-                        refinement_seed = canonical_result
                     force_tight_refinement = True
                     self.log.info(
                         'Refining Brent endpoint N = %.12g from residual %.3g '
