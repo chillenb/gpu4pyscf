@@ -182,6 +182,12 @@ class GrandCanonicalConfig:
     nlcg_residual_filter_alpha_min: float = 2.0e-2
     nlcg_residual_filter_alpha_max: float = 2.0e-1
     nlcg_residual_filter_max_evals: Optional[int] = None
+    # Optional in-kernel NLCG -> L-BFGS handoff.  The already evaluated state
+    # is reused, L-BFGS memory starts empty, and the iteration/Fock counters
+    # remain continuous.  A separate line-search choice lets Hager--Zhang
+    # NLCG hand off to the occupation-projected strong-Wolfe L-BFGS path.
+    lbfgs_switch_residual_rms: Optional[float] = None
+    lbfgs_switch_line_search_method: str = 'strong-wolfe'
 
 
 @dataclass(frozen=True)
@@ -451,6 +457,10 @@ class GrandCanonicalResult:
     max_direction_projection_correction: float = 0.0
     residual_filter_acceptances: int = 0
     residual_filter_rejections: int = 0
+    lbfgs_switches: int = 0
+    lbfgs_switch_cycle: int = -1
+    lbfgs_switch_nfev: int = -1
+    lbfgs_switch_actual_residual_rms: float = np.nan
 
 
 def _as_float(value: Any, name: str = 'value') -> float:
@@ -582,6 +592,9 @@ class GrandCanonicalKRKS:
                 self.config.line_search_nelec_guard_mode))
         self.config.line_search_method = self._canonical_line_search_method(
             self.config.line_search_method)
+        self.config.lbfgs_switch_line_search_method = (
+            self._canonical_line_search_method(
+                self.config.lbfgs_switch_line_search_method))
         self.config.nlcg_nelec_projection_strategy = (
             self._canonical_nlcg_projection_strategy(
                 self.config.nlcg_nelec_projection_strategy))
@@ -608,10 +621,24 @@ class GrandCanonicalKRKS:
                 raise ValueError(
                     'the NLCG residual filter requires Hager-Zhang and the '
                     'fixed-direction projection strategy')
+        if (self.config.lbfgs_switch_residual_rms is not None and
+                self.config.optimizer != 'nlcg'):
+            raise ValueError(
+                'lbfgs_switch_residual_rms requires optimizer="nlcg"')
+        if (not self.fixed_electron_number and
+                self.config.lbfgs_switch_residual_rms is not None and
+                self.config.lbfgs_switch_line_search_method ==
+                'hager-zhang' and
+                self.config.line_search_nelec_guard_mode != 'reject'):
+            raise ValueError(
+                'an occupation-projected NLCG-to-L-BFGS handoff requires '
+                'the strong-Wolfe L-BFGS line search')
         self.verbose = (getattr(mf, 'verbose', logger.NOTE)
                         if self.config.verbose is None else self.config.verbose)
         self.log = logger.new_logger(mf, self.verbose)
-        if (self.config.optimizer == 'lbfgs' and self.fixed_electron_number and
+        if ((self.config.optimizer == 'lbfgs' or
+             self.config.lbfgs_switch_residual_rms is not None) and
+                self.fixed_electron_number and
                 self.config.lbfgs_initial_metric == 'fermi'):
             self.log.info(
                 'Fixed-electron L-BFGS uses the scalar initial metric; the '
@@ -642,6 +669,10 @@ class GrandCanonicalKRKS:
         self.max_direction_projection_correction = 0.0
         self.nresidual_filter_acceptances = 0
         self.nresidual_filter_rejections = 0
+        self.nlbfgs_switches = 0
+        self.lbfgs_switch_cycle = -1
+        self.lbfgs_switch_nfev = -1
+        self.lbfgs_switch_actual_residual_rms = np.nan
         self._nlcg_residual_previous_alpha: Optional[float] = None
         self._prepare_fixed_basis_data()
         bytes_per_pair = 2 * sum(
@@ -911,10 +942,25 @@ class GrandCanonicalKRKS:
                 'nlcg_residual_filter_rms')
 
     def _validate_lbfgs_config(self) -> None:
+        switch = self.config.lbfgs_switch_residual_rms
+        if switch is not None:
+            switch = _as_float(switch, 'lbfgs_switch_residual_rms')
+            if switch <= 0.0:
+                raise ValueError(
+                    'lbfgs_switch_residual_rms must be positive when enabled')
+            if switch < self.config.conv_tol_residual_rms:
+                raise ValueError(
+                    'lbfgs_switch_residual_rms may not be smaller than '
+                    'conv_tol_residual_rms')
+            self.config.lbfgs_switch_residual_rms = switch
         if (not isinstance(self.config.lbfgs_history_size, int) or
                 isinstance(self.config.lbfgs_history_size, bool) or
                 self.config.lbfgs_history_size < 0):
             raise ValueError('lbfgs_history_size must be a nonnegative integer')
+        if switch is not None and self.config.lbfgs_history_size == 0:
+            raise ValueError(
+                'lbfgs_history_size must be positive when the NLCG-to-L-BFGS '
+                'handoff is enabled')
         positive = (
             'lbfgs_curvature_tol', 'lbfgs_min_pair_step_rms',
             'lbfgs_descent_cosine_min', 'lbfgs_inverse_metric_cap',
@@ -956,6 +1002,12 @@ class GrandCanonicalKRKS:
                     'diis_switch_residual_rms may not be smaller than '
                     'conv_tol_residual_rms')
             self.config.diis_switch_residual_rms = switch
+        lbfgs_switch = self.config.lbfgs_switch_residual_rms
+        if (switch is not None and lbfgs_switch is not None and
+                switch >= lbfgs_switch):
+            raise ValueError(
+                'diis_switch_residual_rms must be smaller than '
+                'lbfgs_switch_residual_rms so the L-BFGS phase is reachable')
         for name, minimum in (
                 ('diis_space', 2), ('diis_max_backtracks', 0),
                 ('diis_model_max_backtracks', 0),
@@ -2020,6 +2072,10 @@ class GrandCanonicalKRKS:
         threshold = self.config.diis_switch_residual_rms
         return threshold is not None and state.residual_rms <= threshold
 
+    def _should_start_lbfgs(self, state: _GCState) -> bool:
+        threshold = self.config.lbfgs_switch_residual_rms
+        return threshold is not None and state.residual_rms <= threshold
+
     def _append_diis_item(self, history: list[_DIISItem],
                           state: _GCState) -> None:
         history.append(_DIISItem(
@@ -3039,7 +3095,8 @@ class GrandCanonicalKRKS:
             self, state: _GCState, direction: Sequence,
             alpha_init: Optional[float] = None,
             alpha_cap_override: Optional[float] = None,
-            nelec_limit_override: Optional[float] = None
+            nelec_limit_override: Optional[float] = None, *,
+            residual_filter_enabled: bool = True
             ) -> _LineSearchResult:
         """Cached Hager--Zhang weak/approximate-Wolfe line search."""
         start_nfev = self.nfev
@@ -3047,6 +3104,7 @@ class GrandCanonicalKRKS:
         reduction_start = self.ncheap_nelec_alpha_reductions
         filter_rejection_start = self.nresidual_filter_rejections
         filter_active = (
+            residual_filter_enabled and
             self.config.nlcg_residual_filter_rms is not None and
             state.residual_rms <= self.config.nlcg_residual_filter_rms)
         maximum_evals = self.config.hager_zhang_max_evals
@@ -3134,8 +3192,11 @@ class GrandCanonicalKRKS:
             point = _HZPoint(
                 alpha, trial, phi, dphi, info, charge_boundary, failed)
             cache[alpha] = point
-            _, bounded, _, _ = self._residual_filter_metrics(
-                state, trial)
+            if filter_active:
+                _, bounded, _, _ = self._residual_filter_metrics(
+                    state, trial)
+            else:
+                bounded = True
             if (not failed and
                     phi <= phi0 + delta * alpha * dphi0 and
                     bounded and
@@ -3164,8 +3225,12 @@ class GrandCanonicalKRKS:
                 noise > 0.0 and point.phi <= threshold and
                 point.dphi >= sigma * dphi0 and
                 point.dphi <= (2.0 * delta - 1.0) * dphi0)
-            active, bounded, strong, residual_ratio = (
-                self._residual_filter_metrics(state, point.state))
+            if filter_active:
+                active, bounded, strong, residual_ratio = (
+                    self._residual_filter_metrics(state, point.state))
+            else:
+                active, bounded, strong, residual_ratio = (
+                    False, True, False, np.nan)
             if active and (ordinary or approximate) and not bounded:
                 if point.alpha not in residual_vetoed:
                     residual_vetoed.add(point.alpha)
@@ -3346,13 +3411,19 @@ class GrandCanonicalKRKS:
             alpha_init: Optional[float] = None,
             alpha_cap_override: Optional[float] = None, *,
             allow_nelec_projection: bool = True,
-            nelec_limit_override: Optional[float] = None
+            nelec_limit_override: Optional[float] = None,
+            method_override: Optional[str] = None,
+            residual_filter_enabled: bool = True
             ) -> _LineSearchResult:
-        if self.config.line_search_method == 'hager-zhang':
+        method = (self.config.line_search_method
+                  if method_override is None else
+                  self._canonical_line_search_method(method_override))
+        if method == 'hager-zhang':
             return self._hager_zhang_line_search(
                 state, direction, alpha_init=alpha_init,
                 alpha_cap_override=alpha_cap_override,
-                nelec_limit_override=nelec_limit_override)
+                nelec_limit_override=nelec_limit_override,
+                residual_filter_enabled=residual_filter_enabled)
 
         start_nfev = self.nfev
         cheap_start = self.ncheap_nelec_evaluations
@@ -3477,13 +3548,15 @@ class GrandCanonicalKRKS:
             max_evals_override: Optional[int] = None,
             alpha_cap_override: Optional[float] = None,
             allow_nelec_projection: bool = True,
-            nelec_limit_override: Optional[float] = None
+            nelec_limit_override: Optional[float] = None,
+            residual_filter_enabled: bool = True
             ) -> _LineSearchResult:
         start_nfev = self.nfev
         cheap_start = self.ncheap_nelec_evaluations
         reduction_start = self.ncheap_nelec_alpha_reductions
         filter_rejection_start = self.nresidual_filter_rejections
         filter_active = (
+            residual_filter_enabled and
             self.config.nlcg_residual_filter_rms is not None and
             state.residual_rms <= self.config.nlcg_residual_filter_rms)
         maximum_evals = self.config.line_search_max_evals
@@ -3567,8 +3640,12 @@ class GrandCanonicalKRKS:
                 trial is not None and
                 trial.objective <= state.objective +
                 self.config.line_search_c1 * alpha * dphi0)
-            active, bounded, strong, residual_ratio = (
-                self._residual_filter_metrics(state, trial))
+            if residual_filter_enabled:
+                active, bounded, strong, residual_ratio = (
+                    self._residual_filter_metrics(state, trial))
+            else:
+                active, bounded, strong, residual_ratio = (
+                    False, True, False, np.nan)
             if active and armijo and not bounded:
                 self.nresidual_filter_rejections += 1
             elif armijo:
@@ -3848,6 +3925,10 @@ class GrandCanonicalKRKS:
         self.max_direction_projection_correction = 0.0
         self.nresidual_filter_acceptances = 0
         self.nresidual_filter_rejections = 0
+        self.nlbfgs_switches = 0
+        self.lbfgs_switch_cycle = -1
+        self.lbfgs_switch_nfev = -1
+        self.lbfgs_switch_actual_residual_rms = np.nan
 
     def _canonical_continuation_config(
             self, residual_tolerance: float,
@@ -3859,6 +3940,7 @@ class GrandCanonicalKRKS:
             checkpoint_path=None,
             checkpoint_interval=0,
             initial_electron_number=None,
+            lbfgs_switch_residual_rms=None,
             conv_tol_residual_rms=residual_tolerance,
             # Canonical continuation is a fixed-point globalization.  Enter
             # residual DIIS immediately instead of spending low-temperature
@@ -4200,6 +4282,12 @@ class GrandCanonicalKRKS:
         combined_history = continuation_history + final_history
         total_evaluations = pre_evaluations + final_result.nfev
         total_iterations = pre_iterations + final_result.niter
+        switch_cycle = final_result.lbfgs_switch_cycle
+        switch_nfev = final_result.lbfgs_switch_nfev
+        if switch_cycle >= 0:
+            switch_cycle += pre_iterations
+        if switch_nfev >= 0:
+            switch_nfev += pre_evaluations
         self.nfev = total_evaluations
         self.ncheap_nelec_reject = final_result.cheap_nelec_rejections
         self.history = combined_history
@@ -4210,7 +4298,13 @@ class GrandCanonicalKRKS:
             'canonical_continuation_delta_nelec': (
                 best_handoff_delta_nelec),
             'fock_evaluations_total': total_evaluations,
+            'lbfgs_switch_cycle_gc': switch_cycle,
+            'lbfgs_switch_nfev_gc': switch_nfev,
         })
+        self.lbfgs_switch_cycle = switch_cycle
+        self.lbfgs_switch_nfev = switch_nfev
+        self.mf.lbfgs_switch_cycle_gc = switch_cycle
+        self.mf.lbfgs_switch_nfev_gc = switch_nfev
         message = (
             f'canonical continuation ({outer_steps} outer steps, '
             f'{continuation_evaluations} Fock evaluations); '
@@ -4225,6 +4319,8 @@ class GrandCanonicalKRKS:
             canonical_continuation_evaluations=continuation_evaluations,
             canonical_continuation_mu_error=best_error,
             canonical_continuation_delta_nelec=best_handoff_delta_nelec,
+            lbfgs_switch_cycle=switch_cycle,
+            lbfgs_switch_nfev=switch_nfev,
         )
 
     def kernel(self, dm0: Any = None, h0: Any = None) -> GrandCanonicalResult:
@@ -4245,6 +4341,8 @@ class GrandCanonicalKRKS:
         self.nfev = 0
         self._reset_run_diagnostics()
         self._nlcg_residual_previous_alpha = None
+        self._lbfgs_history = []
+        self._diis_history = []
         state = self.evaluate(self._initial_h(dm0, h0))
         previous: Optional[_GCState] = None
         direction = self.copy_blocks(state.residual)
@@ -4267,6 +4365,20 @@ class GrandCanonicalKRKS:
                     'CG memory reset', state.residual_rms)
                 return self._kernel_diis(
                     state, previous, niter=niter, cycle_start=cycle)
+            if self._should_start_lbfgs(state):
+                self.nlbfgs_switches += 1
+                self.lbfgs_switch_cycle = cycle
+                self.lbfgs_switch_nfev = self.nfev
+                self.lbfgs_switch_actual_residual_rms = state.residual_rms
+                self._nlcg_residual_previous_alpha = None
+                self.log.info(
+                    'Switching from NLCG to L-BFGS at |F-H|_rms = %.6g; '
+                    'CG and L-BFGS memory reset', state.residual_rms)
+                return self._kernel_lbfgs_from_state(
+                    state, previous, niter=niter, cycle_start=cycle,
+                    line_search_method=(
+                        self.config.lbfgs_switch_line_search_method),
+                    residual_filter_enabled=False)
             direction, restarted, restart_reason = self._ensure_descent(state, direction)
             if not self._is_descent(state, direction):
                 if state.grad_rms < self.config.conv_tol_grad_rms and state.residual_rms < self.config.conv_tol_residual_rms:
@@ -4411,15 +4523,28 @@ class GrandCanonicalKRKS:
         self.nfev = 0
         self._reset_run_diagnostics()
         state = self.evaluate(self._initial_h(dm0, h0))
-        previous: Optional[_GCState] = None
+        return self._kernel_lbfgs_from_state(
+            state, None, niter=0, cycle_start=0,
+            line_search_method=self.config.line_search_method,
+            residual_filter_enabled=True)
+
+    def _kernel_lbfgs_from_state(
+            self, state: _GCState, previous: Optional[_GCState], *,
+            niter: int, cycle_start: int, line_search_method: str,
+            residual_filter_enabled: bool) -> GrandCanonicalResult:
+        """Continue from an evaluated state with fresh L-BFGS memory."""
+        line_search_method = self._canonical_line_search_method(
+            line_search_method)
+        if not isinstance(residual_filter_enabled, bool):
+            raise TypeError('residual_filter_enabled must be boolean')
         lbfgs_history: list[_LBFGSPair] = []
         self._lbfgs_history = lbfgs_history
+        self._last_lbfgs_metric_scale = np.nan
         consecutive = 0
         message = 'maximum cycles reached'
         converged = False
-        niter = 0
 
-        for cycle in range(self.config.max_cycle):
+        for cycle in range(cycle_start, self.config.max_cycle):
             if self._meets_convergence(state, previous):
                 consecutive += 1
                 if (previous is None or
@@ -4486,7 +4611,9 @@ class GrandCanonicalKRKS:
                 alpha_cap_override=(
                     1.0 if (used_history and
                             self.config.lbfgs_cap_unit_step_with_history)
-                    else None))
+                    else None),
+                method_override=line_search_method,
+                residual_filter_enabled=residual_filter_enabled)
             fallback_used = False
             if not line_search.success:
                 primary_line_search = line_search
@@ -4497,7 +4624,8 @@ class GrandCanonicalKRKS:
                 dphi0 = self.inner(state.gradient, direction)
                 descent_cosine = self._descent_cosine(state, direction)
                 fallback_line_search = self._armijo_fallback(
-                    state, direction)
+                    state, direction,
+                    residual_filter_enabled=residual_filter_enabled)
                 line_search = self._combine_line_search_work(
                     primary_line_search, fallback_line_search)
                 fallback_used = True
@@ -4648,6 +4776,11 @@ class GrandCanonicalKRKS:
             self.nresidual_filter_acceptances)
         self.mf.residual_filter_rejections_gc = (
             self.nresidual_filter_rejections)
+        self.mf.lbfgs_switches_gc = self.nlbfgs_switches
+        self.mf.lbfgs_switch_cycle_gc = self.lbfgs_switch_cycle
+        self.mf.lbfgs_switch_nfev_gc = self.lbfgs_switch_nfev
+        self.mf.lbfgs_switch_residual_rms_gc = (
+            self.lbfgs_switch_actual_residual_rms)
         self.mf.fixed_electron_number = self.fixed_electron_number
         self.mf.target_electron_number = self.target_electron_number
         self.mf.h_aux_gc = self.copy_blocks(state.h_orth)
@@ -4692,6 +4825,11 @@ class GrandCanonicalKRKS:
                 self.nresidual_filter_acceptances),
             'residual_filter_rejections_gc': (
                 self.nresidual_filter_rejections),
+            'lbfgs_switches_gc': self.nlbfgs_switches,
+            'lbfgs_switch_cycle_gc': self.lbfgs_switch_cycle,
+            'lbfgs_switch_nfev_gc': self.lbfgs_switch_nfev,
+            'lbfgs_switch_residual_rms_gc': (
+                self.lbfgs_switch_actual_residual_rms),
             'fixed_electron_number': self.fixed_electron_number,
         })
         return GrandCanonicalResult(
@@ -4730,4 +4868,9 @@ class GrandCanonicalKRKS:
             residual_filter_acceptances=(
                 self.nresidual_filter_acceptances),
             residual_filter_rejections=(
-                self.nresidual_filter_rejections))
+                self.nresidual_filter_rejections),
+            lbfgs_switches=self.nlbfgs_switches,
+            lbfgs_switch_cycle=self.lbfgs_switch_cycle,
+            lbfgs_switch_nfev=self.lbfgs_switch_nfev,
+            lbfgs_switch_actual_residual_rms=(
+                self.lbfgs_switch_actual_residual_rms))
