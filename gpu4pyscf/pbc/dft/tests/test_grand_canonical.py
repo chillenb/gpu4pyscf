@@ -1234,8 +1234,8 @@ def test_canonical_inner_points_share_workspace_without_publishing(
             diis_children.append(child)
             return original_run_diis(*args, **kwargs)
 
-        def observed_solve(h0, seed_state=None):
-            point = original_solve(h0, seed_state=seed_state)
+        def observed_solve(h0):
+            point = original_solve(h0)
             points.append((child, point))
             return point
 
@@ -1289,85 +1289,6 @@ def test_automatic_canonical_continuation_finds_fixed_mu_electron_number():
     assert result.nfev == mf.veff_calls
     assert result.nfev > result.canonical_continuation_evaluations
     assert solver.config.diis_max_coefficient_l1 == pytest.approx(10.0)
-
-
-def test_fixed_n_view_matches_evaluation_without_extra_fock():
-    mf, fixed_mu_solver = _solver(mu=-0.1)
-    source = fixed_mu_solver.evaluate([
-        cp.asarray([[-0.31, 0.08 + 0.03j],
-                    [0.08 - 0.03j, 0.19]])])
-    fixed_n_solver = GrandCanonicalKRKS(
-        mf, sigma=fixed_mu_solver.sigma,
-        config=replace(fixed_mu_solver.config),
-        electron_number=source.electron_number)
-    veff_calls_before = mf.veff_calls
-
-    view = fixed_n_solver._fixed_n_view(source)
-
-    assert fixed_n_solver.nfev == 0
-    assert mf.veff_calls == veff_calls_before
-    evaluated = fixed_n_solver.evaluate(source.h_orth)
-    assert fixed_n_solver.nfev == 1
-    assert mf.veff_calls == veff_calls_before + 1
-    assert view.electron_number == pytest.approx(
-        evaluated.electron_number, abs=1.0e-12)
-    assert view.auxiliary_mu == pytest.approx(
-        evaluated.auxiliary_mu, abs=2.0e-12)
-    assert view.chemical_potential == pytest.approx(
-        evaluated.chemical_potential, abs=2.0e-12)
-    assert view.gauge_shift == pytest.approx(
-        evaluated.gauge_shift, abs=2.0e-12)
-    assert view.free_energy == pytest.approx(
-        evaluated.free_energy, abs=2.0e-12)
-    assert view.grand_potential == pytest.approx(
-        evaluated.grand_potential, abs=2.0e-12)
-    assert view.objective == pytest.approx(
-        evaluated.objective, abs=2.0e-12)
-    assert view.grad_rms == pytest.approx(evaluated.grad_rms, abs=2.0e-12)
-    assert view.residual_rms == pytest.approx(
-        evaluated.residual_rms, abs=2.0e-12)
-    assert fixed_n_solver.rms(fixed_n_solver.axpy(
-        -1.0, evaluated.gradient, view.gradient)) < 2.0e-12
-    assert fixed_n_solver.rms(fixed_n_solver.axpy(
-        -1.0, evaluated.residual, view.residual)) < 2.0e-12
-    assert fixed_n_solver.rms(fixed_n_solver.axpy(
-        -1.0, evaluated.dm_ao, view.dm_ao)) < 2.0e-12
-    assert abs(fixed_n_solver.inner(
-        view.gradient, fixed_n_solver.identity)) < 1.0e-12
-
-
-def test_fixed_n_point_resume_skips_redundant_initial_fock():
-    mf, fixed_mu_solver = _solver(mu=-0.1)
-    source = fixed_mu_solver.evaluate([
-        cp.asarray([[-0.31, 0.08 + 0.03j],
-                    [0.08 - 0.03j, 0.19]])])
-    config = replace(
-        fixed_mu_solver.config, conv_tol_residual_rms=10.0)
-    fixed_n_solver = GrandCanonicalKRKS(
-        mf, sigma=fixed_mu_solver.sigma, config=config,
-        electron_number=source.electron_number,
-        _workspace=fixed_mu_solver._workspace)
-    veff_calls_before = mf.veff_calls
-
-    resumed = fixed_n_solver._solve_fixed_n_point(
-        source.h_orth, seed_state=source)
-
-    assert resumed.converged
-    assert resumed.target_electron_number == pytest.approx(
-        source.electron_number, abs=1.0e-14)
-    assert resumed.nfev == 0
-    assert resumed.niter == 0
-    assert resumed.history == ()
-    assert mf.veff_calls == veff_calls_before
-
-    fresh = fixed_n_solver._solve_fixed_n_point(source.h_orth)
-    assert fresh.converged
-    assert fresh.nfev == 1
-    assert fresh.niter == 0
-    assert mf.veff_calls == veff_calls_before + 1
-    assert resumed.mu == pytest.approx(fresh.mu, abs=2.0e-12)
-    assert resumed.residual_rms == pytest.approx(
-        fresh.residual_rms, abs=2.0e-12)
 
 
 @pytest.mark.parametrize(
