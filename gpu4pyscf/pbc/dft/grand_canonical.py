@@ -577,6 +577,31 @@ class _DIISItem:
     residual: list
 
 
+@dataclass(frozen=True)
+class _GCWorkspace:
+    """Immutable mean-field data shared by every solve in one calculation."""
+
+    mf: Any
+    kpts: np.ndarray
+    nkpts: int
+    weights: cp.ndarray
+    s_ao: tuple
+    hcore_ao: tuple
+    hcore_for_energy: Any
+    x_ao2orth: tuple
+    nao: int
+    north: tuple[int, ...]
+    identity: tuple
+    ndof: float
+    tr_pairs: tuple[tuple[int, int], ...]
+    time_reversal_enabled: bool
+    checkpoint_fingerprint: str
+    nuclear_energy: float
+    energy_vhf_keyword: str
+    check_time_reversal: bool
+    enforce_time_reversal: bool
+
+
 @dataclass
 class GrandCanonicalResult:
     converged: bool
@@ -759,7 +784,8 @@ class GrandCanonicalKRKS:
     def __init__(self, mf: Any, mu: Optional[float] = None,
                  sigma: Optional[float] = None,
                  config: Optional[GrandCanonicalConfig] = None,
-                 electron_number: Optional[float] = None):
+                 electron_number: Optional[float] = None,
+                 _workspace: Optional[_GCWorkspace] = None):
         self.mf = mf
         if sigma is None:
             raise TypeError('sigma is required')
@@ -887,7 +913,11 @@ class GrandCanonicalKRKS:
         self._canonical_precondition_streak = 0
         self._canonical_precondition_last_nfev = -1
         self._nlcg_residual_previous_alpha: Optional[float] = None
-        self._prepare_fixed_basis_data()
+        if _workspace is None:
+            self._prepare_fixed_basis_data()
+            self._workspace = self._capture_workspace()
+        else:
+            self._install_workspace(_workspace)
         bytes_per_pair = 2 * sum(
             n * n * int(x.dtype.itemsize)
             for n, x in zip(self.north, self.x_ao2orth))
@@ -1515,6 +1545,75 @@ class GrandCanonicalKRKS:
         self._tr_pairs, self._time_reversal_enabled = self._initialise_time_reversal()
         self._checkpoint_fingerprint = self._mean_field_fingerprint()
 
+    def _capture_workspace(self) -> _GCWorkspace:
+        """Freeze setup data that is invariant throughout one solver run."""
+        energy_parameters = inspect.signature(self.mf.energy_elec).parameters
+        energy_vhf_keyword = (
+            'vhf' if ('vhf' in energy_parameters or
+                      any(parameter.kind == inspect.Parameter.VAR_KEYWORD
+                          for parameter in energy_parameters.values()))
+            else 'vhf_kpts')
+        nuclear_energy = _as_float(
+            self.mf.energy_nuc(), 'nuclear energy')
+        return _GCWorkspace(
+            mf=self.mf,
+            kpts=self.kpts,
+            nkpts=self.nkpts,
+            weights=self.weights,
+            s_ao=tuple(self.s_ao),
+            hcore_ao=tuple(self.hcore_ao),
+            hcore_for_energy=_stack_or_list(self.hcore_ao),
+            x_ao2orth=tuple(self.x_ao2orth),
+            nao=self.nao,
+            north=tuple(self.north),
+            identity=tuple(self.identity),
+            ndof=self.ndof,
+            tr_pairs=tuple(self._tr_pairs),
+            time_reversal_enabled=self._time_reversal_enabled,
+            checkpoint_fingerprint=self._checkpoint_fingerprint,
+            nuclear_energy=nuclear_energy,
+            energy_vhf_keyword=energy_vhf_keyword,
+            check_time_reversal=self.config.check_time_reversal,
+            enforce_time_reversal=self.config.enforce_time_reversal,
+        )
+
+    def _install_workspace(self, workspace: _GCWorkspace) -> None:
+        """Install a validated workspace without rebuilding immutable data."""
+        if not isinstance(workspace, _GCWorkspace):
+            raise TypeError('_workspace must be a _GCWorkspace')
+        if workspace.mf is not self.mf:
+            raise ValueError('a shared workspace belongs to a different mf')
+        if (workspace.check_time_reversal !=
+                self.config.check_time_reversal or
+                workspace.enforce_time_reversal !=
+                self.config.enforce_time_reversal):
+            raise ValueError(
+                'shared workspace time-reversal settings do not match config')
+        self._workspace = workspace
+        self.kpts = workspace.kpts
+        self.nkpts = workspace.nkpts
+        self.weights = workspace.weights
+        self.s_ao = list(workspace.s_ao)
+        self.hcore_ao = list(workspace.hcore_ao)
+        self.x_ao2orth = list(workspace.x_ao2orth)
+        self.nao = workspace.nao
+        self.north = list(workspace.north)
+        self.identity = list(workspace.identity)
+        self.ndof = workspace.ndof
+        self._tr_pairs = list(workspace.tr_pairs)
+        self._time_reversal_enabled = workspace.time_reversal_enabled
+        self._checkpoint_fingerprint = workspace.checkpoint_fingerprint
+
+    def _spawn_fixed_n(
+            self, electron_number: float,
+            config: GrandCanonicalConfig) -> 'GrandCanonicalKRKS':
+        """Create a fixed-N run context sharing all immutable mf setup."""
+        if self.fixed_electron_number:
+            raise AssertionError('fixed-N child requires a fixed-mu parent')
+        return GrandCanonicalKRKS(
+            self.mf, mu=self.mu, sigma=self.sigma, config=config,
+            electron_number=electron_number, _workspace=self._workspace)
+
     def _mean_field_fingerprint(self) -> str:
         """A conservative restart guard for cell, basis, and DFT configuration."""
         cell = self.mf.cell
@@ -1764,7 +1863,7 @@ class GrandCanonicalKRKS:
         response potential and expose the matched assembly through get_fock.
         Calling it at cycle=-1 bypasses DIIS, damping, and level shifting.
         """
-        hcore = _stack_or_list(self.hcore_ao)
+        hcore = self._workspace.hcore_for_energy
         if getattr(veff, 'v_solvent', None) is not None:
             if not hasattr(self.mf, 'get_fock'):
                 raise TypeError('tagged solvent potential requires mf.get_fock')
@@ -1822,15 +1921,11 @@ class GrandCanonicalKRKS:
         # KRKS calls this argument ``vhf`` while KSCF-style decorators, such
         # as PeriodicLPBE, retain the older ``vhf_kpts`` spelling.  In either
         # case the exact tagged object returned above must be passed through.
-        energy_parameters = inspect.signature(self.mf.energy_elec).parameters
-        vhf_keyword = 'vhf' if ('vhf' in energy_parameters or
-                                any(p.kind == inspect.Parameter.VAR_KEYWORD
-                                    for p in energy_parameters.values())) else 'vhf_kpts'
         electronic_energy, _ = self.mf.energy_elec(
-            dm_kpts=dm, h1e_kpts=_stack_or_list(self.hcore_ao),
-            **{vhf_keyword: veff})
+            dm_kpts=dm, h1e_kpts=self._workspace.hcore_for_energy,
+            **{self._workspace.energy_vhf_keyword: veff})
         electronic_energy = _as_float(electronic_energy, 'electronic energy')
-        nuclear_energy = _as_float(self.mf.energy_nuc(), 'nuclear energy')
+        nuclear_energy = self._workspace.nuclear_energy
         dft_total_energy = electronic_energy + nuclear_energy
         fock = self._to_orth(fock_ao)
         entropy, entropy_energy = self._entropy(eigenvalues, q)
@@ -4606,11 +4701,10 @@ class GrandCanonicalKRKS:
             # The trust update expands this damping rapidly when warranted.
             initial_damping = (
                 self.config.canonical_continuation_initial_damping)
-            canonical_solver = GrandCanonicalKRKS(
-                self.mf, mu=self.mu, sigma=self.sigma,
-                config=self._canonical_continuation_config(
-                    residual_tolerance, initial_damping),
-                electron_number=current_nelec)
+            canonical_solver = self._spawn_fixed_n(
+                current_nelec,
+                self._canonical_continuation_config(
+                    residual_tolerance, initial_damping))
             if outer == 0 and seed_state is not None:
                 canonical_solver.history = []
                 canonical_solver.nfev = 0
