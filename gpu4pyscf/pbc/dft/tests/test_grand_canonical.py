@@ -163,9 +163,10 @@ def test_constructor_and_stream_object_configuration():
     with pytest.raises(TypeError, match='different ensembles'):
         GrandCanonicalKRKS(mf, mu=-.1, sigma=.1, nelec=1.2)
     solver = GrandCanonicalKRKS(mf, mu=-.1, sigma=.1).set(
-        conv_tol=1e-7, diis_space=4)
+        conv_tol=1e-7, diis_space=4, diis_backtrack=.4)
     assert solver.conv_tol == 1e-7
     assert solver.diis_space == 4
+    assert solver.diis_backtrack == .4
 
 
 def test_build_caches_mean_field_setup():

@@ -19,6 +19,19 @@ class GrandCanonicalKRKS(StreamObject):
     conv_tol_nelec: float
     diis_space: int
     damp: float
+    diis_backtrack: float
+    diis_max_backtrack: int
+    diis_min_reduction: float
+    diis_trust_shrink: float
+    diis_trust_expand: float
+    diis_expansion: float
+    diis_expand_reduction: float
+    min_damp: float
+    initial_nelec_step: float
+    max_nelec_step_fraction: float
+    root_nelec_tol: float
+    verify_residual_tol: float
+    verify_density_tol: float
     callback: Callable[[dict[str, Any]], None] | None
     enforce_time_reversal: bool
 
