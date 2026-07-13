@@ -18,6 +18,8 @@ from typing import Any, Optional, Sequence
 import numpy as np
 import cupy as cp
 
+from pyscf.scf.addons import _fermi_smearing_occ, _smearing_optimize
+
 from gpu4pyscf.lib import logger
 
 try:  # cupyx supplies the most efficient, branch-stable implementation.
@@ -50,7 +52,6 @@ class GrandCanonicalConfig:
     preconditioned_descent_cosine_min: float = 0.05
     exact_gradient_polish_residual_rms: float = 1.0e-4
     mu_electron_number_tol: float = 1.0e-12
-    mu_max_cycle: int = 100
 
     # Optional residual-DIIS final polishing.  The direct optimizer hands off
     # once the residual reaches the switch threshold.  DIIS then prioritizes
@@ -1237,33 +1238,27 @@ class GrandCanonicalKRKS:
 
     def _solve_chemical_potential(self, orbital_energies: Sequence) -> float:
         """Find mu such that the Fermi occupations have the target electron count."""
-        target = self.target_electron_number
-        margin = max(1.0, 50.0 * self.sigma)
-        lower = min(float(cp.min(value).item()) for value in orbital_energies) - margin
-        upper = max(float(cp.max(value).item()) for value in orbital_energies) + margin
+        # PySCF's smearing helper works with the unweighted sum of one-spin
+        # occupations.  This class accepts only a full, uniformly weighted
+        # k-point mesh, so the equivalent target is N * nkpts / 2.
+        mo_es = np.concatenate([
+            cp.asnumpy(cp.asarray(value)).ravel()
+            for value in orbital_energies
+        ])
+        nocc = self.target_electron_number * self.nkpts / 2.0
+        mu, _ = _smearing_optimize(
+            _fermi_smearing_occ, mo_es, nocc, self.sigma)
+        mu_values = np.asarray(mu).reshape(-1)
+        if mu_values.size != 1:
+            raise ValueError('PySCF smearing returned a nonscalar chemical potential')
+        mu = _as_float(mu_values[0], 'chemical potential')
 
-        def electron_number(mu: float) -> float:
-            return 2.0 * sum(
-                float((self.weights[k] * cp.sum(fermi_occupations(
-                    self.beta * (value - mu)))).item())
-                for k, value in enumerate(orbital_energies))
-
-        midpoint = 0.5 * (lower + upper)
-        for _ in range(self.config.mu_max_cycle):
-            midpoint = 0.5 * (lower + upper)
-            nelec = electron_number(midpoint)
-            if abs(nelec - target) <= self.config.mu_electron_number_tol:
-                return midpoint
-            if nelec < target:
-                lower = midpoint
-            else:
-                upper = midpoint
-        nelec = electron_number(midpoint)
-        if abs(nelec - target) > self.config.mu_electron_number_tol:
+        nelec = self._electron_number_from_eigenvalues(orbital_energies, mu)
+        if abs(nelec - self.target_electron_number) > self.config.mu_electron_number_tol:
             raise RuntimeError(
                 'chemical-potential solve did not reach the target electron '
-                f'number: {nelec:.15g} vs {target:.15g}')
-        return midpoint
+                f'number: {nelec:.15g} vs {self.target_electron_number:.15g}')
+        return mu
 
     def _thermal_density(self, h: Sequence) -> tuple[list, list, list, list,
                                                             list, cp.ndarray, float]:
