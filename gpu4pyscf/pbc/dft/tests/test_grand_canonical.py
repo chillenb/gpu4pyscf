@@ -322,6 +322,15 @@ def test_fock_evaluation_count_includes_initial_density_build():
     assert solver.nfev == 2
 
 
+def test_fixed_mu_starts_from_initial_density_electron_number():
+    mf, solver = _solver(mu=-.16)
+    solver.build()
+    dm0 = cp.asarray([[[.7, .1j], [-.1j, .2]]])
+    unused_h, nelec = solver._initial_h(dm0)
+    assert nelec == pytest.approx(.9)
+    assert nelec != pytest.approx(solver._nelec_at_mu(unused_h, solver.mu))
+
+
 def test_time_reversal_projection_handles_complex_kpoints():
     kpts = np.asarray([[0., 0., 0.], [.25, 0., 0.], [-.25, 0., 0.]])
     f0 = _fock()
