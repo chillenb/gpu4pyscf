@@ -501,12 +501,18 @@ class GrandCanonicalKRKS(lib.StreamObject):
                 dm0 = self.mf.get_init_guess(self.cell)
         dm = cp.stack(self._hermi(self._project_time_reversal(
             _blocks(dm0, 'initial density'))))
+        nelec = self.weight * sum(_as_float(
+            cp.einsum('ij,ji->', d, s), 'initial electron number')
+            for d, s in zip(dm, self.s_ao))
+        if not 0 < nelec < self.capacity:
+            raise ValueError('initial density electron count must lie between '
+                             '0 and %g' % self.capacity)
         self.nfev += 1
         veff = self.mf.get_veff(
             self.cell, dm, dm_last=None, vhf_last=None, hermi=1,
             kpts=self.mf.kpts, kpts_band=None)
-        return self._sanitize_h(self._to_orth(
-            self._fock_from_veff(dm, veff)))
+        h = self._sanitize_h(self._to_orth(self._fock_from_veff(dm, veff)))
+        return h, nelec
 
     def _solve_mu(self, orbital_energies, nelec):
         mo_energy = np.concatenate([
@@ -805,9 +811,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.message = session.message
         return session.state, session.converged
 
-    def _kernel_fixed_mu(self, h):
+    def _kernel_fixed_mu(self, h, current_n):
         samples = []
-        current_n = self._nelec_at_mu(h, self.mu)
         best = None
         best_score = np.inf
         pending = None
@@ -970,9 +975,11 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.refinements = 0
         self.verification_attempts = 0
         self.message = ''
-        h = self._initial_h(dm0)
+        h, initial_nelec = self._initial_h(dm0)
         if self.nelec is None:
-            state, converged = self._kernel_fixed_mu(h)
+            logger.info(self, 'Initial density electron number = %.12g',
+                        initial_nelec)
+            state, converged = self._kernel_fixed_mu(h, initial_nelec)
         else:
             state, converged = self._kernel_fixed_n(h)
         logger.info(self, '%s; total Fock evaluations = %d',
