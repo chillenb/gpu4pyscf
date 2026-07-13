@@ -135,7 +135,6 @@ def _solver(mf=None, mu=None, nelec=None, sigma=.15):
     if mf is None:
         mf = _FixedFockKRKS([_fock()])
     solver = GrandCanonicalKRKS(mf, mu=mu, sigma=sigma, nelec=nelec)
-    solver.enforce_time_reversal = False
     return mf, solver
 
 
@@ -172,7 +171,6 @@ def test_constructor_and_stream_object_configuration():
 def test_build_caches_mean_field_setup():
     mf = _CountingSetupKRKS([_fock()])
     solver = GrandCanonicalKRKS(mf, mu=-.1, sigma=.1)
-    solver.enforce_time_reversal = False
     solver.build()
     solver.build()
     assert mf.setup_calls == dict(
@@ -183,7 +181,6 @@ def test_fixed_n_mu_uses_pyscf_smearing_convention(monkeypatch):
     fock = [cp.diag(cp.asarray([-.7, .3])) for unused in range(3)]
     solver = GrandCanonicalKRKS(
         _FixedFockKRKS(fock), sigma=.15, nelec=1.3)
-    solver.enforce_time_reversal = False
     solver.build()
     energies = [cp.asarray([-.8, .1]), cp.asarray([-.6, .2]),
                 cp.asarray([-.4, .5])]
@@ -234,7 +231,6 @@ def test_tagged_solvent_fock_and_energy_use_same_veff():
     solvent = [cp.asarray([[.1, .03j], [-.03j, -.04]])]
     mf = _TaggedSolventKRKS(hcore, solvent)
     solver = GrandCanonicalKRKS(mf, sigma=.15, nelec=1.2)
-    solver.enforce_time_reversal = False
     solver.build()
     state = solver._evaluate([cp.asarray([[-.2, .1j], [-.1j, .1]])],
                              nelec=1.2)
@@ -248,7 +244,6 @@ def test_residual_diis_converges_complex_fixed_n_problem():
     hcore = [cp.asarray([[-.7, .08j], [-.08j, .3]], dtype=cp.complex128)]
     mf = _LinearFockKRKS(hcore, coupling=.15)
     solver = GrandCanonicalKRKS(mf, sigma=.15, nelec=1.3)
-    solver.enforce_time_reversal = False
     solver.conv_tol = 1e-8
     solver.build()
     h0 = [cp.asarray([[-.2, .18-.07j], [.18+.07j, .5]])]
@@ -264,7 +259,6 @@ def test_same_n_refinement_preserves_diis_session():
     hcore = [cp.asarray([[-.7, .08j], [-.08j, .3]], dtype=cp.complex128)]
     solver = GrandCanonicalKRKS(
         _LinearFockKRKS(hcore, coupling=.15), sigma=.15, nelec=1.3)
-    solver.enforce_time_reversal = False
     solver.build()
     h0 = [cp.asarray([[-.2, .18-.07j], [.18+.07j, .5]])]
     session = solver._new_session(h0, 1.3)
@@ -336,23 +330,10 @@ def test_fixed_mu_clips_an_overcapacity_initial_density():
     mf = _FixedFockKRKS([cp.asarray([[-.7]])])
     mf.get_init_guess = lambda cell, kpts=None: cp.asarray([[[2.1]]])
     solver = GrandCanonicalKRKS(mf, mu=-.16, sigma=.15)
-    solver.enforce_time_reversal = False
     solver.max_outer_cycle = 10
     solver.kernel()
     assert solver.converged, solver.message
     assert abs(solver.mu+.16) < solver.conv_tol_mu
-
-
-def test_time_reversal_projection_handles_complex_kpoints():
-    kpts = np.asarray([[0., 0., 0.], [.25, 0., 0.], [-.25, 0., 0.]])
-    f0 = _fock()
-    mf = _FixedFockKRKS([f0, f0, f0.conj()], kpts=kpts)
-    solver = GrandCanonicalKRKS(mf, sigma=.15, nelec=1.3)
-    solver.build()
-    assert solver._time_reversal
-    blocks = [f0.copy(), f0+.03j*cp.eye(2), f0.conj()]
-    projected = solver._project_time_reversal(blocks)
-    assert float(cp.max(cp.abs(projected[2]-projected[1].conj())).item()) == 0.
 
 
 def _small_periodic_cell():
