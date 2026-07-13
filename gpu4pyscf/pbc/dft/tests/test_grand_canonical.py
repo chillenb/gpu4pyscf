@@ -5,6 +5,7 @@ from dataclasses import FrozenInstanceError, replace
 from pyscf.pbc import gto
 
 from gpu4pyscf.lib.cupy_helper import tag_array
+from gpu4pyscf.pbc.dft import grand_canonical as gc
 from gpu4pyscf.pbc.dft.grand_canonical import (
     GrandCanonicalConfig, GrandCanonicalKRKS, _CanonicalSample,
     _CanonicalWork, _DIISItem, _FixedNSession, _LineSearchResult,
@@ -869,6 +870,36 @@ def test_fixed_electron_number_gradient_and_mu_constraint():
     assert abs(plus.electron_number - target) < solver.config.mu_electron_number_tol
     assert abs(minus.electron_number - target) < solver.config.mu_electron_number_tol
     assert abs(solver.inner(state.gradient, solver.identity)) < 1.0e-12
+
+
+def test_fixed_electron_number_mu_reuses_pyscf_smearing(monkeypatch):
+    target = 1.3
+    fock = [cp.diag(cp.asarray([-0.7, 0.3], dtype=cp.float64)) for _ in range(3)]
+    solver = GrandCanonicalKRKS(
+        _FixedFockKRKS(fock), sigma=0.15, electron_number=target,
+        config=GrandCanonicalConfig(check_time_reversal=False))
+    orbital_energies = [
+        cp.asarray([-0.8, 0.1]),
+        cp.asarray([-0.6, 0.2]),
+        cp.asarray([-0.4, 0.5]),
+    ]
+    original = gc._smearing_optimize
+    seen = {}
+
+    def recording_optimize(f_occ, mo_es, nocc, sigma):
+        seen.update(f_occ=f_occ, mo_es=mo_es.copy(), nocc=nocc, sigma=sigma)
+        return original(f_occ, mo_es, nocc, sigma)
+
+    monkeypatch.setattr(gc, '_smearing_optimize', recording_optimize)
+    mu = solver._solve_chemical_potential(orbital_energies)
+
+    assert seen['f_occ'] is gc._fermi_smearing_occ
+    assert np.array_equal(
+        seen['mo_es'], np.concatenate([cp.asnumpy(x) for x in orbital_energies]))
+    assert seen['nocc'] == target * len(orbital_energies) / 2.0
+    assert seen['sigma'] == solver.sigma
+    assert abs(solver._electron_number_from_eigenvalues(
+        orbital_energies, mu) - target) < solver.config.mu_electron_number_tol
 
 
 def test_fixed_electron_number_minimisation_and_physical_mu():
