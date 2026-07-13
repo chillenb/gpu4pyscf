@@ -34,167 +34,6 @@ __all__ = [
 
 
 @dataclass
-class _BrentRoot:
-    """Stateful safeguarded Brent--Dekker scalar root iteration.
-
-    ``a`` and ``b`` always bracket a root and ``b`` is the endpoint with the
-    smaller residual magnitude.  A proposal must be evaluated and supplied to
-    :meth:`update` before another proposal is requested.  Keeping this state
-    outside the fixed-N solver is important: each scalar function evaluation
-    is itself a fully converged electronic-structure calculation.
-    """
-
-    a: float
-    fa: float
-    b: float
-    fb: float
-    xtol: float
-    c: float
-    fc: float
-    d: float
-    mflag: bool = True
-    pending: Optional[float] = None
-    last_method: str = 'initial-bracket'
-    interpolation_steps: int = 0
-    bisection_steps: int = 0
-
-    @classmethod
-    def from_bracket(
-            cls, x0: float, f0: float, x1: float, f1: float,
-            xtol: float) -> '_BrentRoot':
-        values = (x0, f0, x1, f1, xtol)
-        if not all(np.isfinite(value) for value in values):
-            raise ValueError('Brent bracket values and tolerance must be finite')
-        if xtol <= 0.0:
-            raise ValueError('Brent x tolerance must be positive')
-        if x0 == x1:
-            raise ValueError('Brent bracket endpoints must be distinct')
-        if f0 == 0.0 or f1 == 0.0 or np.signbit(f0) == np.signbit(f1):
-            raise ValueError('Brent bracket must have strictly opposite signs')
-        a, fa, b, fb = float(x0), float(f0), float(x1), float(f1)
-        if abs(fa) < abs(fb):
-            a, b = b, a
-            fa, fb = fb, fa
-        return cls(
-            a=a, fa=fa, b=b, fb=fb, xtol=float(xtol),
-            c=a, fc=fa, d=a)
-
-    @property
-    def bracket(self) -> tuple[float, float]:
-        return tuple(sorted((self.a, self.b)))
-
-    @property
-    def width(self) -> float:
-        return abs(self.b - self.a)
-
-    @property
-    def converged(self) -> bool:
-        """Whether the root or its representable x interval is resolved."""
-        lo, hi = self.bracket
-        return (
-            self.fb == 0.0 or self.width <= self.xtol or
-            not lo < np.nextafter(lo, hi) < hi)
-
-    def proposal(self) -> float:
-        """Return the next inverse-quadratic/secant or bisection proposal."""
-        if self.pending is not None:
-            raise RuntimeError('the pending Brent proposal has not been updated')
-        if self.converged:
-            raise RuntimeError('the Brent root interval has converged')
-
-        use_iqi = (
-            self.fa != self.fc and self.fb != self.fc and
-            self.fa != self.fb)
-        if use_iqi:
-            s = (
-                self.a * self.fb * self.fc /
-                ((self.fa - self.fb) * (self.fa - self.fc)) +
-                self.b * self.fa * self.fc /
-                ((self.fb - self.fa) * (self.fb - self.fc)) +
-                self.c * self.fa * self.fb /
-                ((self.fc - self.fa) * (self.fc - self.fb)))
-            method = 'inverse-quadratic'
-        else:
-            denominator = self.fb - self.fa
-            s = (self.b - self.fb * (self.b - self.a) / denominator
-                 if denominator != 0.0 else np.nan)
-            method = 'secant'
-
-        # Brent's acceptance tests reject interpolation that is outside the
-        # protected part of the bracket or is not contracting quickly enough.
-        protected = 0.75 * self.a + 0.25 * self.b
-        protected_lo, protected_hi = sorted((protected, self.b))
-        reject = (
-            not np.isfinite(s) or
-            not (protected_lo < s < protected_hi) or
-            (self.mflag and
-             abs(s - self.b) >= 0.5 * abs(self.b - self.c)) or
-            (not self.mflag and
-             abs(s - self.b) >= 0.5 * abs(self.c - self.d)) or
-            (self.mflag and abs(self.b - self.c) < self.xtol) or
-            (not self.mflag and abs(self.c - self.d) < self.xtol))
-        if reject:
-            s = self.a + 0.5 * (self.b - self.a)
-            self.mflag = True
-            method = 'bisection'
-        else:
-            self.mflag = False
-
-        # Roundoff must not turn a valid interpolation into an endpoint
-        # reevaluation.  Enforce the usual minimum move toward the opposite
-        # endpoint; ``converged`` handles intervals too narrow to resolve.
-        lo, hi = self.bracket
-        minimum_step = min(self.xtol, 0.5 * (hi - lo))
-        if abs(s - self.b) < minimum_step:
-            s = self.b + np.copysign(minimum_step, self.a - self.b)
-            self.mflag = True
-            method = 'bisection'
-        if not (lo < s < hi):
-            s = lo + 0.5 * (hi - lo)
-            self.mflag = True
-            method = 'bisection'
-        if not (lo < s < hi):  # pragma: no cover - guarded by converged
-            raise RuntimeError('no representable point inside Brent bracket')
-        if method == 'bisection':
-            self.bisection_steps += 1
-        else:
-            self.interpolation_steps += 1
-        self.pending = float(s)
-        self.last_method = method
-        return self.pending
-
-    def update(self, x: float, fx: float) -> None:
-        """Update the sign-changing bracket with an evaluated proposal."""
-        if self.pending is None:
-            raise RuntimeError('Brent update requires a pending proposal')
-        scale = max(1.0, abs(self.pending), abs(x))
-        if abs(x - self.pending) > 32.0 * np.finfo(float).eps * scale:
-            raise ValueError('Brent update does not match its pending proposal')
-        if not np.isfinite(fx):
-            raise ValueError('Brent function value must be finite')
-        lo, hi = self.bracket
-        x_value = self.pending
-        if not lo < x_value < hi:
-            raise ValueError('Brent update must lie strictly inside its bracket')
-
-        old_b, old_fb = self.b, self.fb
-        self.d = self.c
-        self.c = old_b
-        self.fc = old_fb
-        if fx == 0.0:
-            self.a, self.fa = old_b, old_fb
-            self.b, self.fb = x_value, 0.0
-        elif np.signbit(self.fa) != np.signbit(fx):
-            self.b, self.fb = x_value, float(fx)
-        else:
-            self.a, self.fa = x_value, float(fx)
-        if abs(self.fa) < abs(self.fb):
-            self.a, self.b = self.b, self.a
-            self.fa, self.fb = self.fb, self.fa
-        self.pending = None
-
-
-@dataclass
 class GrandCanonicalConfig:
     max_cycle: int = 100
     conv_tol_omega: float = 1.0e-8
@@ -234,7 +73,7 @@ class GrandCanonicalConfig:
     diis_trust_expand_min_relative_reduction: float = 2.0e-2
 
     # Optional fixed-mu globalization through canonical continuation.  Each
-    # inner solve fixes N; the outer scalar Brent iteration zeros the optimized
+    # inner solve fixes N; outer scalar secant steps zero the optimized
     # chemical-potential error before a one-Fock fixed-mu verification.
     canonical_continuation: bool = False
     canonical_continuation_max_outer: int = 16
@@ -243,10 +82,13 @@ class GrandCanonicalConfig:
     canonical_continuation_handoff_delta_nelec: float = 2.0e-5
     canonical_continuation_unbracketed_handoff_delta_nelec: float = 2.0e-5
     canonical_continuation_initial_delta_nelec: float = 3.0e-2
-    canonical_continuation_max_delta_nelec: float = 1.0
-    canonical_continuation_min_delta_nelec: float = 1.0e-5
+    # Deprecated absolute cap retained for constructor compatibility.  None
+    # selects the neutral-electron fraction appended below.
+    canonical_continuation_max_delta_nelec: Optional[float] = None
+    canonical_continuation_min_delta_nelec: float = 1.0e-8
     canonical_continuation_initial_damping: float = 0.125
     canonical_continuation_diis_max_coefficient_l1: float = 50.0
+    canonical_continuation_diis_transport_delta_nelec: float = 1.0e-3
 
     # Optional branch selector for low-temperature calculations.  This shifts
     # only the initial auxiliary Hamiltonian by a scalar; mu and every
@@ -308,6 +150,7 @@ class GrandCanonicalConfig:
     canonical_continuation_verification_residual_tol: float = 1.0e-6
     canonical_continuation_verification_density_tol: float = 1.0e-9
     canonical_continuation_root_nelec_tol: float = 1.0e-8
+    canonical_continuation_max_delta_nelec_fraction: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -423,9 +266,36 @@ class _HZPoint:
 
 @dataclass
 class _DIISItem:
-    h: list
     fock: list
     residual: list
+
+
+@dataclass
+class _DIISRunContext:
+    """Mutable residual-DIIS state that can be advanced more than once."""
+
+    state: _GCState
+    previous: Optional[_GCState]
+    history: list[_DIISItem]
+    damping_hint: float
+    niter: int
+    next_cycle: int
+    converged: bool = False
+    message: str = 'residual-DIIS iteration has not started'
+    transport_pending: bool = False
+    transport_attempts: int = 0
+    transport_acceptances: int = 0
+    transport_resets: int = 0
+
+
+@dataclass(frozen=True)
+class _DIISStepResult:
+    step: _LineSearchResult
+    condition: float
+    coefficient_l1: float
+    history_action: str
+    predicted_residual_rms: float
+    transport_status: str = ''
 
 
 @dataclass(frozen=True)
@@ -510,14 +380,30 @@ class _FixedNPoint:
         return self.state.residual_rms
 
 
+@dataclass
+class _FixedNSession:
+    """One fixed-N solver and its resumable DIIS context."""
+
+    electron_number: float
+    solver: Any
+    context: _DIISRunContext
+    published_history: int = 0
+    published_nfev: int = 0
+    published_niter: int = 0
+    published_transport_attempts: int = 0
+    published_transport_acceptances: int = 0
+    published_transport_resets: int = 0
+
+
 @dataclass(frozen=True)
 class _CanonicalSample:
-    """One converged scalar-root observation without retaining its full state."""
+    """One converged scalar-root observation and optional live DIIS session."""
 
     electron_number: float
     mu_error: float
     residual_rms: float
     fock_orth: list
+    session: Optional[_FixedNSession] = None
 
 
 @dataclass
@@ -529,6 +415,10 @@ class _CanonicalWork:
     fixed_n_nfev: int = 0
     fixed_n_niter: int = 0
     verification_nfev: int = 0
+    refinements: int = 0
+    transport_attempts: int = 0
+    transport_acceptances: int = 0
+    transport_resets: int = 0
 
     @property
     def total_nfev(self) -> int:
@@ -611,6 +501,10 @@ class GrandCanonicalResult:
     canonical_verification_delta_nelec: float = np.nan
     canonical_verification_density_rms: float = np.nan
     canonical_terminal_mode: str = ''
+    canonical_continuation_refinements: int = 0
+    canonical_diis_transport_attempts: int = 0
+    canonical_diis_transport_acceptances: int = 0
+    canonical_diis_transport_resets: int = 0
 
 
 def _as_float(value: Any, name: str = 'value') -> float:
@@ -749,7 +643,6 @@ class GrandCanonicalKRKS:
                         if self.config.verbose is None else self.config.verbose)
         self.log = logger.new_logger(mf, self.verbose)
         self.history: list[IterationRecord] = []
-        self._diis_history: list[_DIISItem] = []
         self.nfev = 0
         self.ncheap_nelec_reject = 0
         self._last_trial_rejected_by_nelec = False
@@ -978,6 +871,12 @@ class GrandCanonicalKRKS:
             value = getattr(self.config, name)
             if not np.isfinite(value) or value <= 0.0:
                 raise ValueError(f'{name} must be finite and positive')
+        transport_delta = (
+            self.config.canonical_continuation_diis_transport_delta_nelec)
+        if not np.isfinite(transport_delta) or transport_delta < 0.0:
+            raise ValueError(
+                'canonical_continuation_diis_transport_delta_nelec must be '
+                'finite and nonnegative')
         reduction = self.config.diis_min_residual_reduction
         if not np.isfinite(reduction) or not 0.0 <= reduction < 1.0:
             raise ValueError(
@@ -1040,7 +939,7 @@ class GrandCanonicalKRKS:
             'canonical_continuation_unbracketed_handoff_delta_nelec',
             'canonical_continuation_handoff_delta_mu',
             'canonical_continuation_initial_delta_nelec',
-            'canonical_continuation_max_delta_nelec',
+            'canonical_continuation_max_delta_nelec_fraction',
             'canonical_continuation_min_delta_nelec',
             'canonical_continuation_initial_damping',
             'canonical_continuation_diis_max_coefficient_l1',
@@ -1052,6 +951,12 @@ class GrandCanonicalKRKS:
             value = getattr(self.config, name)
             if not np.isfinite(value) or value <= 0.0:
                 raise ValueError(f'{name} must be finite and positive')
+        absolute_cap = self.config.canonical_continuation_max_delta_nelec
+        if (absolute_cap is not None and
+                (not np.isfinite(absolute_cap) or absolute_cap <= 0.0)):
+            raise ValueError(
+                'canonical_continuation_max_delta_nelec must be finite and '
+                'positive when supplied')
         if (self.config.canonical_continuation_bracketed_residual_tol >
                 self.config.canonical_continuation_coarse_residual_tol):
             raise ValueError(
@@ -1067,11 +972,10 @@ class GrandCanonicalKRKS:
             raise ValueError(
                 'canonical_continuation_unbracketed_handoff_delta_nelec may '
                 'not exceed canonical_continuation_handoff_delta_nelec')
-        if (self.config.canonical_continuation_initial_delta_nelec >
-                self.config.canonical_continuation_max_delta_nelec):
+        if self.config.canonical_continuation_max_delta_nelec_fraction > 1.0:
             raise ValueError(
-                'canonical_continuation_initial_delta_nelec may not exceed '
-                'canonical_continuation_max_delta_nelec')
+                'canonical_continuation_max_delta_nelec_fraction may not '
+                'exceed 1')
         if self.config.canonical_continuation_initial_damping > 1.0:
             raise ValueError(
                 'canonical_continuation_initial_damping may not exceed 1')
@@ -1796,11 +1700,15 @@ class GrandCanonicalKRKS:
     def _append_diis_item(self, history: list[_DIISItem],
                           state: _GCState) -> None:
         history.append(_DIISItem(
-            self.copy_blocks(state.h_orth),
             self.copy_blocks(state.fock_orth),
             self.copy_blocks(state.residual)))
         if len(history) > self.config.diis_space:
             del history[0]
+
+    def _copy_diis_item(self, item: _DIISItem) -> _DIISItem:
+        return _DIISItem(
+            self.copy_blocks(item.fock),
+            self.copy_blocks(item.residual))
 
     def _diis_coefficients(
             self, history: list[_DIISItem]) -> tuple[np.ndarray, float,
@@ -1907,14 +1815,17 @@ class GrandCanonicalKRKS:
 
     def _try_diis_target(self, state: _GCState, target: Sequence,
                          starting_damping: float = 1.0,
+                         max_backtracks: Optional[int] = None,
                          ) -> tuple[Optional[_GCState], float, str]:
         direction = self.axpy(-1.0, state.h_orth, target)
         if not self.all_finite(direction) or self.norm(direction) == 0.0:
             return None, 0.0, 'zero or nonfinite DIIS direction'
         damping = min(1.0, max(
             self.config.line_search_alpha_min, starting_damping))
+        if max_backtracks is None:
+            max_backtracks = self.config.diis_max_backtracks
         last_reason = 'no DIIS trial evaluated'
-        for _ in range(self.config.diis_max_backtracks + 1):
+        for _ in range(max_backtracks + 1):
             trial = self._trial(state, direction, damping)
             if trial is not None:
                 acceptable, last_reason = self._diis_trial_acceptable(
@@ -1936,28 +1847,66 @@ class GrandCanonicalKRKS:
     def _diis_step(
             self, state: _GCState,
             history: list[_DIISItem], starting_damping: float = 1.0,
-            ) -> tuple[_LineSearchResult, float, float, str, float]:
+            transported: bool = False) -> _DIISStepResult:
         start_nfev = self.nfev
+        latest = history[-1]
         coefficients, condition, coefficient_l1, action = (
             self._diis_coefficients(history))
-        target = self._diis_target(history, coefficients)
-        trial, damping, rejection = self._try_diis_target(
-            state, target, starting_damping)
+        transport_status = ''
+        if transported and action:
+            # Regularization rejected every imported vector before a trial.
+            history[:] = [latest]
+            trial, damping, rejection = self._try_diis_target(
+                state, latest.fock, starting_damping,
+                self.config.diis_max_backtracks)
+            transport_status = 'reset'
+            reset_action = 'discarded pruned transported DIIS history'
+            action = ((action + '; ') if action else '') + reset_action
+        else:
+            target = self._diis_target(history, coefficients)
+            model_backtracks = (
+                0 if transported else
+                (min(2, self.config.diis_max_backtracks)
+                 if len(history) > 1 else self.config.diis_max_backtracks))
+            trial, damping, rejection = self._try_diis_target(
+                state, target, starting_damping, model_backtracks)
+        if trial is None and len(history) > 1:
+            if transported:
+                history[:] = [latest]
+            trial, damping, rejection = self._try_diis_target(
+                state, latest.fock, starting_damping,
+                self.config.diis_max_backtracks)
+            if transported:
+                transport_status = 'reset'
+                fallback_action = (
+                    'discarded rejected transported DIIS history; '
+                    'latest-Fock fallback')
+            else:
+                fallback_action = (
+                    'latest-Fock fallback after rejected Pulay model')
+            action = ((action + '; ') if action else '') + fallback_action
+        elif (transported and trial is not None and
+              transport_status != 'reset'):
+            transport_status = 'accepted'
+            transport_action = 'accepted transported DIIS model'
+            action = ((action + '; ') if action else '') + transport_action
         nfev = self.nfev - start_nfev
         if trial is None:
             message = 'residual-DIIS failed: ' + rejection
-            return (_LineSearchResult(False, None, nfev=nfev,
-                                      message=message),
-                    condition, coefficient_l1, action, np.nan)
+            return _DIISStepResult(
+                _LineSearchResult(False, None, nfev=nfev, message=message),
+                condition, coefficient_l1, action, np.nan,
+                transport_status)
         predicted_residual_rms = self._diis_predicted_residual_rms(
             state, damping)
         message = 'residual-DIIS accepted'
         if damping < 1.0:
             message += f' with damping {damping:.6g}'
-        return (_LineSearchResult(True, trial, damping, nfev,
-                                  False, False, message),
-                condition, coefficient_l1, action,
-                predicted_residual_rms)
+        return _DIISStepResult(
+            _LineSearchResult(True, trial, damping, nfev,
+                              False, False, message),
+            condition, coefficient_l1, action,
+            predicted_residual_rms, transport_status)
 
     def _alpha_cap(self, direction: Sequence) -> float:
         block_rms = self.max_block_rms(direction)
@@ -2937,7 +2886,6 @@ class GrandCanonicalKRKS:
         self.history = []
         self.nfev = 0
         self._reset_run_diagnostics()
-        self._diis_history = []
         state = self.evaluate(self._initial_h(h0=h0))
         outcome = self._run_diis(
             state, None, niter=0, cycle_start=0)
@@ -2989,37 +2937,38 @@ class GrandCanonicalKRKS:
             required_consecutive_conv=1,
         )
 
+    def _canonical_secant_step_cap(self) -> float:
+        """Return the configured cap for post-initial secant proposals."""
+        absolute = self.config.canonical_continuation_max_delta_nelec
+        if absolute is not None:
+            return float(absolute)
+        return (
+            self.config.canonical_continuation_max_delta_nelec_fraction *
+            float(self.mf.cell.nelectron))
+
     def _canonical_continuation_proposal(
             self, samples: Sequence[tuple[float, float] | _CanonicalSample],
-            physical_fock: Sequence, current_nelec: float,
-            maximum_step: float) -> float:
-        """Propose N before a chemical-potential root has been bracketed."""
+            physical_fock: Sequence, current_nelec: float) -> float:
+        """Propose N from the latest secant, or the Fock for the first move."""
         samples = self._canonical_sample_coordinates(samples)
         minimum_step = self.config.canonical_continuation_min_delta_nelec
         proposal = None
-        negative = any(error < 0.0 for _, error in samples)
-        positive = any(error > 0.0 for _, error in samples)
-        if negative and positive:
-            raise ValueError(
-                'a bracketed canonical root must use Brent--Dekker')
-
-        # Use the measured screened dmu/dN once two canonical states are
-        # available.  The vacuum-aligned Fock projection is useful for the
-        # first move but can be extremely aggressive at low temperature; a
-        # positive local secant avoids geometrically growing past the root.
         current_n, current_error = samples[-1]
         previous = next(
             ((n, error) for n, error in reversed(samples[:-1])
              if abs(n - current_n) >= minimum_step), None)
         if previous is not None:
-            slope = ((current_error - previous[1]) /
-                     (current_n - previous[0]))
-            if np.isfinite(slope) and slope > 0.0:
-                local = current_n - current_error / slope
+            denominator = current_error - previous[1]
+            if denominator != 0.0:
+                local = (current_n - current_error *
+                         (current_n - previous[0]) / denominator)
                 if np.isfinite(local):
                     proposal = local
         if proposal is None:
             proposal = self._electron_number_at_mu(physical_fock, self.mu)
+        maximum_step = (
+            self.config.canonical_continuation_initial_delta_nelec
+            if previous is None else self._canonical_secant_step_cap())
         if abs(proposal - current_nelec) < minimum_step:
             proposal = (
                 current_nelec - np.sign(current_error or 1.0) * minimum_step)
@@ -3033,22 +2982,22 @@ class GrandCanonicalKRKS:
         return min(capacity - margin,
                    max(margin, current_nelec + delta))
 
-    def _canonical_brent_from_samples(
-            self, samples: Sequence[tuple[float, float] | _CanonicalSample]
-            ) -> Optional[_BrentRoot]:
-        """Build Brent state from the narrowest evaluated sign bracket."""
-        samples = self._canonical_sample_coordinates(samples)
-        negative = [(n, error) for n, error in samples if error < 0.0]
-        positive = [(n, error) for n, error in samples if error > 0.0]
+    @staticmethod
+    def _canonical_bracket(
+            samples: Sequence[_CanonicalSample]
+            ) -> Optional[tuple[_CanonicalSample, _CanonicalSample]]:
+        """Return the narrowest evaluated sign bracket, ordered by N."""
+        negative = [sample for sample in samples if sample.mu_error < 0.0]
+        positive = [sample for sample in samples if sample.mu_error > 0.0]
         if not negative or not positive:
             return None
         left, right = min(
             ((negative_item, positive_item)
              for negative_item in negative for positive_item in positive),
-            key=lambda pair: abs(pair[0][0] - pair[1][0]))
-        return _BrentRoot.from_bracket(
-            left[0], left[1], right[0], right[1],
-            self.config.canonical_continuation_root_nelec_tol)
+            key=lambda pair: abs(
+                pair[0].electron_number - pair[1].electron_number))
+        return tuple(sorted(
+            (left, right), key=lambda sample: sample.electron_number))
 
     @staticmethod
     def _canonical_sample_coordinates(
@@ -3059,15 +3008,18 @@ class GrandCanonicalKRKS:
             if isinstance(sample, _CanonicalSample) else sample
             for sample in samples]
 
-    @staticmethod
     def _canonical_sample_index(
+            self,
             samples: Sequence[_CanonicalSample],
             electron_number: float) -> Optional[int]:
+        tolerance = self.config.canonical_continuation_root_nelec_tol
         return next((
             index for index, sample in enumerate(samples)
-            if abs(sample.electron_number - electron_number) <=
-            32.0 * np.finfo(float).eps * max(
-                1.0, abs(sample.electron_number), abs(electron_number))), None)
+            if abs(sample.electron_number - electron_number) <= max(
+                tolerance,
+                32.0 * np.finfo(float).eps * max(
+                    1.0, abs(sample.electron_number),
+                    abs(electron_number)))), None)
 
     @staticmethod
     def _continuation_history(
@@ -3085,53 +3037,148 @@ class GrandCanonicalKRKS:
                              if record.restart_reason else '')))
             for record in records]
 
-    def _solve_canonical_point(
+    def _diis_transport_snapshot(
+            self, session: _FixedNSession) -> tuple[list[_DIISItem], float]:
+        """Copy the terminal Pulay vector for one guarded transport trial."""
+        source = session.solver
+        terminal = _DIISItem(
+            source.copy_blocks(session.context.state.fock_orth),
+            source.copy_blocks(session.context.state.residual))
+        return [terminal], session.context.damping_hint
+
+    def _canonical_transport_source(
+            self, samples: Sequence[_CanonicalSample],
+            electron_number: float) -> Optional[_FixedNSession]:
+        threshold = (
+            self.config.canonical_continuation_diis_transport_delta_nelec)
+        if threshold == 0.0:
+            return None
+        candidates = []
+        for sample in samples:
+            session = sample.session
+            if session is None or not session.context.converged:
+                continue
+            delta = abs(sample.electron_number - electron_number)
+            if delta > 0.0 and delta <= threshold:
+                candidates.append((delta, session))
+        return (None if not candidates else
+                min(candidates, key=lambda item: item[0])[1])
+
+    def _start_canonical_session(
             self, h: Sequence, electron_number: float,
-            residual_tolerance: float,
-            work: _CanonicalWork) -> _FixedNPoint:
-        """Solve and account for one unpublished fixed-N root observation."""
+            residual_tolerance: float, work: _CanonicalWork,
+            transport_source: Optional[_FixedNSession] = None,
+            ) -> tuple[_FixedNPoint, _FixedNSession]:
+        """Start, advance, and account for one fixed-N DIIS session."""
         canonical_solver = self._spawn_fixed_n(
             electron_number,
             self._canonical_continuation_config(
                 residual_tolerance,
                 self.config.canonical_continuation_initial_damping))
-        point = canonical_solver._solve_fixed_n_point(h)
-        stage_evaluation_offset = work.total_nfev
-        work.fixed_n_nfev += point.nfev
+        canonical_solver.history = []
+        canonical_solver.nfev = 0
+        canonical_solver._reset_run_diagnostics()
+        state = canonical_solver.evaluate(
+            canonical_solver._initial_h(h0=h))
+        transported_items = None
+        damping_hint = None
+        if transport_source is not None:
+            transported_items, source_damping = self._diis_transport_snapshot(
+                transport_source)
+            damping_hint = min(
+                source_damping,
+                canonical_solver.config.diis_initial_damping)
+            self.log.info(
+                'Transporting %d DIIS vectors from N = %.12g to N = %.12g '
+                '(delta N = %.3g, initial damping = %.3g)',
+                len(transported_items), transport_source.electron_number,
+                electron_number,
+                electron_number - transport_source.electron_number,
+                damping_hint)
+        context = canonical_solver._new_diis_context(
+            state, None, niter=0, cycle_start=0,
+            history=transported_items, damping_hint=damping_hint,
+            transported=transported_items is not None)
+        session = _FixedNSession(
+            float(electron_number), canonical_solver, context)
+        point = self._advance_canonical_session(
+            session, residual_tolerance, work)
+        return point, session
+
+    def _advance_canonical_session(
+            self, session: _FixedNSession,
+            residual_tolerance: float,
+            work: _CanonicalWork) -> _FixedNPoint:
+        """Resume a fixed-N session and publish only its incremental work."""
+        solver = session.solver
+        context = session.context
+        evaluation_offset = work.total_nfev - session.published_nfev
+        cycle_offset = work.fixed_n_niter - session.published_niter
+        outcome = solver._advance_diis(context, residual_tolerance)
+
+        nfev = solver.nfev - session.published_nfev
+        niter = context.niter - session.published_niter
+        records = solver.history[session.published_history:]
         work.history.extend(self._continuation_history(
-            point.history, work.fixed_n_niter, electron_number,
-            stage_evaluation_offset))
-        work.fixed_n_niter += point.niter
-        return point
+            records, cycle_offset, session.electron_number,
+            evaluation_offset))
+        work.fixed_n_nfev += nfev
+        work.fixed_n_niter += niter
+        work.transport_attempts += (
+            context.transport_attempts -
+            session.published_transport_attempts)
+        work.transport_acceptances += (
+            context.transport_acceptances -
+            session.published_transport_acceptances)
+        work.transport_resets += (
+            context.transport_resets -
+            session.published_transport_resets)
+
+        session.published_history = len(solver.history)
+        session.published_nfev = solver.nfev
+        session.published_niter = context.niter
+        session.published_transport_attempts = context.transport_attempts
+        session.published_transport_acceptances = context.transport_acceptances
+        session.published_transport_resets = context.transport_resets
+        return _FixedNPoint(
+            state=outcome.state,
+            converged=outcome.converged,
+            message=outcome.message,
+            niter=niter,
+            nfev=nfev,
+            history=tuple(records),
+            density_change=outcome.density_change,
+        )
 
     def _observe_canonical_point(
-            self, samples: list[_CanonicalSample],
-            brent_root: Optional[_BrentRoot], electron_number: float,
-            mu_error: float, point: _FixedNPoint) -> Optional[_BrentRoot]:
-        """Record one converged point and consistently update Brent state."""
+            self, samples: list[_CanonicalSample], electron_number: float,
+            mu_error: float, point: _FixedNPoint,
+            session: Optional[_FixedNSession]) -> None:
+        """Record one converged point in chronological secant order."""
         sample = _CanonicalSample(
             electron_number, mu_error, point.residual_rms,
-            self.copy_blocks(point.fock_orth))
+            self.copy_blocks(point.fock_orth), session)
         duplicate = self._canonical_sample_index(samples, electron_number)
         if duplicate is None:
             samples.append(sample)
-            if brent_root is not None:
-                if (brent_root.pending is not None and
-                        abs(brent_root.pending - electron_number) <=
-                        32.0 * np.finfo(float).eps * max(
-                            1.0, abs(electron_number))):
-                    brent_root.update(electron_number, mu_error)
-                else:
-                    # Safeguarded recovery may deliberately leave a pending
-                    # interpolation.  Rebuild from evaluated observations.
-                    brent_root = None
         else:
-            # Tightening the same N refines its value; it is not a root step.
-            if point.residual_rms <= samples[duplicate].residual_rms:
-                samples[duplicate] = sample
-            brent_root = None
-        return (self._canonical_brent_from_samples(samples)
-                if brent_root is None else brent_root)
+            # A tighter same-N solve supplies the latest secant observation.
+            previous = samples.pop(duplicate)
+            samples.append(
+                sample if point.residual_rms <= previous.residual_rms
+                else previous)
+
+    def _prune_canonical_sessions(
+            self, samples: list[_CanonicalSample],
+            bracket: Optional[tuple[_CanonicalSample, _CanonicalSample]],
+            ) -> None:
+        """Retain only the latest sessions and active bracket endpoints."""
+        keep = {id(sample) for sample in samples[-2:]}
+        if bracket is not None:
+            keep.update(id(sample) for sample in bracket)
+        for index, sample in enumerate(samples):
+            if sample.session is not None and id(sample) not in keep:
+                samples[index] = replace(sample, session=None)
 
     def _verify_canonical_point(
             self, point: _FixedNPoint, h_fixed_mu: Sequence,
@@ -3167,7 +3214,7 @@ class GrandCanonicalKRKS:
     def _finalize_canonical_search(
             self, terminal_state: _GCState,
             terminal_source: _FixedNPoint, terminal_success: bool,
-            outer_steps: int, work: _CanonicalWork,
+            distinct_n_proposals: int, work: _CanonicalWork,
             verification: _CanonicalVerification) -> GrandCanonicalResult:
         """Publish the sole terminal canonical state and its global counts."""
         # Compute these before _finalize publishes the optimized state and
@@ -3184,9 +3231,13 @@ class GrandCanonicalKRKS:
             'canonical-verification' if terminal_success else
             'canonical-verification-failed')
         message = (
-            f'canonical continuation ({outer_steps} outer steps, '
+            f'canonical continuation ({distinct_n_proposals} fixed-N points, '
+            f'{work.refinements} refinements, '
             f'{work.fixed_n_nfev} fixed-N Fock evaluations, '
-            f'{work.verification_nfev} verification evaluations); ' +
+            f'{work.verification_nfev} verification evaluations, DIIS '
+            f'transport {work.transport_acceptances}/'
+            f'{work.transport_attempts} accepted with '
+            f'{work.transport_resets} resets); ' +
             ('converged by one-Fock fixed-mu verification'
              if terminal_success else
              'failed to satisfy canonical root verification'))
@@ -3202,19 +3253,34 @@ class GrandCanonicalKRKS:
         result = self._finalize(
             terminal_state, terminal_success, message,
             work.total_niter, density_change)
+        self.mf.canonical_continuation_refinements_gc = work.refinements
+        self.mf.canonical_diis_transport_attempts_gc = work.transport_attempts
+        self.mf.canonical_diis_transport_acceptances_gc = (
+            work.transport_acceptances)
+        self.mf.canonical_diis_transport_resets_gc = work.transport_resets
         self.mf.scf_summary.update({
-            'canonical_continuation_steps': outer_steps,
+            'canonical_continuation_steps': distinct_n_proposals,
             'canonical_continuation_evaluations': work.fixed_n_nfev,
             'canonical_continuation_mu_error': mu_error,
             'canonical_continuation_delta_nelec': delta_nelec,
+            'canonical_continuation_refinements': work.refinements,
+            'canonical_diis_transport_attempts': work.transport_attempts,
+            'canonical_diis_transport_acceptances': (
+                work.transport_acceptances),
+            'canonical_diis_transport_resets': work.transport_resets,
             'fock_evaluations_total': work.total_nfev,
         })
         return replace(
             result,
-            canonical_continuation_steps=outer_steps,
+            canonical_continuation_steps=distinct_n_proposals,
             canonical_continuation_evaluations=work.fixed_n_nfev,
             canonical_continuation_mu_error=mu_error,
             canonical_continuation_delta_nelec=delta_nelec,
+            canonical_continuation_refinements=work.refinements,
+            canonical_diis_transport_attempts=work.transport_attempts,
+            canonical_diis_transport_acceptances=(
+                work.transport_acceptances),
+            canonical_diis_transport_resets=work.transport_resets,
         )
 
     def _kernel_canonical_continuation(
@@ -3229,33 +3295,77 @@ class GrandCanonicalKRKS:
         work = _CanonicalWork(self.nfev, [])
         current_nelec = self._electron_number_at_mu(h, self.mu)
         samples: list[_CanonicalSample] = []
-        brent_root: Optional[_BrentRoot] = None
+        bracket: Optional[tuple[_CanonicalSample, _CanonicalSample]] = None
         best_handoff_score = np.inf
         best_canonical_result: Optional[_FixedNPoint] = None
         last_canonical_result: Optional[_FixedNPoint] = None
-        outer_steps = 0
+        distinct_n_proposals = 0
+        proposed_nelec: list[float] = []
         force_tight_refinement = False
+        pending_session: Optional[_FixedNSession] = None
+        allow_transport = True
         failed_inner_nelec: Optional[float] = None
         verification_repair_nelec: Optional[float] = None
         verification = _CanonicalVerification()
-        outer_trust_radius = (
-            self.config.canonical_continuation_initial_delta_nelec)
+        reached_outer_limit = False
+        max_passes = 4 * self.config.canonical_continuation_max_outer + 4
+        pass_count = 0
 
-        for outer in range(self.config.canonical_continuation_max_outer):
-            had_bracket = (
-                brent_root is not None or
-                (any(sample.mu_error < 0.0 for sample in samples) and
-                 any(sample.mu_error > 0.0 for sample in samples)))
+        while True:
+            if pass_count >= max_passes:
+                self.log.warn(
+                    'Canonical continuation reached its safety limit of %d '
+                    'fixed-N passes; proceeding to fixed-mu verification',
+                    max_passes)
+                break
+            pass_count += 1
+            distinct_index = next((
+                index for index, value in enumerate(proposed_nelec)
+                if abs(value - current_nelec) <= max(
+                    self.config.canonical_continuation_root_nelec_tol,
+                    32.0 * np.finfo(float).eps *
+                    max(1.0, abs(value), abs(current_nelec)))), None)
+            is_distinct = distinct_index is None
+            if (is_distinct and distinct_n_proposals >=
+                    self.config.canonical_continuation_max_outer):
+                reached_outer_limit = True
+                break
+            if is_distinct:
+                distinct_index = distinct_n_proposals
+                proposed_nelec.append(float(current_nelec))
+                distinct_n_proposals += 1
+            else:
+                work.refinements += 1
+                if pending_session is None and allow_transport:
+                    sample_index = self._canonical_sample_index(
+                        samples, current_nelec)
+                    if sample_index is not None:
+                        candidate_session = samples[sample_index].session
+                        if (candidate_session is not None and
+                                candidate_session.context.converged):
+                            pending_session = candidate_session
+            had_bracket = bracket is not None
             tight_canonical_solve = had_bracket or force_tight_refinement
             force_tight_refinement = False
             residual_tolerance = (
                 self.config.canonical_continuation_bracketed_residual_tol
                 if (tight_canonical_solve or had_bracket) else
                 self.config.canonical_continuation_coarse_residual_tol)
-            canonical_result = self._solve_canonical_point(
-                h, current_nelec, residual_tolerance, work)
+            if pending_session is not None:
+                session = pending_session
+                pending_session = None
+                canonical_result = self._advance_canonical_session(
+                    session, residual_tolerance, work)
+            else:
+                transport_source = (
+                    self._canonical_transport_source(
+                        samples, current_nelec)
+                    if allow_transport else None)
+                canonical_result, session = self._start_canonical_session(
+                    h, current_nelec, residual_tolerance, work,
+                    transport_source=transport_source)
+            allow_transport = True
             last_canonical_result = canonical_result
-            outer_steps += 1
             h = canonical_result.h_orth
             error = canonical_result.mu - self.mu
             target_nelec = self._electron_number_at_mu(
@@ -3263,16 +3373,20 @@ class GrandCanonicalKRKS:
             handoff_delta_nelec = (
                 target_nelec - canonical_result.electron_number)
             if canonical_result.converged:
-                brent_root = self._observe_canonical_point(
-                    samples, brent_root, current_nelec, error,
-                    canonical_result)
+                self._observe_canonical_point(
+                    samples, current_nelec, error, canonical_result, session)
+                bracket = self._canonical_bracket(samples)
+                self._prune_canonical_sessions(samples, bracket)
+                bracket = self._canonical_bracket(samples)
                 failed_inner_nelec = None
-            bracketed = brent_root is not None
+            bracketed = bracket is not None
+            label = ('continuation' if is_distinct else 'refinement')
             self.log.info(
-                'Canonical continuation %d: N = %.12g, optimized mu = '
+                'Canonical %s %d: N = %.12g, optimized mu = '
                 '%.12g, target mu = %.12g, delta mu = %.3g, residual = %.3g, '
                 'physical delta N = %.3g, Fock evaluations = %d',
-                outer, current_nelec, canonical_result.mu, self.mu, error,
+                label, distinct_index, current_nelec,
+                canonical_result.mu, self.mu, error,
                 canonical_result.residual_rms, handoff_delta_nelec,
                 canonical_result.nfev)
 
@@ -3306,51 +3420,53 @@ class GrandCanonicalKRKS:
                     # its N once from the best physical Fock while leaving
                     # the evaluated sign bracket untouched.
                     failed_inner_nelec = current_nelec
-                    brent_root = self._canonical_brent_from_samples(samples)
+                    bracket = self._canonical_bracket(samples)
                     h = self.copy_blocks(
                         best_canonical_result.fock_orth)
                     force_tight_refinement = True
+                    pending_session = None
+                    allow_transport = False
                     self.log.warn(
                         'Retrying failed fixed-N solve once at N = %.12g',
                         current_nelec)
                     continue
 
                 retry_nelec = None
-                brent_root = self._canonical_brent_from_samples(samples)
-                if brent_root is not None and not brent_root.converged:
-                    lo, hi = brent_root.bracket
+                bracket = self._canonical_bracket(samples)
+                if bracket is not None:
+                    lo, hi = (sample.electron_number for sample in bracket)
                     retry_nelec = lo + 0.5 * (hi - lo)
                     if abs(retry_nelec - current_nelec) <= (
                             32.0 * np.finfo(float).eps *
                             max(1.0, abs(current_nelec))):
                         # The failed point was already the midpoint.  Split
-                        # its interval to Brent's best endpoint instead of
+                        # its interval to the best endpoint instead of
                         # immediately abandoning a valid outer bracket.
+                        best_endpoint = min(
+                            bracket, key=lambda sample: abs(sample.mu_error))
                         retry_nelec = (
                             current_nelec +
-                            0.5 * (brent_root.b - current_nelec))
+                            0.5 * (best_endpoint.electron_number -
+                                   current_nelec))
                 elif samples:
                     retry_nelec = 0.5 * (
                         current_nelec + samples[-1].electron_number)
                 if (retry_nelec is not None and
                         abs(retry_nelec - current_nelec) >
                         1.0e-14 * max(1.0, abs(current_nelec))):
-                    outer_trust_radius = max(
-                        self.config.canonical_continuation_min_delta_nelec,
-                        0.5 * outer_trust_radius)
                     h = self.copy_blocks(
                         best_canonical_result.fock_orth)
                     current_nelec = retry_nelec
-                    brent_root = None
                     failed_inner_nelec = None
                     force_tight_refinement = True
+                    pending_session = None
+                    allow_transport = False
                     self.log.warn(
                         'Retrying fixed-N continuation at safeguarded '
                         'N = %.12g', current_nelec)
                     continue
                 break
-            (h_fixed_mu, _, physical_delta_nelec,
-             predicted_residual_rms) = (
+            (h_fixed_mu, _, physical_delta_nelec, _) = (
                 self._canonical_fixed_mu_candidate(canonical_result))
             canonical_ready = (
                 canonical_result.residual_rms <=
@@ -3360,10 +3476,7 @@ class GrandCanonicalKRKS:
                 self.config.canonical_continuation_handoff_delta_mu and
                 abs(physical_delta_nelec) <=
                 self.config.
-                canonical_continuation_handoff_delta_nelec and
-                predicted_residual_rms <=
-                self.config.
-                canonical_continuation_verification_residual_tol)
+                canonical_continuation_handoff_delta_nelec)
             if canonical_ready:
                 candidate_state, verification_ok = (
                     self._verify_canonical_point(
@@ -3383,7 +3496,8 @@ class GrandCanonicalKRKS:
                 self.log.warn(
                     'One-Fock fixed-mu verification failed: residual '
                     '%.3g, gradient %.3g, delta N %.3g, density change '
-                    '%.3g; resuming fixed-N refinement',
+                    '%.3g; restarting fixed-N repair from the verification '
+                    'Fock',
                     candidate_state.residual_rms,
                     candidate_state.grad_rms,
                     verification.delta_nelec,
@@ -3402,17 +3516,19 @@ class GrandCanonicalKRKS:
                         canonical_result.electron_number)
                     h = self.copy_blocks(candidate_state.fock_orth)
                     current_nelec = canonical_result.electron_number
-                    brent_root = self._canonical_brent_from_samples(samples)
+                    bracket = self._canonical_bracket(samples)
                     force_tight_refinement = True
+                    pending_session = None
+                    allow_transport = False
                     continue
 
                 # A persistent failure must not cycle forever at the same
                 # N.  Use the verification Fock response only to choose a
                 # safeguarded interior recovery point; its optimized mu is
-                # evaluated by the next fixed-N solve before Brent sees it.
-                brent_root = self._canonical_brent_from_samples(samples)
-                if brent_root is not None and not brent_root.converged:
-                    lo, hi = brent_root.bracket
+                # evaluated by the next fixed-N solve before secant sees it.
+                bracket = self._canonical_bracket(samples)
+                if bracket is not None:
+                    lo, hi = (sample.electron_number for sample in bracket)
                     preferred = (
                         canonical_result.electron_number +
                         verification.delta_nelec)
@@ -3423,15 +3539,34 @@ class GrandCanonicalKRKS:
                         retry_nelec = preferred
                     else:
                         retry_nelec = lo + 0.5 * (hi - lo)
+                    no_progress_tolerance = max(
+                        self.config.canonical_continuation_root_nelec_tol,
+                        32.0 * np.finfo(float).eps *
+                        max(1.0, abs(current_nelec)))
+                    if (abs(retry_nelec - current_nelec) <=
+                            no_progress_tolerance):
+                        best_endpoint = min(
+                            bracket, key=lambda sample: abs(sample.mu_error))
+                        retry_nelec = (
+                            current_nelec +
+                            0.5 * (best_endpoint.electron_number -
+                                   current_nelec))
+                    if (abs(retry_nelec - current_nelec) <=
+                            no_progress_tolerance):
+                        self.log.warn(
+                            'Persistent fixed-mu verification recovery made '
+                            'no resolvable electron-number progress')
+                        break
                     h = self.copy_blocks(candidate_state.fock_orth)
                     current_nelec = retry_nelec
-                    brent_root = None
                     verification_repair_nelec = None
                     force_tight_refinement = True
+                    pending_session = None
+                    allow_transport = False
                     continue
                 self.log.warn(
                     'Persistent fixed-mu verification failure left no '
-                    'resolvable Brent interval')
+                    'resolvable sign bracket')
                 break
 
             root_coordinates_ready = (
@@ -3447,68 +3582,69 @@ class GrandCanonicalKRKS:
                 h = self.copy_blocks(canonical_result.h_orth)
                 current_nelec = canonical_result.electron_number
                 force_tight_refinement = True
+                pending_session = session
+                allow_transport = False
                 continue
 
-            if brent_root is not None:
+            if bracket is not None:
                 # A coarse value can supply the first sign change but may not
-                # be accurate enough to steer an expensive Brent iteration.
-                # Re-solve the best endpoint before trusting the bracket, and
+                # be accurate enough to steer an expensive secant iteration.
+                # Re-solve the best endpoint before trusting the samples, and
                 # tighten again near the root so the requested physical charge
                 # tolerance is not dominated by fixed-N residual noise.
+                best_endpoint = min(
+                    bracket, key=lambda sample: abs(sample.mu_error))
                 endpoint_index = self._canonical_sample_index(
-                    samples, brent_root.b)
+                    samples, best_endpoint.electron_number)
                 endpoint_tolerance = (
                     self.config.canonical_continuation_bracketed_residual_tol)
                 if (endpoint_index is not None and
                         samples[endpoint_index].residual_rms >
                         endpoint_tolerance):
                     h = self.copy_blocks(samples[endpoint_index].fock_orth)
-                    current_nelec = brent_root.b
+                    current_nelec = best_endpoint.electron_number
                     force_tight_refinement = True
+                    pending_session = best_endpoint.session
+                    allow_transport = False
                     self.log.info(
-                        'Refining Brent endpoint N = %.12g from residual %.3g '
+                        'Refining secant endpoint N = %.12g from residual %.3g '
                         'to %.3g before the next root proposal',
                         current_nelec, samples[endpoint_index].residual_rms,
                         endpoint_tolerance)
                     continue
-            if (not bracketed and len(samples) >= 2 and
-                    np.sign(samples[-1].mu_error) ==
-                    np.sign(samples[-2].mu_error)):
-                outer_trust_radius = min(
-                    self.config.canonical_continuation_max_delta_nelec,
-                    2.0 * outer_trust_radius)
-            if brent_root is not None:
-                if brent_root.converged:
+                bracket_width = abs(
+                    bracket[1].electron_number -
+                    bracket[0].electron_number)
+                if bracket_width <= (
+                        self.config.canonical_continuation_root_nelec_tol):
                     self.log.warn(
-                        'Canonical continuation Brent interval resolved at '
+                        'Canonical continuation sign bracket resolved at '
                         'width %.3g without satisfying physical verification',
-                        brent_root.width)
+                        bracket_width)
                     break
-                proposal = brent_root.proposal()
-                endpoint_focks = []
-                for endpoint in (brent_root.a, brent_root.b):
-                    endpoint_index = self._canonical_sample_index(
-                        samples, endpoint)
-                    endpoint_focks.append(
-                        None if endpoint_index is None else
-                        samples[endpoint_index].fock_orth)
-                proposal_h = None
-                if all(value is not None for value in endpoint_focks):
-                    fraction = ((proposal - brent_root.a) /
-                                (brent_root.b - brent_root.a))
+
+            proposal = self._canonical_continuation_proposal(
+                samples, canonical_result.fock_orth, current_nelec)
+            proposal_h = None
+            if bracket is not None:
+                left, right = bracket
+                if (left.electron_number <= proposal <=
+                        right.electron_number):
+                    fraction = (
+                        (proposal - left.electron_number) /
+                        (right.electron_number - left.electron_number))
                     proposal_h = self._sanitize_h([
-                        (1.0 - fraction) * h_a + fraction * h_b
-                        for h_a, h_b in zip(*endpoint_focks)])
-                self.log.info(
-                    'Canonical continuation Brent %s proposal N = %.12g '
-                    'inside [%.12g, %.12g]',
-                    brent_root.last_method, proposal,
-                    brent_root.bracket[0], brent_root.bracket[1])
-            else:
-                proposal = self._canonical_continuation_proposal(
-                    samples, canonical_result.fock_orth,
-                    current_nelec, outer_trust_radius)
-                proposal_h = None
+                        (1.0 - fraction) * h_left + fraction * h_right
+                        for h_left, h_right in zip(
+                            left.fock_orth, right.fock_orth)])
+            method = 'Fock-response' if len(samples) == 1 else 'secant'
+            self.log.info(
+                'Canonical continuation %s proposal N = %.12g '
+                '(maximum |delta N| = %.12g)',
+                method, proposal,
+                (self.config.canonical_continuation_initial_delta_nelec
+                 if len(samples) == 1 else
+                 self._canonical_secant_step_cap()))
             if abs(proposal - current_nelec) <= (
                     1.0e-14 * max(1.0, abs(current_nelec))):
                 self.log.warn(
@@ -3518,9 +3654,10 @@ class GrandCanonicalKRKS:
             h = (proposal_h if proposal_h is not None else
                  self.copy_blocks(canonical_result.fock_orth))
             current_nelec = proposal
-        else:
+        if reached_outer_limit:
             self.log.warn(
-                'Canonical continuation reached its maximum of %d outer steps; '
+                'Canonical continuation reached its maximum of %d distinct '
+                'N proposals; '
                 'proceeding to fixed-mu verification',
                 self.config.canonical_continuation_max_outer)
 
@@ -3566,7 +3703,7 @@ class GrandCanonicalKRKS:
                 'fixed-mu verification lacks its canonical source')
         return self._finalize_canonical_search(
             terminal_state, terminal_source, terminal_success,
-            outer_steps, work, verification)
+            distinct_n_proposals, work, verification)
 
     def kernel(self, dm0: Any = None, h0: Any = None) -> GrandCanonicalResult:
         """Run the configured safeguarded direct minimizer."""
@@ -3582,7 +3719,6 @@ class GrandCanonicalKRKS:
         self.nfev = 0
         self._reset_run_diagnostics()
         self._nlcg_residual_previous_alpha = None
-        self._diis_history = []
         state = self.evaluate(self._initial_h(dm0, h0))
         previous: Optional[_GCState] = None
         direction = self.copy_blocks(state.residual)
@@ -3685,47 +3821,105 @@ class GrandCanonicalKRKS:
         density_change = (0.0 if previous is None else self._metrics(state, previous)[2])
         return self._finalize(state, converged, message, niter, density_change)
 
-    def _run_diis(self, state: _GCState, previous: Optional[_GCState],
-                  niter: int, cycle_start: int) -> _KernelOutcome:
-        """Run DIIS and return an unpublished internal outcome."""
-        diis_history: list[_DIISItem] = []
-        self._diis_history = diis_history
-        converged = False
-        message = 'maximum cycles reached during residual-DIIS polishing'
-        damping_hint = self.config.diis_initial_damping
+    def _new_diis_context(
+            self, state: _GCState, previous: Optional[_GCState],
+            niter: int, cycle_start: int,
+            history: Optional[Sequence[_DIISItem]] = None,
+            damping_hint: Optional[float] = None,
+            transported: bool = False) -> _DIISRunContext:
+        items = ([] if history is None else
+                 [self._copy_diis_item(item) for item in history])
+        if len(items) >= self.config.diis_space:
+            items = items[-(self.config.diis_space - 1):]
+        return _DIISRunContext(
+            state=state,
+            previous=previous,
+            history=items,
+            damping_hint=(self.config.diis_initial_damping
+                          if damping_hint is None else float(damping_hint)),
+            niter=niter,
+            next_cycle=cycle_start,
+            transport_pending=bool(transported and items),
+        )
 
-        for cycle in range(cycle_start, self.config.max_cycle):
-            if state.residual_rms < self.config.conv_tol_residual_rms:
-                converged = True
-                message = 'converged residual-DIIS fixed point'
+    def _advance_diis(
+            self, context: _DIISRunContext,
+            residual_tolerance: Optional[float] = None) -> _KernelOutcome:
+        """Advance a fresh or previously stopped residual-DIIS context."""
+        tolerance = (self.config.conv_tol_residual_rms
+                     if residual_tolerance is None else
+                     float(residual_tolerance))
+        if not np.isfinite(tolerance) or tolerance <= 0.0:
+            raise ValueError('DIIS residual tolerance must be positive')
+        context.converged = False
+        context.message = (
+            'maximum cycles reached during residual-DIIS polishing')
+
+        for cycle in range(context.next_cycle, self.config.max_cycle):
+            state = context.state
+            if state.residual_rms < tolerance:
+                context.converged = True
+                context.message = 'converged residual-DIIS fixed point'
                 break
-            self._append_diis_item(diis_history, state)
-            starting_damping = damping_hint
-            (step, condition, coefficient_l1, history_action,
-             predicted_residual_rms) = self._diis_step(
-                 state, diis_history, starting_damping)
+            self._append_diis_item(context.history, state)
+            starting_damping = context.damping_hint
+            transported = context.transport_pending
+            result = self._diis_step(
+                state, context.history, starting_damping,
+                transported=transported)
+            history_size = len(context.history)
+            if transported:
+                context.transport_attempts += 1
+                if result.transport_status == 'accepted':
+                    context.transport_acceptances += 1
+                else:
+                    context.transport_resets += 1
+                context.transport_pending = False
+            step = result.step
             if not step.success or step.state is None:
-                message = step.message
+                context.message = step.message
                 break
             new_state = step.state
-            damping_hint, trust_ratio = self._next_diis_damping(
-                state, new_state, predicted_residual_rms, step.alpha,
-                starting_damping)
+            context.damping_hint, trust_ratio = self._next_diis_damping(
+                state, new_state, result.predicted_residual_rms,
+                step.alpha, starting_damping)
+            history_action = result.history_action
+            if (transported and
+                    result.transport_status == 'accepted'):
+                # The imported model is an accelerator for exactly one step.
+                # Subsequent Pulay vectors must come from the new fixed-N map.
+                current_item = context.history[-1]
+                context.history[:] = [current_item]
+                history_action = (
+                    history_action +
+                    ('; ' if history_action else '') +
+                    'retired imported vectors after one-shot transport')
             self._record_diis(
-                cycle, state, new_state, step, len(diis_history),
-                condition, coefficient_l1, history_action,
-                predicted_residual_rms, trust_ratio, damping_hint)
-            niter += 1
-            self._checkpoint(new_state, niter)
-            previous, state = state, new_state
+                cycle, state, new_state, step, history_size,
+                result.condition, result.coefficient_l1,
+                history_action, result.predicted_residual_rms,
+                trust_ratio, context.damping_hint)
+            context.niter += 1
+            context.next_cycle = cycle + 1
+            self._checkpoint(new_state, context.niter)
+            context.previous, context.state = state, new_state
         else:
-            if state.residual_rms < self.config.conv_tol_residual_rms:
-                converged = True
-                message = 'converged residual-DIIS fixed point at maximum cycle'
-        density_change = (0.0 if previous is None
-                          else self._metrics(state, previous)[2])
+            if context.state.residual_rms < tolerance:
+                context.converged = True
+                context.message = (
+                    'converged residual-DIIS fixed point at maximum cycle')
+        density_change = (
+            0.0 if context.previous is None else
+            self._metrics(context.state, context.previous)[2])
         return _KernelOutcome(
-            state, previous, converged, message, niter, density_change)
+            context.state, context.previous, context.converged,
+            context.message, context.niter, density_change)
+
+    def _run_diis(self, state: _GCState, previous: Optional[_GCState],
+                  niter: int, cycle_start: int) -> _KernelOutcome:
+        """Run a fresh DIIS context and return its unpublished outcome."""
+        return self._advance_diis(self._new_diis_context(
+            state, previous, niter, cycle_start))
 
     def _kernel_diis(self, state: _GCState, previous: Optional[_GCState],
                      niter: int, cycle_start: int) -> GrandCanonicalResult:
