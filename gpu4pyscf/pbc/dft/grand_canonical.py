@@ -3064,6 +3064,14 @@ class GrandCanonicalKRKS:
         return (None if not candidates else
                 min(candidates, key=lambda item: item[0])[1])
 
+    def _canonical_transport_residual_floor(
+            self, residual_tolerance: float) -> float:
+        """Avoid spending a transport trial on an already-local seed."""
+        intermediate = np.sqrt(
+            self.config.canonical_continuation_coarse_residual_tol *
+            self.config.canonical_continuation_bracketed_residual_tol)
+        return max(float(residual_tolerance), float(intermediate))
+
     def _start_canonical_session(
             self, h: Sequence, electron_number: float,
             residual_tolerance: float, work: _CanonicalWork,
@@ -3080,6 +3088,17 @@ class GrandCanonicalKRKS:
         canonical_solver._reset_run_diagnostics()
         state = canonical_solver.evaluate(
             canonical_solver._initial_h(h0=h))
+        if transport_source is not None:
+            residual_floor = self._canonical_transport_residual_floor(
+                residual_tolerance)
+            if state.residual_rms <= residual_floor:
+                self.log.info(
+                    'Skipping DIIS transport from N = %.12g to N = %.12g: '
+                    'new-state residual %.3g is already below the transport '
+                    'floor %.3g',
+                    transport_source.electron_number, electron_number,
+                    state.residual_rms, residual_floor)
+                transport_source = None
         transported_items = None
         damping_hint = None
         if transport_source is not None:
