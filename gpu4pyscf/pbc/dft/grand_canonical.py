@@ -163,48 +163,27 @@ class GrandCanonicalKRKS(lib.StreamObject):
             Electron count for a canonical calculation.
     '''
 
-    max_cycle = getattr(
-        __config__, 'pbc_dft_grand_canonical_max_cycle', 100)
-    max_outer_cycle = getattr(
-        __config__, 'pbc_dft_grand_canonical_max_outer_cycle', 16)
-    conv_tol = getattr(
-        __config__, 'pbc_dft_grand_canonical_conv_tol', 1e-8)
-    conv_tol_coarse = getattr(
-        __config__, 'pbc_dft_grand_canonical_conv_tol_coarse', 4e-6)
-    conv_tol_mu = getattr(
-        __config__, 'pbc_dft_grand_canonical_conv_tol_mu', 1e-6)
-    conv_tol_nelec = getattr(
-        __config__, 'pbc_dft_grand_canonical_conv_tol_nelec', 2e-5)
-    diis_space = getattr(
-        __config__, 'pbc_dft_grand_canonical_diis_space', 6)
-    damp = getattr(
-        __config__, 'pbc_dft_grand_canonical_damp', .125)
-    diis_backtrack = getattr(
-        __config__, 'pbc_dft_grand_canonical_diis_backtrack', .5)
-    diis_max_backtrack = getattr(
-        __config__, 'pbc_dft_grand_canonical_diis_max_backtrack', 8)
-    diis_min_reduction = getattr(
-        __config__, 'pbc_dft_grand_canonical_diis_min_reduction', 1e-3)
-    diis_trust_shrink = getattr(
-        __config__, 'pbc_dft_grand_canonical_diis_trust_shrink', .25)
-    diis_trust_expand = getattr(
-        __config__, 'pbc_dft_grand_canonical_diis_trust_expand', .75)
-    diis_expansion = getattr(
-        __config__, 'pbc_dft_grand_canonical_diis_expansion', 2.)
-    diis_expand_reduction = getattr(
-        __config__, 'pbc_dft_grand_canonical_diis_expand_reduction', 2e-2)
-    min_damp = getattr(
-        __config__, 'pbc_dft_grand_canonical_min_damp', 1e-8)
-    initial_nelec_step = getattr(
-        __config__, 'pbc_dft_grand_canonical_initial_nelec_step', 3e-2)
-    max_nelec_step_fraction = getattr(
-        __config__, 'pbc_dft_grand_canonical_max_nelec_step_fraction', .1)
-    root_nelec_tol = getattr(
-        __config__, 'pbc_dft_grand_canonical_root_nelec_tol', 1e-8)
-    verify_residual_tol = getattr(
-        __config__, 'pbc_dft_grand_canonical_verify_residual_tol', 1e-6)
-    verify_density_tol = getattr(
-        __config__, 'pbc_dft_grand_canonical_verify_density_tol', 1e-9)
+    max_cycle = getattr(__config__, 'pbc_dft_grand_canonical_max_cycle', 100)
+    max_outer_cycle = getattr(__config__, 'pbc_dft_grand_canonical_max_outer_cycle', 16)
+    conv_tol = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol', 1e-8)
+    conv_tol_coarse = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_coarse', 4e-6)
+    conv_tol_mu = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_mu', 1e-6)
+    conv_tol_nelec = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_nelec', 2e-5)
+    diis_space = getattr(__config__, 'pbc_dft_grand_canonical_diis_space', 6)
+    damp = getattr(__config__, 'pbc_dft_grand_canonical_damp', 0.125)
+    diis_backtrack = getattr(__config__, 'pbc_dft_grand_canonical_diis_backtrack', 0.5)
+    diis_max_backtrack = getattr(__config__, 'pbc_dft_grand_canonical_diis_max_backtrack', 8)
+    diis_min_reduction = getattr(__config__, 'pbc_dft_grand_canonical_diis_min_reduction', 1e-3)
+    diis_trust_shrink = getattr(__config__, 'pbc_dft_grand_canonical_diis_trust_shrink', 0.25)
+    diis_trust_expand = getattr(__config__, 'pbc_dft_grand_canonical_diis_trust_expand', 0.75)
+    diis_expansion = getattr(__config__, 'pbc_dft_grand_canonical_diis_expansion', 2.0)
+    diis_expand_reduction = getattr(__config__, 'pbc_dft_grand_canonical_diis_expand_reduction', 2e-2)
+    min_damp = getattr(__config__, 'pbc_dft_grand_canonical_min_damp', 1e-8)
+    initial_nelec_step = getattr(__config__, 'pbc_dft_grand_canonical_initial_nelec_step', 3e-2)
+    max_nelec_step_fraction = getattr(__config__, 'pbc_dft_grand_canonical_max_nelec_step_fraction', 0.1)
+    root_nelec_tol = getattr(__config__, 'pbc_dft_grand_canonical_root_nelec_tol', 1e-8)
+    verify_residual_tol = getattr(__config__, 'pbc_dft_grand_canonical_verify_residual_tol', 1e-6)
+    verify_density_tol = getattr(__config__, 'pbc_dft_grand_canonical_verify_density_tol', 1e-9)
     callback = None
     enforce_time_reversal = True
 
