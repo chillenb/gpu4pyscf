@@ -545,10 +545,6 @@ class GrandCanonicalKRKS(lib.StreamObject):
         nelec = self.weight * sum(_as_float(
             cp.einsum('ij,ji->', d, s), 'initial electron number')
             for d, s in zip(dm, self.s_ao))
-        tolerance = 1e-8 * max(1., self.capacity)
-        if not -tolerance <= nelec <= self.capacity+tolerance:
-            raise ValueError('initial density electron count must lie between '
-                             '0 and %g' % self.capacity)
         self.nfev += 1
         veff = self.mf.get_veff(
             self.cell, dm, dm_last=None, vhf_last=None, hermi=1,
