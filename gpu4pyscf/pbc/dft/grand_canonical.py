@@ -37,21 +37,36 @@ except ImportError:  # pragma: no cover
 __all__ = ['GrandCanonicalKRKS']
 
 
-_DIIS_BACKTRACK = .5
-_DIIS_MAX_BACKTRACK = 8
-_DIIS_MIN_REDUCTION = 1e-3
-_DIIS_TRUST_SHRINK = .25
-_DIIS_TRUST_EXPAND = .75
-_DIIS_EXPANSION = 2.
-_DIIS_EXPAND_REDUCTION = 2e-2
-_MIN_DAMP = 1e-8
-_INITIAL_NELEC_STEP = 3e-2
-_MAX_NELEC_STEP_FRACTION = .1
-_ROOT_NELEC_TOL = 1e-8
-_VERIFY_RESIDUAL_TOL = 1e-6
-_VERIFY_DENSITY_TOL = 1e-9
-_HERMITICITY_TOL = 1e-10
-_ORTHOGONALITY_TOL = 1e-9
+_DIIS_BACKTRACK = getattr(
+    __config__, 'pbc_dft_grand_canonical_diis_backtrack', .5)
+_DIIS_MAX_BACKTRACK = getattr(
+    __config__, 'pbc_dft_grand_canonical_diis_max_backtrack', 8)
+_DIIS_MIN_REDUCTION = getattr(
+    __config__, 'pbc_dft_grand_canonical_diis_min_reduction', 1e-3)
+_DIIS_TRUST_SHRINK = getattr(
+    __config__, 'pbc_dft_grand_canonical_diis_trust_shrink', .25)
+_DIIS_TRUST_EXPAND = getattr(
+    __config__, 'pbc_dft_grand_canonical_diis_trust_expand', .75)
+_DIIS_EXPANSION = getattr(
+    __config__, 'pbc_dft_grand_canonical_diis_expansion', 2.)
+_DIIS_EXPAND_REDUCTION = getattr(
+    __config__, 'pbc_dft_grand_canonical_diis_expand_reduction', 2e-2)
+_MIN_DAMP = getattr(
+    __config__, 'pbc_dft_grand_canonical_min_damp', 1e-8)
+_INITIAL_NELEC_STEP = getattr(
+    __config__, 'pbc_dft_grand_canonical_initial_nelec_step', 3e-2)
+_MAX_NELEC_STEP_FRACTION = getattr(
+    __config__, 'pbc_dft_grand_canonical_max_nelec_step_fraction', .1)
+_ROOT_NELEC_TOL = getattr(
+    __config__, 'pbc_dft_grand_canonical_root_nelec_tol', 1e-8)
+_VERIFY_RESIDUAL_TOL = getattr(
+    __config__, 'pbc_dft_grand_canonical_verify_residual_tol', 1e-6)
+_VERIFY_DENSITY_TOL = getattr(
+    __config__, 'pbc_dft_grand_canonical_verify_density_tol', 1e-9)
+_HERMITICITY_TOL = getattr(
+    __config__, 'pbc_dft_grand_canonical_hermiticity_tol', 1e-10)
+_ORTHOGONALITY_TOL = getattr(
+    __config__, 'pbc_dft_grand_canonical_orthogonality_tol', 1e-9)
 
 
 def _as_float(value, name='value'):
