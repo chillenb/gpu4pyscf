@@ -545,7 +545,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
         nelec = self.weight * sum(_as_float(
             cp.einsum('ij,ji->', d, s), 'initial electron number')
             for d, s in zip(dm, self.s_ao))
-        if not 0 < nelec < self.capacity:
+        tolerance = 1e-8 * max(1., self.capacity)
+        if not -tolerance <= nelec <= self.capacity+tolerance:
             raise ValueError('initial density electron count must lie between '
                              '0 and %g' % self.capacity)
         self.nfev += 1
@@ -853,6 +854,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
 
     def _kernel_fixed_mu(self, h, current_n):
         samples = []
+        margin = min(self.root_nelec_tol, .25*self.capacity)
+        current_n = min(self.capacity-margin, max(margin, current_n))
         best = None
         best_score = np.inf
         pending = None
