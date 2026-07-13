@@ -30,7 +30,7 @@ from gpu4pyscf.pbc.dft.multigrid_v2 import fft_in_place, ifft_in_place
 def shape_function(rhoR, sigma_k, nc_k, eps=1e-10):
     Z = cp.log(cp.maximum(rhoR.real, eps) / nc_k) * (1.0 / (np.sqrt(2) * sigma_k))
     S = 0.5 * cupyx.scipy.special.erfc(Z)
-    Sprime = (1/(np.sqrt(2*np.pi)*sigma_k)) * cp.exp(-Z**2) / cp.maximum(rhoR.real, eps)
+    Sprime = -(1/(np.sqrt(2*np.pi)*sigma_k)) * cp.exp(-Z**2) / cp.maximum(rhoR.real, eps)
     return S, Sprime
 
 def vasp_dens_to_pyscf_dens(val):
@@ -358,10 +358,8 @@ class PeriodicLPBE(lib.StreamObject):
         lambdalq_ion = - 1.0/(8*np.pi) * ebkappa2 * solution_phi_R.reshape(-1)**2
         lambdalq_diel = -1.0/(8*np.pi) * (self.rel_permittivity - 1.) * cp.einsum('ng, ng ->g', grad_solution_phiR, grad_solution_phiR)
 
-        # shape_function returns the positive magnitude -dS/drho.  The
-        # dielectric and ionic response terms require dS/drho itself.
-        vion_r = -Sprime.reshape(-1) * lambdalq_ion
-        vdiel_r = -Sprime.reshape(-1) * lambdalq_diel
+        vion_r = Sprime.reshape(-1) * lambdalq_ion
+        vdiel_r = Sprime.reshape(-1) * lambdalq_diel
 
         # These terms should not be added to the free energy.
         Eion = cp.einsum('g, g ->', lambdalq_ion, S.reshape(-1)) * vol / ngrids
@@ -416,7 +414,7 @@ class PeriodicLPBE(lib.StreamObject):
         grad_abs_r = cp.sqrt(cp.einsum('i...,i...->...', grad_rho_r, grad_rho_r))
         grad_abs_safe_r = cp.maximum(grad_abs_r, self.eps)
 
-        vcav_r = -self.cav_tension * Sprime * (
+        vcav_r = self.cav_tension * Sprime * (
             lap_rho_r / grad_abs_safe_r
             - grad_hess_grad_r / (grad_abs_safe_r ** 3)
         )
@@ -445,7 +443,7 @@ class PeriodicLPBE(lib.StreamObject):
         log.timer("convert_xc_on_g_mesh_to_fock", *t5)
 
 
-        surf_area = cp.sum( (Sprime * grad_abs_r).reshape(-1) ) * vol / ngrids
+        surf_area = cp.sum( (-Sprime * grad_abs_r).reshape(-1) ) * vol / ngrids
         Ecav = self.cav_tension * surf_area
 
         if self.debug_checks:
