@@ -1369,14 +1369,41 @@ def test_canonical_transport_starts_with_minimum_source_and_initial_damping(
         return source_point
 
     monkeypatch.setattr(parent, '_advance_canonical_session', capture)
+    h0 = [cp.asarray([
+        [-0.25, 0.2 + 0.05j],
+        [0.2 - 0.05j, 0.1]], dtype=cp.complex128)]
     parent._start_canonical_session(
-        parent.hcore_ao, 1.0005, 1.0, _CanonicalWork(0, []),
+        h0, 1.0005, 1.0e-8, _CanonicalWork(0, []),
         transport_source=source)
 
     context = captured['session'].context
+    assert context.state.residual_rms > (
+        parent._canonical_transport_residual_floor(1.0e-8))
     assert context.damping_hint == pytest.approx(0.125)
     assert context.transport_pending
     assert len(context.history) == 1
+
+
+def test_canonical_transport_bypasses_already_local_new_state(monkeypatch):
+    _, parent = _solver(canonical_continuation=True)
+    source_point, source = parent._start_canonical_session(
+        parent.hcore_ao, 1.0, 1.0, _CanonicalWork(0, []))
+    captured = {}
+
+    def capture(session, residual_tolerance, work):
+        captured['session'] = session
+        return source_point
+
+    monkeypatch.setattr(parent, '_advance_canonical_session', capture)
+    parent._start_canonical_session(
+        parent.hcore_ao, 1.0005, 1.0e-8, _CanonicalWork(0, []),
+        transport_source=source)
+
+    context = captured['session'].context
+    assert context.state.residual_rms <= (
+        parent._canonical_transport_residual_floor(1.0e-8))
+    assert not context.transport_pending
+    assert context.history == []
 
 
 def test_canonical_transport_selects_nearest_retained_converged_session():
