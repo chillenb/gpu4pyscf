@@ -88,7 +88,6 @@ class GrandCanonicalConfig:
     canonical_continuation_min_delta_nelec: float = 1.0e-8
     canonical_continuation_initial_damping: float = 0.125
     canonical_continuation_diis_max_coefficient_l1: float = 50.0
-    canonical_continuation_diis_transport_delta_nelec: float = 1.0e-3
 
     # Optional branch selector for low-temperature calculations.  This shifts
     # only the initial auxiliary Hamiltonian by a scalar; mu and every
@@ -282,10 +281,6 @@ class _DIISRunContext:
     next_cycle: int
     converged: bool = False
     message: str = 'residual-DIIS iteration has not started'
-    transport_pending: bool = False
-    transport_attempts: int = 0
-    transport_acceptances: int = 0
-    transport_resets: int = 0
 
 
 @dataclass(frozen=True)
@@ -295,7 +290,6 @@ class _DIISStepResult:
     coefficient_l1: float
     history_action: str
     predicted_residual_rms: float
-    transport_status: str = ''
 
 
 @dataclass(frozen=True)
@@ -390,9 +384,6 @@ class _FixedNSession:
     published_history: int = 0
     published_nfev: int = 0
     published_niter: int = 0
-    published_transport_attempts: int = 0
-    published_transport_acceptances: int = 0
-    published_transport_resets: int = 0
 
 
 @dataclass(frozen=True)
@@ -416,9 +407,6 @@ class _CanonicalWork:
     fixed_n_niter: int = 0
     verification_nfev: int = 0
     refinements: int = 0
-    transport_attempts: int = 0
-    transport_acceptances: int = 0
-    transport_resets: int = 0
 
     @property
     def total_nfev(self) -> int:
@@ -502,9 +490,6 @@ class GrandCanonicalResult:
     canonical_verification_density_rms: float = np.nan
     canonical_terminal_mode: str = ''
     canonical_continuation_refinements: int = 0
-    canonical_diis_transport_attempts: int = 0
-    canonical_diis_transport_acceptances: int = 0
-    canonical_diis_transport_resets: int = 0
 
 
 def _as_float(value: Any, name: str = 'value') -> float:
@@ -871,12 +856,6 @@ class GrandCanonicalKRKS:
             value = getattr(self.config, name)
             if not np.isfinite(value) or value <= 0.0:
                 raise ValueError(f'{name} must be finite and positive')
-        transport_delta = (
-            self.config.canonical_continuation_diis_transport_delta_nelec)
-        if not np.isfinite(transport_delta) or transport_delta < 0.0:
-            raise ValueError(
-                'canonical_continuation_diis_transport_delta_nelec must be '
-                'finite and nonnegative')
         reduction = self.config.diis_min_residual_reduction
         if not np.isfinite(reduction) or not 0.0 <= reduction < 1.0:
             raise ValueError(
@@ -1705,11 +1684,6 @@ class GrandCanonicalKRKS:
         if len(history) > self.config.diis_space:
             del history[0]
 
-    def _copy_diis_item(self, item: _DIISItem) -> _DIISItem:
-        return _DIISItem(
-            self.copy_blocks(item.fock),
-            self.copy_blocks(item.residual))
-
     def _diis_coefficients(
             self, history: list[_DIISItem]) -> tuple[np.ndarray, float,
                                                       float, str]:
@@ -1846,57 +1820,31 @@ class GrandCanonicalKRKS:
 
     def _diis_step(
             self, state: _GCState,
-            history: list[_DIISItem], starting_damping: float = 1.0,
-            transported: bool = False) -> _DIISStepResult:
+            history: list[_DIISItem],
+            starting_damping: float = 1.0) -> _DIISStepResult:
         start_nfev = self.nfev
         latest = history[-1]
         coefficients, condition, coefficient_l1, action = (
             self._diis_coefficients(history))
-        transport_status = ''
-        if transported and action:
-            # Regularization rejected every imported vector before a trial.
-            history[:] = [latest]
-            trial, damping, rejection = self._try_diis_target(
-                state, latest.fock, starting_damping,
-                self.config.diis_max_backtracks)
-            transport_status = 'reset'
-            reset_action = 'discarded pruned transported DIIS history'
-            action = ((action + '; ') if action else '') + reset_action
-        else:
-            target = self._diis_target(history, coefficients)
-            model_backtracks = (
-                0 if transported else
-                (min(2, self.config.diis_max_backtracks)
-                 if len(history) > 1 else self.config.diis_max_backtracks))
-            trial, damping, rejection = self._try_diis_target(
-                state, target, starting_damping, model_backtracks)
+        target = self._diis_target(history, coefficients)
+        model_backtracks = (
+            min(2, self.config.diis_max_backtracks)
+            if len(history) > 1 else self.config.diis_max_backtracks)
+        trial, damping, rejection = self._try_diis_target(
+            state, target, starting_damping, model_backtracks)
         if trial is None and len(history) > 1:
-            if transported:
-                history[:] = [latest]
             trial, damping, rejection = self._try_diis_target(
                 state, latest.fock, starting_damping,
                 self.config.diis_max_backtracks)
-            if transported:
-                transport_status = 'reset'
-                fallback_action = (
-                    'discarded rejected transported DIIS history; '
-                    'latest-Fock fallback')
-            else:
-                fallback_action = (
-                    'latest-Fock fallback after rejected Pulay model')
+            fallback_action = (
+                'latest-Fock fallback after rejected Pulay model')
             action = ((action + '; ') if action else '') + fallback_action
-        elif (transported and trial is not None and
-              transport_status != 'reset'):
-            transport_status = 'accepted'
-            transport_action = 'accepted transported DIIS model'
-            action = ((action + '; ') if action else '') + transport_action
         nfev = self.nfev - start_nfev
         if trial is None:
             message = 'residual-DIIS failed: ' + rejection
             return _DIISStepResult(
                 _LineSearchResult(False, None, nfev=nfev, message=message),
-                condition, coefficient_l1, action, np.nan,
-                transport_status)
+                condition, coefficient_l1, action, np.nan)
         predicted_residual_rms = self._diis_predicted_residual_rms(
             state, damping)
         message = 'residual-DIIS accepted'
@@ -1906,7 +1854,7 @@ class GrandCanonicalKRKS:
             _LineSearchResult(True, trial, damping, nfev,
                               False, False, message),
             condition, coefficient_l1, action,
-            predicted_residual_rms, transport_status)
+            predicted_residual_rms)
 
     def _alpha_cap(self, direction: Sequence) -> float:
         block_rms = self.max_block_rms(direction)
@@ -3037,46 +2985,10 @@ class GrandCanonicalKRKS:
                              if record.restart_reason else '')))
             for record in records]
 
-    def _diis_transport_snapshot(
-            self, session: _FixedNSession) -> tuple[list[_DIISItem], float]:
-        """Copy the terminal Pulay vector for one guarded transport trial."""
-        source = session.solver
-        terminal = _DIISItem(
-            source.copy_blocks(session.context.state.fock_orth),
-            source.copy_blocks(session.context.state.residual))
-        return [terminal], session.context.damping_hint
-
-    def _canonical_transport_source(
-            self, samples: Sequence[_CanonicalSample],
-            electron_number: float) -> Optional[_FixedNSession]:
-        threshold = (
-            self.config.canonical_continuation_diis_transport_delta_nelec)
-        if threshold == 0.0:
-            return None
-        candidates = []
-        for sample in samples:
-            session = sample.session
-            if session is None or not session.context.converged:
-                continue
-            delta = abs(sample.electron_number - electron_number)
-            if delta > 0.0 and delta <= threshold:
-                candidates.append((delta, session))
-        return (None if not candidates else
-                min(candidates, key=lambda item: item[0])[1])
-
-    def _canonical_transport_residual_floor(
-            self, residual_tolerance: float) -> float:
-        """Avoid spending a transport trial on an already-local seed."""
-        intermediate = np.sqrt(
-            self.config.canonical_continuation_coarse_residual_tol *
-            self.config.canonical_continuation_bracketed_residual_tol)
-        return max(float(residual_tolerance), float(intermediate))
-
     def _start_canonical_session(
             self, h: Sequence, electron_number: float,
-            residual_tolerance: float, work: _CanonicalWork,
-            transport_source: Optional[_FixedNSession] = None,
-            ) -> tuple[_FixedNPoint, _FixedNSession]:
+            residual_tolerance: float,
+            work: _CanonicalWork) -> tuple[_FixedNPoint, _FixedNSession]:
         """Start, advance, and account for one fixed-N DIIS session."""
         canonical_solver = self._spawn_fixed_n(
             electron_number,
@@ -3088,36 +3000,8 @@ class GrandCanonicalKRKS:
         canonical_solver._reset_run_diagnostics()
         state = canonical_solver.evaluate(
             canonical_solver._initial_h(h0=h))
-        if transport_source is not None:
-            residual_floor = self._canonical_transport_residual_floor(
-                residual_tolerance)
-            if state.residual_rms <= residual_floor:
-                self.log.info(
-                    'Skipping DIIS transport from N = %.12g to N = %.12g: '
-                    'new-state residual %.3g is already below the transport '
-                    'floor %.3g',
-                    transport_source.electron_number, electron_number,
-                    state.residual_rms, residual_floor)
-                transport_source = None
-        transported_items = None
-        damping_hint = None
-        if transport_source is not None:
-            transported_items, source_damping = self._diis_transport_snapshot(
-                transport_source)
-            damping_hint = min(
-                source_damping,
-                canonical_solver.config.diis_initial_damping)
-            self.log.info(
-                'Transporting %d DIIS vectors from N = %.12g to N = %.12g '
-                '(delta N = %.3g, initial damping = %.3g)',
-                len(transported_items), transport_source.electron_number,
-                electron_number,
-                electron_number - transport_source.electron_number,
-                damping_hint)
         context = canonical_solver._new_diis_context(
-            state, None, niter=0, cycle_start=0,
-            history=transported_items, damping_hint=damping_hint,
-            transported=transported_items is not None)
+            state, None, niter=0, cycle_start=0)
         session = _FixedNSession(
             float(electron_number), canonical_solver, context)
         point = self._advance_canonical_session(
@@ -3143,22 +3027,10 @@ class GrandCanonicalKRKS:
             evaluation_offset))
         work.fixed_n_nfev += nfev
         work.fixed_n_niter += niter
-        work.transport_attempts += (
-            context.transport_attempts -
-            session.published_transport_attempts)
-        work.transport_acceptances += (
-            context.transport_acceptances -
-            session.published_transport_acceptances)
-        work.transport_resets += (
-            context.transport_resets -
-            session.published_transport_resets)
 
         session.published_history = len(solver.history)
         session.published_nfev = solver.nfev
         session.published_niter = context.niter
-        session.published_transport_attempts = context.transport_attempts
-        session.published_transport_acceptances = context.transport_acceptances
-        session.published_transport_resets = context.transport_resets
         return _FixedNPoint(
             state=outcome.state,
             converged=outcome.converged,
@@ -3253,10 +3125,7 @@ class GrandCanonicalKRKS:
             f'canonical continuation ({distinct_n_proposals} fixed-N points, '
             f'{work.refinements} refinements, '
             f'{work.fixed_n_nfev} fixed-N Fock evaluations, '
-            f'{work.verification_nfev} verification evaluations, DIIS '
-            f'transport {work.transport_acceptances}/'
-            f'{work.transport_attempts} accepted with '
-            f'{work.transport_resets} resets); ' +
+            f'{work.verification_nfev} verification evaluations); ' +
             ('converged by one-Fock fixed-mu verification'
              if terminal_success else
              'failed to satisfy canonical root verification'))
@@ -3273,20 +3142,12 @@ class GrandCanonicalKRKS:
             terminal_state, terminal_success, message,
             work.total_niter, density_change)
         self.mf.canonical_continuation_refinements_gc = work.refinements
-        self.mf.canonical_diis_transport_attempts_gc = work.transport_attempts
-        self.mf.canonical_diis_transport_acceptances_gc = (
-            work.transport_acceptances)
-        self.mf.canonical_diis_transport_resets_gc = work.transport_resets
         self.mf.scf_summary.update({
             'canonical_continuation_steps': distinct_n_proposals,
             'canonical_continuation_evaluations': work.fixed_n_nfev,
             'canonical_continuation_mu_error': mu_error,
             'canonical_continuation_delta_nelec': delta_nelec,
             'canonical_continuation_refinements': work.refinements,
-            'canonical_diis_transport_attempts': work.transport_attempts,
-            'canonical_diis_transport_acceptances': (
-                work.transport_acceptances),
-            'canonical_diis_transport_resets': work.transport_resets,
             'fock_evaluations_total': work.total_nfev,
         })
         return replace(
@@ -3296,10 +3157,6 @@ class GrandCanonicalKRKS:
             canonical_continuation_mu_error=mu_error,
             canonical_continuation_delta_nelec=delta_nelec,
             canonical_continuation_refinements=work.refinements,
-            canonical_diis_transport_attempts=work.transport_attempts,
-            canonical_diis_transport_acceptances=(
-                work.transport_acceptances),
-            canonical_diis_transport_resets=work.transport_resets,
         )
 
     def _kernel_canonical_continuation(
@@ -3322,7 +3179,7 @@ class GrandCanonicalKRKS:
         proposed_nelec: list[float] = []
         force_tight_refinement = False
         pending_session: Optional[_FixedNSession] = None
-        allow_transport = True
+        allow_resume = True
         failed_inner_nelec: Optional[float] = None
         verification_repair_nelec: Optional[float] = None
         verification = _CanonicalVerification()
@@ -3355,7 +3212,7 @@ class GrandCanonicalKRKS:
                 distinct_n_proposals += 1
             else:
                 work.refinements += 1
-                if pending_session is None and allow_transport:
+                if pending_session is None and allow_resume:
                     sample_index = self._canonical_sample_index(
                         samples, current_nelec)
                     if sample_index is not None:
@@ -3376,14 +3233,9 @@ class GrandCanonicalKRKS:
                 canonical_result = self._advance_canonical_session(
                     session, residual_tolerance, work)
             else:
-                transport_source = (
-                    self._canonical_transport_source(
-                        samples, current_nelec)
-                    if allow_transport else None)
                 canonical_result, session = self._start_canonical_session(
-                    h, current_nelec, residual_tolerance, work,
-                    transport_source=transport_source)
-            allow_transport = True
+                    h, current_nelec, residual_tolerance, work)
+            allow_resume = True
             last_canonical_result = canonical_result
             h = canonical_result.h_orth
             error = canonical_result.mu - self.mu
@@ -3444,7 +3296,7 @@ class GrandCanonicalKRKS:
                         best_canonical_result.fock_orth)
                     force_tight_refinement = True
                     pending_session = None
-                    allow_transport = False
+                    allow_resume = False
                     self.log.warn(
                         'Retrying failed fixed-N solve once at N = %.12g',
                         current_nelec)
@@ -3479,7 +3331,7 @@ class GrandCanonicalKRKS:
                     failed_inner_nelec = None
                     force_tight_refinement = True
                     pending_session = None
-                    allow_transport = False
+                    allow_resume = False
                     self.log.warn(
                         'Retrying fixed-N continuation at safeguarded '
                         'N = %.12g', current_nelec)
@@ -3538,7 +3390,7 @@ class GrandCanonicalKRKS:
                     bracket = self._canonical_bracket(samples)
                     force_tight_refinement = True
                     pending_session = None
-                    allow_transport = False
+                    allow_resume = False
                     continue
 
                 # A persistent failure must not cycle forever at the same
@@ -3581,7 +3433,7 @@ class GrandCanonicalKRKS:
                     verification_repair_nelec = None
                     force_tight_refinement = True
                     pending_session = None
-                    allow_transport = False
+                    allow_resume = False
                     continue
                 self.log.warn(
                     'Persistent fixed-mu verification failure left no '
@@ -3602,7 +3454,7 @@ class GrandCanonicalKRKS:
                 current_nelec = canonical_result.electron_number
                 force_tight_refinement = True
                 pending_session = session
-                allow_transport = False
+                allow_resume = False
                 continue
 
             if bracket is not None:
@@ -3624,7 +3476,7 @@ class GrandCanonicalKRKS:
                     current_nelec = best_endpoint.electron_number
                     force_tight_refinement = True
                     pending_session = best_endpoint.session
-                    allow_transport = False
+                    allow_resume = False
                     self.log.info(
                         'Refining secant endpoint N = %.12g from residual %.3g '
                         'to %.3g before the next root proposal',
@@ -3842,23 +3694,14 @@ class GrandCanonicalKRKS:
 
     def _new_diis_context(
             self, state: _GCState, previous: Optional[_GCState],
-            niter: int, cycle_start: int,
-            history: Optional[Sequence[_DIISItem]] = None,
-            damping_hint: Optional[float] = None,
-            transported: bool = False) -> _DIISRunContext:
-        items = ([] if history is None else
-                 [self._copy_diis_item(item) for item in history])
-        if len(items) >= self.config.diis_space:
-            items = items[-(self.config.diis_space - 1):]
+            niter: int, cycle_start: int) -> _DIISRunContext:
         return _DIISRunContext(
             state=state,
             previous=previous,
-            history=items,
-            damping_hint=(self.config.diis_initial_damping
-                          if damping_hint is None else float(damping_hint)),
+            history=[],
+            damping_hint=self.config.diis_initial_damping,
             niter=niter,
             next_cycle=cycle_start,
-            transport_pending=bool(transported and items),
         )
 
     def _advance_diis(
@@ -3882,18 +3725,9 @@ class GrandCanonicalKRKS:
                 break
             self._append_diis_item(context.history, state)
             starting_damping = context.damping_hint
-            transported = context.transport_pending
             result = self._diis_step(
-                state, context.history, starting_damping,
-                transported=transported)
+                state, context.history, starting_damping)
             history_size = len(context.history)
-            if transported:
-                context.transport_attempts += 1
-                if result.transport_status == 'accepted':
-                    context.transport_acceptances += 1
-                else:
-                    context.transport_resets += 1
-                context.transport_pending = False
             step = result.step
             if not step.success or step.state is None:
                 context.message = step.message
@@ -3903,16 +3737,6 @@ class GrandCanonicalKRKS:
                 state, new_state, result.predicted_residual_rms,
                 step.alpha, starting_damping)
             history_action = result.history_action
-            if (transported and
-                    result.transport_status == 'accepted'):
-                # The imported model is an accelerator for exactly one step.
-                # Subsequent Pulay vectors must come from the new fixed-N map.
-                current_item = context.history[-1]
-                context.history[:] = [current_item]
-                history_action = (
-                    history_action +
-                    ('; ' if history_action else '') +
-                    'retired imported vectors after one-shot transport')
             self._record_diis(
                 cycle, state, new_state, step, history_size,
                 result.condition, result.coefficient_l1,
