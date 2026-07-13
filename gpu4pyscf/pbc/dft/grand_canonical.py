@@ -22,16 +22,12 @@ to the discontinuously changing low-temperature occupations.
 
 import numpy as np
 import cupy as cp
+from scipy.special import expit
 
 from pyscf import __config__, lib
 from pyscf.scf.addons import _fermi_smearing_occ, _smearing_optimize
 
 from gpu4pyscf.lib import diis, logger
-
-try:
-    from cupyx.scipy.special import expit as _expit
-except ImportError:  # pragma: no cover
-    _expit = None
 
 
 __all__ = ['GrandCanonicalKRKS']
@@ -80,16 +76,7 @@ def _stack_or_list(values):
 
 
 def _fermi_occ(gamma):
-    gamma = cp.asarray(gamma)
-    if _expit is not None:
-        return _expit(-gamma)
-    positive = gamma >= 0
-    out = cp.empty_like(gamma, dtype=cp.result_type(gamma, cp.float64))
-    exp_neg = cp.exp(-gamma[positive])
-    out[positive] = exp_neg / (1. + exp_neg)
-    exp_pos = cp.exp(gamma[~positive])
-    out[~positive] = 1. / (1. + exp_pos)
-    return out
+    return expit(-cp.asarray(gamma))
 
 
 def _fermi_entropy(gamma, occ):
