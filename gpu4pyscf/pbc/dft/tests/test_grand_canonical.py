@@ -6,14 +6,15 @@ from pyscf.pbc import gto
 
 from gpu4pyscf.lib.cupy_helper import tag_array
 from gpu4pyscf.pbc.dft.grand_canonical import (
-    GrandCanonicalConfig, GrandCanonicalKRKS, _BrentRoot, _DIISItem,
-    _LineSearchResult, fermi_divided_difference, fermi_entropy,
-    fermi_occupations,
+    GrandCanonicalConfig, GrandCanonicalKRKS, _CanonicalSample,
+    _CanonicalWork, _DIISItem, _FixedNSession, _LineSearchResult,
+    fermi_divided_difference, fermi_entropy, fermi_occupations,
 )
 
 
 class _MockCell:
     precision = 1.0e-12
+    nelectron = 2
 
     @staticmethod
     def get_scaled_kpts(kpts):
@@ -130,6 +131,8 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
             line_search_max_delta_nelec=1.0,
             line_search_nelec_guard_max_delta_nelec=5.0e-2,
             canonical_continuation=False,
+            canonical_continuation_diis_transport_delta_nelec=1.0e-3,
+            canonical_continuation_max_delta_nelec=None,
             canonical_continuation_verification_residual_tol=1.0e-6,
             canonical_continuation_verification_density_tol=1.0e-9,
             line_search_method='strong-wolfe',
@@ -172,6 +175,10 @@ def _solver(mu=-0.1, checkpoint_path=None, initial_electron_number=None,
         line_search_nelec_guard_max_delta_nelec=(
             line_search_nelec_guard_max_delta_nelec),
         canonical_continuation=canonical_continuation,
+        canonical_continuation_diis_transport_delta_nelec=(
+            canonical_continuation_diis_transport_delta_nelec),
+        canonical_continuation_max_delta_nelec=(
+            canonical_continuation_max_delta_nelec),
         canonical_continuation_verification_residual_tol=(
             canonical_continuation_verification_residual_tol),
         canonical_continuation_verification_density_tol=(
@@ -1024,8 +1031,8 @@ def test_residual_diis_configuration_and_pulay_coefficients():
 
     fock = [cp.zeros((2, 2), dtype=cp.complex128)]
     history = [
-        _DIISItem(fock, fock, [cp.diag(cp.asarray([1.0, 0.0]))]),
-        _DIISItem(fock, fock, [cp.diag(cp.asarray([0.0, 1.0]))]),
+        _DIISItem(fock, [cp.diag(cp.asarray([1.0, 0.0]))]),
+        _DIISItem(fock, [cp.diag(cp.asarray([0.0, 1.0]))]),
     ]
     coefficients, condition, coefficient_l1, action = (
         solver._diis_coefficients(history))
@@ -1041,8 +1048,8 @@ def test_residual_diis_prunes_unsafe_condition_and_coefficients():
     _, solver = _solver()
     solver.config.diis_max_condition = 1.0e6
     history = [
-        _DIISItem(zero, zero, duplicate),
-        _DIISItem(zero, zero, duplicate),
+        _DIISItem(zero, duplicate),
+        _DIISItem(zero, duplicate),
     ]
     _, condition, _, action = solver._diis_coefficients(history)
     assert condition > solver.config.diis_max_condition
@@ -1055,9 +1062,9 @@ def test_residual_diis_prunes_unsafe_condition_and_coefficients():
     solver.config.diis_max_condition = 1.0e12
     solver.config.diis_max_coefficient_l1 = 10.0
     history = [
-        _DIISItem(zero, zero, [cp.diag(cp.asarray([1.0, 0.0]))]),
+        _DIISItem(zero, [cp.diag(cp.asarray([1.0, 0.0]))]),
         _DIISItem(
-            zero, zero, [cp.diag(cp.asarray([1.01, 0.01]))]),
+            zero, [cp.diag(cp.asarray([1.01, 0.01]))]),
     ]
     _, condition, _, action = solver._diis_coefficients(history)
     assert condition < solver.config.diis_max_condition
@@ -1139,6 +1146,508 @@ def test_diis_backtracks_until_trial_reduces_residual():
     assert calls == pytest.approx([0.1, 0.05, 0.025])
 
 
+def test_diis_falls_back_to_latest_fock_after_rejected_pulay_model():
+    _, solver = _solver(diis_switch_residual_rms=1.0e-3)
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    zero = [cp.zeros((2, 2), dtype=cp.complex128)]
+    history = [
+        _DIISItem([cp.eye(2)], [cp.diag(cp.asarray([1.0, 0.0]))]),
+        _DIISItem([3.0 * cp.eye(2)],
+                  [cp.diag(cp.asarray([0.0, 1.0]))]),
+    ]
+    accepted = replace(state, residual_rms=0.5 * state.residual_rms)
+    calls = []
+
+    solver._diis_coefficients = lambda items: (
+        np.full(len(items), 1.0 / len(items)), 1.0, 1.0, '')
+
+    def try_target(unused_state, target, starting_damping,
+                   max_backtracks=None):
+        calls.append((solver.copy_blocks(target), starting_damping,
+                      max_backtracks))
+        if len(calls) == 1:
+            return None, 0.0, 'rejected test Pulay model'
+        return accepted, 0.125, ''
+
+    solver._try_diis_target = try_target
+    result = solver._diis_step(
+        state, history, starting_damping=0.5)
+
+    assert result.step.success
+    assert result.step.state is accepted
+    assert result.step.alpha == pytest.approx(0.125)
+    assert [call[2] for call in calls] == [2, solver.config.diis_max_backtracks]
+    assert all(call[1] == pytest.approx(0.5) for call in calls)
+    assert float(cp.max(cp.abs(
+        calls[0][0][0] - 2.0 * cp.eye(2))).item()) < 1.0e-14
+    assert float(cp.max(cp.abs(
+        calls[1][0][0] - history[-1].fock[0])).item()) < 1.0e-14
+    assert 'latest-Fock fallback' in result.history_action
+
+
+def test_diis_context_resumes_without_seed_evaluation_and_keeps_memory():
+    mf, solver = _solver(electron_number=1.0)
+    solver.config.diis_initial_damping = 0.25
+    state = solver.evaluate([
+        cp.asarray([[0.3, 0.19 + 0.04j],
+                    [0.19 - 0.04j, -0.2]])])
+    initial_residual = state.residual_rms
+    context = solver._new_diis_context(
+        state, None, niter=0, cycle_start=0)
+    history = context.history
+
+    coarse = solver._advance_diis(
+        context, residual_tolerance=0.8 * initial_residual)
+    assert coarse.converged
+    assert context.niter == 1
+    assert context.next_cycle == 1
+    assert context.history is history
+    assert len(history) == 1
+    assert context.damping_hint == pytest.approx(0.5)
+
+    calls_before = mf.veff_calls
+    niter_before = context.niter
+    tighter = solver._advance_diis(context, residual_tolerance=1.0e-8)
+    assert tighter.converged
+    assert context.history is history
+    assert context.niter > niter_before
+    assert context.next_cycle == context.niter
+    # Every resumed Fock is a DIIS trial; there is no repeated seed build.
+    assert mf.veff_calls - calls_before == context.niter - niter_before
+    assert solver.nfev == mf.veff_calls
+
+
+def test_canonical_session_refinement_preserves_history_and_accounts_incrementally(
+        monkeypatch):
+    mf, solver = _solver(electron_number=1.0)
+    solver.config.diis_initial_damping = 0.25
+    state = solver.evaluate([
+        cp.asarray([[0.3, 0.19 + 0.04j],
+                    [0.19 - 0.04j, -0.2]])])
+    context = solver._new_diis_context(
+        state, None, niter=0, cycle_start=0)
+    session = _FixedNSession(1.0, solver, context)
+    work = _CanonicalWork(0, [])
+
+    coarse = solver._advance_canonical_session(
+        session, 0.8 * state.residual_rms, work)
+    assert coarse.converged
+    assert context.history
+    retained = tuple(context.history)
+    damping = context.damping_hint
+
+    # Exhausting the cumulative cycle budget proves that refinement does not
+    # spend another seed evaluation merely to restart the DIIS driver.
+    solver.config.max_cycle = context.next_cycle
+    published = (
+        solver.nfev, context.niter, len(solver.history),
+        work.fixed_n_nfev, work.fixed_n_niter, len(work.history),
+        mf.veff_calls)
+    stopped = solver._advance_canonical_session(session, 1.0e-12, work)
+    assert not stopped.converged
+    assert published == (
+        solver.nfev, context.niter, len(solver.history),
+        work.fixed_n_nfev, work.fixed_n_niter, len(work.history),
+        mf.veff_calls)
+
+    seen = []
+    original_step = solver._diis_step
+
+    def inspect_step(current, history, starting_damping, **kwargs):
+        seen.append((tuple(history[:len(retained)]), starting_damping))
+        return original_step(
+            current, history, starting_damping, **kwargs)
+
+    monkeypatch.setattr(solver, '_diis_step', inspect_step)
+    solver.config.max_cycle = context.next_cycle + 1
+    before_nfev = solver.nfev
+    before_niter = context.niter
+    before_history = len(work.history)
+    before_veff = mf.veff_calls
+    solver._advance_canonical_session(session, 1.0e-12, work)
+
+    assert len(seen) == 1
+    assert all(actual is expected
+               for actual, expected in zip(seen[0][0], retained))
+    assert seen[0][1] == pytest.approx(damping)
+    assert context.next_cycle == solver.config.max_cycle
+    assert context.niter == before_niter + 1
+    assert solver.nfev - before_nfev == mf.veff_calls - before_veff
+    assert work.fixed_n_nfev == solver.nfev
+    assert work.fixed_n_niter == context.niter
+    assert len(work.history) - before_history == 1
+    assert [record.cycle for record in work.history] == list(
+        range(context.niter))
+    assert [record.fock_evaluations for record in work.history] == sorted(
+        record.fock_evaluations for record in work.history)
+
+
+def test_canonical_transport_snapshot_is_terminal_deep_and_time_reversal_safe():
+    fock0 = cp.asarray([[-0.7, 0.12 + 0.04j],
+                        [0.12 - 0.04j, 0.3]], dtype=cp.complex128)
+    mf = _FixedFockKRKS([fock0, fock0.conj()])
+    mf.kpts = np.asarray([[0.25, 0.0, 0.0], [-0.25, 0.0, 0.0]])
+    parent = GrandCanonicalKRKS(
+        mf, mu=-0.1, sigma=0.15,
+        config=GrandCanonicalConfig(
+            check_time_reversal=True, enforce_time_reversal=True,
+            canonical_continuation=True))
+    work = _CanonicalWork(0, [])
+    point, session = parent._start_canonical_session(
+        parent.hcore_ao, 1.0, 1.0, work)
+    assert point.converged
+    session.context.history = []
+    for value in range(6):
+        matrix = cp.asarray([
+            [value + 1.0, 0.1 + 0.2j],
+            [0.1 - 0.2j, -value - 1.0]], dtype=cp.complex128)
+        session.context.history.append(_DIISItem(
+            [matrix, matrix.conj()],
+            [0.01 * matrix, 0.01 * matrix.conj()]))
+
+    terminal_fock = parent.copy_blocks(session.context.state.fock_orth)
+    terminal_residual = parent.copy_blocks(session.context.state.residual)
+    snapshot, damping = parent._diis_transport_snapshot(session)
+    assert len(snapshot) == 1
+    assert damping == pytest.approx(session.context.damping_hint)
+    # Only the terminal vector is transported, leaving all remaining DIIS
+    # slots for the newly evaluated fixed-N map.
+    assert float(cp.max(cp.abs(
+        snapshot[0].fock[0] - terminal_fock[0])).item()) < 1.0e-14
+    assert float(cp.max(cp.abs(
+        snapshot[0].residual[0] - terminal_residual[0])).item()) < 1.0e-14
+    for item in snapshot:
+        assert float(cp.max(cp.abs(
+            item.fock[1] - item.fock[0].conj())).item()) < 1.0e-14
+        assert float(cp.max(cp.abs(
+            item.residual[1] - item.residual[0].conj())).item()) < 1.0e-14
+    session.context.state.fock_orth[0][0, 0] = 99.0
+    assert float(cp.max(cp.abs(
+        snapshot[0].fock[0] - terminal_fock[0])).item()) < 1.0e-14
+
+
+@pytest.mark.parametrize('target,expected', [
+    (1.0 + 0.999e-3, True),
+    (1.001, True),
+    (np.nextafter(1.001, np.inf), False),
+])
+def test_canonical_transport_source_obeys_exact_delta_nelec_threshold(
+        target, expected):
+    _, parent = _solver(canonical_continuation=True)
+    work = _CanonicalWork(0, [])
+    point, session = parent._start_canonical_session(
+        parent.hcore_ao, 1.0, 1.0, work)
+    sample = _CanonicalSample(
+        1.0, -0.1, point.residual_rms,
+        parent.copy_blocks(point.fock_orth), session)
+    source = parent._canonical_transport_source([sample], target)
+    assert (source is session) is expected
+
+    parent.config.canonical_continuation_diis_transport_delta_nelec = 0.0
+    assert parent._canonical_transport_source(
+        [sample], 1.0 + 0.5e-3) is None
+    session.context.converged = False
+    parent.config.canonical_continuation_diis_transport_delta_nelec = 1.0e-3
+    assert parent._canonical_transport_source(
+        [sample], 1.0 + 0.5e-3) is None
+
+
+def test_canonical_transport_starts_with_minimum_source_and_initial_damping(
+        monkeypatch):
+    _, parent = _solver(canonical_continuation=True)
+    source_work = _CanonicalWork(0, [])
+    source_point, source = parent._start_canonical_session(
+        parent.hcore_ao, 1.0, 1.0, source_work)
+    source.context.damping_hint = 0.5
+    parent.config.canonical_continuation_initial_damping = 0.125
+    captured = {}
+
+    def capture(session, residual_tolerance, work):
+        captured['session'] = session
+        return source_point
+
+    monkeypatch.setattr(parent, '_advance_canonical_session', capture)
+    parent._start_canonical_session(
+        parent.hcore_ao, 1.0005, 1.0, _CanonicalWork(0, []),
+        transport_source=source)
+
+    context = captured['session'].context
+    assert context.damping_hint == pytest.approx(0.125)
+    assert context.transport_pending
+    assert len(context.history) == 1
+
+
+def test_canonical_transport_selects_nearest_retained_converged_session():
+    _, solver = _solver(canonical_continuation=True)
+    work = _CanonicalWork(0, [])
+    samples = []
+    for electron_number in (1.0, 1.0006):
+        point, session = solver._start_canonical_session(
+            solver.hcore_ao, electron_number, 1.0, work)
+        samples.append(_CanonicalSample(
+            electron_number, point.mu - solver.mu, point.residual_rms,
+            solver.copy_blocks(point.fock_orth), session))
+
+    source = solver._canonical_transport_source(samples, 1.0005)
+
+    assert source is samples[1].session
+
+
+def test_repeated_secant_sample_uses_its_retained_session(monkeypatch):
+    _, solver = _solver(
+        mu=-0.1, canonical_continuation=True,
+        canonical_continuation_diis_transport_delta_nelec=0.0)
+    monkeypatch.setattr(solver, '_canonical_bracket', lambda samples: None)
+    first_nelec = []
+
+    def repeat_first_sample(samples, physical_fock, current_nelec):
+        if not first_nelec:
+            first_nelec.append(samples[0].electron_number)
+            return current_nelec + 0.02
+        return first_nelec[0]
+
+    monkeypatch.setattr(
+        solver, '_canonical_continuation_proposal', repeat_first_sample)
+    original_advance = solver._advance_canonical_session
+
+    class ReusedSession(RuntimeError):
+        pass
+
+    def detect_resume(session, residual_tolerance, work):
+        if session.published_nfev:
+            raise ReusedSession
+        return original_advance(session, residual_tolerance, work)
+
+    monkeypatch.setattr(solver, '_advance_canonical_session', detect_resume)
+    h0 = [cp.asarray([
+        [-0.25, 0.2 + 0.05j],
+        [0.2 - 0.05j, 0.1]], dtype=cp.complex128)]
+
+    with pytest.raises(ReusedSession):
+        solver._kernel_canonical_continuation(h0=h0)
+
+
+def test_canonical_session_pruning_keeps_latest_and_bracket_endpoints():
+    _, solver = _solver(canonical_continuation=True)
+    sessions = [object() for _ in range(5)]
+    samples = [
+        _CanonicalSample(
+            float(index), -1.0 + 0.5 * index, 1.0e-8,
+            solver.copy_blocks(solver.hcore_ao), sessions[index])
+        for index in range(5)
+    ]
+    bracket = (samples[0], samples[2])
+
+    solver._prune_canonical_sessions(samples, bracket)
+
+    assert samples[0].session is sessions[0]
+    assert samples[1].session is None
+    assert samples[2].session is sessions[2]
+    assert samples[3].session is sessions[3]
+    assert samples[4].session is sessions[4]
+
+
+def test_transported_diis_accepts_one_unbacktracked_trial():
+    _, solver = _solver(electron_number=1.0)
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    residual0 = [cp.diag(cp.asarray([1.0, 0.0]))]
+    residual1 = [cp.diag(cp.asarray([0.0, 1.0]))]
+    history = [
+        _DIISItem([cp.eye(2)], residual0),
+        _DIISItem([2.0 * cp.eye(2)], residual1),
+        _DIISItem(solver.copy_blocks(state.fock_orth),
+                  solver.copy_blocks(state.residual)),
+    ]
+    accepted = replace(state, residual_rms=0.5 * state.residual_rms)
+    calls = []
+
+    solver._diis_coefficients = lambda items: (
+        np.full(len(items), 1.0 / len(items)), 1.0, 1.0, '')
+
+    def try_target(unused_state, target, starting_damping,
+                   max_backtracks=None):
+        solver.nfev += 1
+        calls.append((starting_damping, max_backtracks))
+        return accepted, starting_damping, ''
+
+    solver._try_diis_target = try_target
+    result = solver._diis_step(
+        state, history, starting_damping=0.125, transported=True)
+
+    assert result.step.success
+    assert result.step.nfev == 1
+    assert calls == [(0.125, 0)]
+    assert result.transport_status == 'accepted'
+    assert 'accepted transported DIIS model' in result.history_action
+
+
+def test_accepted_transport_is_counted_and_retired_after_one_advance():
+    _, solver = _solver(electron_number=1.0)
+    solver.config.max_cycle = 1
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    imported = _DIISItem(
+        [cp.eye(2, dtype=cp.complex128)],
+        [cp.diag(cp.asarray([1.0, 0.0], dtype=cp.complex128))])
+    context = solver._new_diis_context(
+        state, None, niter=0, cycle_start=0,
+        history=[imported], damping_hint=0.125, transported=True)
+    accepted = replace(state, residual_rms=0.5 * state.residual_rms)
+    calls = []
+    solver._diis_coefficients = lambda items: (
+        np.full(len(items), 1.0 / len(items)), 1.0, 1.0, '')
+
+    def try_target(unused_state, target, starting_damping,
+                   max_backtracks=None):
+        solver.nfev += 1
+        calls.append(max_backtracks)
+        return accepted, starting_damping, ''
+
+    solver._try_diis_target = try_target
+    solver._advance_diis(context, residual_tolerance=1.0e-12)
+
+    assert calls == [0]
+    assert context.transport_attempts == 1
+    assert context.transport_acceptances == 1
+    assert context.transport_resets == 0
+    assert not context.transport_pending
+    assert context.state is accepted
+    # Imported cross-N information is intentionally a one-shot accelerator;
+    # subsequent Pulay steps are built only from the new fixed-N map.
+    assert len(context.history) == 1
+    assert float(cp.max(cp.abs(
+        context.history[0].fock[0] - state.fock_orth[0])).item()) < 1.0e-14
+    assert 'retired imported vectors after one-shot transport' in (
+        solver.history[-1].diis_history_action)
+
+
+def test_transported_pulay_trial_preserves_multik_time_reversal():
+    fock0 = cp.asarray([[-0.7, 0.12 + 0.04j],
+                        [0.12 - 0.04j, 0.3]], dtype=cp.complex128)
+    mf = _FixedFockKRKS([fock0, fock0.conj()])
+    mf.kpts = np.asarray([[0.25, 0.0, 0.0], [-0.25, 0.0, 0.0]])
+    solver = GrandCanonicalKRKS(
+        mf, mu=-0.1, sigma=0.15, electron_number=2.0,
+        config=GrandCanonicalConfig(
+            check_time_reversal=True, enforce_time_reversal=True,
+            required_consecutive_conv=1))
+    h0 = cp.asarray([[-0.25, 0.18 + 0.03j],
+                     [0.18 - 0.03j, 0.1]], dtype=cp.complex128)
+    state = solver.evaluate([h0, h0.conj()])
+    imported_fock = cp.asarray([
+        [-0.6, 0.04 + 0.08j],
+        [0.04 - 0.08j, 0.25]], dtype=cp.complex128)
+    imported_residual = cp.asarray([
+        [0.3, 0.1 + 0.07j],
+        [0.1 - 0.07j, -0.2]], dtype=cp.complex128)
+    history = [
+        _DIISItem(
+            [imported_fock, imported_fock.conj()],
+            [imported_residual, imported_residual.conj()]),
+        _DIISItem(
+            solver.copy_blocks(state.fock_orth),
+            solver.copy_blocks(state.residual)),
+    ]
+    accepted = replace(state, residual_rms=0.5 * state.residual_rms)
+    calls = []
+
+    def try_target(unused_state, target, starting_damping,
+                   max_backtracks=None):
+        calls.append((solver.copy_blocks(target), max_backtracks))
+        return accepted, starting_damping, ''
+
+    solver._try_diis_target = try_target
+    result = solver._diis_step(
+        state, history, starting_damping=0.125, transported=True)
+
+    assert result.transport_status == 'accepted'
+    assert len(calls) == 1 and calls[0][1] == 0
+    assert float(cp.max(cp.abs(
+        calls[0][0][1] - calls[0][0][0].conj())).item()) < 1.0e-14
+
+
+def test_rejected_transported_diis_resets_to_new_state_with_one_trial_overhead():
+    _, solver = _solver(electron_number=1.0)
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    current = _DIISItem(
+        solver.copy_blocks(state.fock_orth),
+        solver.copy_blocks(state.residual))
+    history = [
+        _DIISItem([cp.eye(2)],
+                  [cp.diag(cp.asarray([1.0, 0.0]))]),
+        _DIISItem([2.0 * cp.eye(2)],
+                  [cp.diag(cp.asarray([0.0, 1.0]))]),
+        current,
+    ]
+    accepted = replace(state, residual_rms=0.5 * state.residual_rms)
+    calls = []
+    solver._diis_coefficients = lambda items: (
+        np.full(len(items), 1.0 / len(items)), 1.0, 1.0, '')
+
+    def try_target(unused_state, target, starting_damping,
+                   max_backtracks=None):
+        solver.nfev += 1
+        calls.append((solver.copy_blocks(target), max_backtracks))
+        if len(calls) == 1:
+            return None, 0.0, 'rejected transported model'
+        return accepted, starting_damping, ''
+
+    solver._try_diis_target = try_target
+    result = solver._diis_step(
+        state, history, starting_damping=0.125, transported=True)
+
+    assert result.step.success
+    assert result.step.nfev == 2
+    assert [call[1] for call in calls] == [
+        0, solver.config.diis_max_backtracks]
+    assert len(history) == 1 and history[0] is current
+    assert float(cp.max(cp.abs(
+        calls[1][0][0] - state.fock_orth[0])).item()) < 1.0e-14
+    assert result.transport_status == 'reset'
+    assert 'discarded rejected transported DIIS history' in (
+        result.history_action)
+
+
+def test_pruned_transported_diis_resets_before_spending_a_pulay_trial():
+    _, solver = _solver(electron_number=1.0)
+    solver.config.diis_max_condition = 1.0e6
+    state = solver.evaluate([
+        cp.asarray([[-0.3, 0.08 + 0.03j],
+                    [0.08 - 0.03j, 0.2]])])
+    duplicate = solver.copy_blocks(state.residual)
+    current = _DIISItem(
+        solver.copy_blocks(state.fock_orth), duplicate)
+    history = [
+        _DIISItem([cp.eye(2)], solver.copy_blocks(duplicate)),
+        _DIISItem([2.0 * cp.eye(2)], solver.copy_blocks(duplicate)),
+        current,
+    ]
+    accepted = replace(state, residual_rms=0.5 * state.residual_rms)
+    calls = []
+
+    def try_target(unused_state, target, starting_damping,
+                   max_backtracks=None):
+        calls.append(max_backtracks)
+        return accepted, starting_damping, ''
+
+    solver._try_diis_target = try_target
+    result = solver._diis_step(
+        state, history, starting_damping=0.125, transported=True)
+
+    assert calls == [solver.config.diis_max_backtracks]
+    assert len(history) == 1 and history[0] is current
+    assert result.transport_status == 'reset'
+    assert 'discarded pruned transported DIIS history' in (
+        result.history_action)
+
+
 def test_residual_diis_accepts_noise_scale_objective_change_but_not_charge_jump():
     _, solver = _solver(
         diis_switch_residual_rms=1.0e-3,
@@ -1217,31 +1726,25 @@ def test_canonical_inner_points_share_workspace_without_publishing(
             check_time_reversal=False, canonical_continuation=True))
     expected_setup_calls = dict(mf.setup_calls)
     children = []
-    diis_children = []
-    points = []
+    advances = []
     original_spawn = solver._spawn_fixed_n
 
     def observed_spawn(electron_number, config):
         child = original_spawn(electron_number, config)
         children.append(child)
-        original_run_diis = child._run_diis
-        original_solve = child._solve_fixed_n_point
+        original_advance_diis = child._advance_diis
 
         def unexpected_finalize(*args, **kwargs):
             raise AssertionError('canonical child published through _finalize')
 
-        def observed_run_diis(*args, **kwargs):
-            diis_children.append(child)
-            return original_run_diis(*args, **kwargs)
-
-        def observed_solve(h0):
-            point = original_solve(h0)
-            points.append((child, point))
-            return point
+        def observed_advance_diis(context, residual_tolerance=None):
+            before = (child.nfev, context.niter, len(child.history))
+            outcome = original_advance_diis(context, residual_tolerance)
+            advances.append((child, context, before, outcome))
+            return outcome
 
         monkeypatch.setattr(child, '_finalize', unexpected_finalize)
-        monkeypatch.setattr(child, '_run_diis', observed_run_diis)
-        monkeypatch.setattr(child, '_solve_fixed_n_point', observed_solve)
+        monkeypatch.setattr(child, '_advance_diis', observed_advance_diis)
         return child
 
     monkeypatch.setattr(solver, '_spawn_fixed_n', observed_spawn)
@@ -1251,15 +1754,14 @@ def test_canonical_inner_points_share_workspace_without_publishing(
 
     assert result.converged, result.message
     assert children
-    assert len(points) == len(children)
-    assert diis_children == children
+    assert set(child for child, _, _, _ in advances) == set(children)
     assert all(child._workspace is solver._workspace for child in children)
-    for child, point in points:
-        assert point.state is not None
-        assert isinstance(point.converged, bool)
-        assert isinstance(point.message, str)
-        assert point.niter == len(point.history)
-        assert point.nfev == child.nfev
+    assert all(outcome.state is context.state
+               for _, context, _, outcome in advances)
+    assert sum(child.nfev for child in children) == (
+        result.canonical_continuation_evaluations)
+    assert sum(len(child.history) for child in children) == result.niter
+    assert result.niter == len(result.history)
     assert mf.setup_calls == expected_setup_calls
     assert mf.converged
     assert mf.e_tot == pytest.approx(result.dft_total_energy)
@@ -1288,6 +1790,10 @@ def test_automatic_canonical_continuation_finds_fixed_mu_electron_number():
         solver.config.canonical_continuation_handoff_delta_nelec)
     assert result.nfev == mf.veff_calls
     assert result.nfev > result.canonical_continuation_evaluations
+    assert result.canonical_continuation_refinements >= 0
+    assert (result.canonical_diis_transport_attempts ==
+            result.canonical_diis_transport_acceptances +
+            result.canonical_diis_transport_resets)
     assert solver.config.diis_max_coefficient_l1 == pytest.approx(10.0)
 
 
@@ -1320,97 +1826,48 @@ def test_kernel_routes_canonical_and_direct_solves(
     assert calls[0][0] == expected_route
 
 
-def test_unbracketed_canonical_continuation_uses_screened_secant():
+def test_canonical_continuation_uses_plain_secant_after_first_proposal():
     _, solver = _solver(canonical_continuation=True)
     inner_config = solver._canonical_continuation_config(1.0e-4, 0.125)
     assert inner_config.diis_max_coefficient_l1 == pytest.approx(50.0)
     proposal = solver._canonical_continuation_proposal(
         [(1.0, -0.04), (1.03, -0.03)], solver.hcore_ao,
-        current_nelec=1.03, maximum_step=0.1)
+        current_nelec=1.03)
     assert proposal == pytest.approx(1.12)
 
 
-def test_canonical_brent_accepts_secant_then_inverse_quadratic():
-    root = _BrentRoot.from_bracket(1.0, -1.0, 2.0, 2.0, 1.0e-12)
-    proposal = root.proposal()
-    assert proposal == pytest.approx(4.0 / 3.0)
-    assert root.last_method == 'secant'
-    root.update(proposal, proposal**2 - 2.0)
-    assert root.bracket == pytest.approx((4.0 / 3.0, 2.0))
-
-    proposal = root.proposal()
-    assert proposal == pytest.approx(149.0 / 105.0)
-    assert root.last_method == 'inverse-quadratic'
-    assert root.bracket[0] < proposal < root.bracket[1]
-
-
-def test_canonical_brent_bisects_an_unsafe_imbalanced_interpolation():
-    root = _BrentRoot.from_bracket(0.0, -10.0, 1.0, 1.0, 1.0e-12)
-    proposal = root.proposal()
-    assert proposal == pytest.approx(10.0 / 11.0)
-    assert root.last_method == 'secant'
-    root.update(proposal, 0.9)
-
-    proposal = root.proposal()
-    assert proposal == pytest.approx(5.0 / 11.0)
-    assert root.last_method == 'bisection'
-    assert root.bisection_steps == 1
-
-
-def test_canonical_brent_uses_optimized_mu_not_physical_charge_root():
+def test_canonical_secant_cap_is_ten_percent_of_neutral_electrons():
     _, solver = _solver(canonical_continuation=True)
-    mu_samples = [(1.0, -0.4), (2.0, 0.6)]
-    physical_charge_samples = [(1.0, -0.1), (2.0, 0.9)]
-    root = solver._canonical_brent_from_samples(mu_samples)
-    assert root is not None
-    assert root.proposal() == pytest.approx(1.4)
-
-    charge_root = solver._canonical_brent_from_samples(
-        physical_charge_samples)
-    assert charge_root is not None
-    assert charge_root.proposal() == pytest.approx(1.1)
+    assert solver.mf.cell.nelectron == 2
+    assert solver.config.canonical_continuation_max_delta_nelec is None
+    proposal = solver._canonical_continuation_proposal(
+        [(1.0, -1.0), (1.01, -0.99)], solver.hcore_ao,
+        current_nelec=1.01)
+    assert proposal == pytest.approx(1.21)
 
 
-def test_canonical_brent_bracket_is_nested_for_reversed_endpoints():
-    root = _BrentRoot.from_bracket(2.0, 6.0, 0.0, -2.0, 1.0e-10)
-    old_width = root.width
-    proposals = 0
-    for _ in range(12):
-        if root.converged:
-            break
-        proposal = root.proposal()
-        proposals += 1
-        lo, hi = root.bracket
-        assert lo < proposal < hi
-        root.update(proposal, proposal**3 - 2.0)
-        assert root.width < old_width
-        assert root.fb == 0.0 or np.signbit(root.fa) != np.signbit(root.fb)
-        assert abs(root.fb) <= abs(root.fa)
-        old_width = root.width
-    assert root.interpolation_steps + root.bisection_steps == proposals
+def test_canonical_deprecated_absolute_secant_cap_remains_supported():
+    _, solver = _solver(
+        canonical_continuation=True,
+        canonical_continuation_max_delta_nelec=0.075)
+    proposal = solver._canonical_continuation_proposal(
+        [(1.0, -1.0), (1.01, -0.99)], solver.hcore_ao,
+        current_nelec=1.01)
+    assert solver._canonical_secant_step_cap() == pytest.approx(0.075)
+    assert proposal == pytest.approx(1.085)
+
+    with pytest.raises(ValueError, match='max_delta_nelec'):
+        _solver(
+            canonical_continuation=True,
+            canonical_continuation_max_delta_nelec=0.0)
 
 
-def test_canonical_brent_reports_exact_and_interval_convergence():
-    exact = _BrentRoot.from_bracket(1.0, -1.0, 2.0, 1.0, 1.0e-12)
-    proposal = exact.proposal()
-    exact.update(proposal, 0.0)
-    assert exact.converged
-    assert exact.fb == 0.0
-    with pytest.raises(RuntimeError, match='interval has converged'):
-        exact.proposal()
-
-    interval = _BrentRoot.from_bracket(
-        1.0, -1.0, 1.0 + 5.0e-7, 1.0, 1.0e-6)
-    assert interval.converged
-    with pytest.raises(RuntimeError, match='interval has converged'):
-        interval.proposal()
-
-    lo = 1.0
-    hi = np.nextafter(lo, np.inf)
-    adjacent = _BrentRoot.from_bracket(lo, -1.0, hi, 1.0, 1.0e-20)
-    assert adjacent.converged
-    with pytest.raises(RuntimeError, match='interval has converged'):
-        adjacent.proposal()
+def test_canonical_secant_uses_optimized_mu_error_across_a_bracket():
+    _, solver = _solver(canonical_continuation=True)
+    proposal = solver._canonical_continuation_proposal(
+        [(1.0, -0.4), (1.1, 0.6)], solver.hcore_ao,
+        current_nelec=1.1)
+    assert proposal == pytest.approx(1.04)
 
 
 def test_canonical_continuation_default_handoff_charge_is_conservative():
@@ -1435,6 +1892,18 @@ def test_canonical_only_terminal_defaults_are_tight():
         1.0e-8)
     assert (solver.config.canonical_continuation_bracketed_residual_tol ==
             pytest.approx(1.0e-8))
+    assert (solver.config.
+            canonical_continuation_diis_transport_delta_nelec ==
+            pytest.approx(1.0e-3))
+    _, disabled = _solver(
+        canonical_continuation=True,
+        canonical_continuation_diis_transport_delta_nelec=0.0)
+    assert (disabled.config.
+            canonical_continuation_diis_transport_delta_nelec == 0.0)
+    with pytest.raises(ValueError, match='finite and nonnegative'):
+        _solver(
+            canonical_continuation=True,
+            canonical_continuation_diis_transport_delta_nelec=-1.0e-3)
 
 
 def test_canonical_fixed_mu_candidate_is_gauge_exact_and_uses_fock_charge():
@@ -1611,6 +2080,13 @@ def test_canonical_continuation_uses_one_gauge_exact_verification_fock(
             'canonical_verification_density_rms',
             'canonical_terminal_mode'):
         assert mf.scf_summary[name] == getattr(result, name)
+    for name in (
+            'canonical_continuation_refinements',
+            'canonical_diis_transport_attempts',
+            'canonical_diis_transport_acceptances',
+            'canonical_diis_transport_resets'):
+        assert mf.scf_summary[name] == getattr(result, name)
+        assert getattr(mf, name + '_gc') == getattr(result, name)
     assert mf.scf_summary['fock_evaluations_total'] == result.nfev
 
 
@@ -1633,6 +2109,17 @@ def test_failed_canonical_verification_resumes_fixed_n_continuation(
         return state
 
     monkeypatch.setattr(solver, 'evaluate', fail_first_verification)
+    original_start = solver._start_canonical_session
+    transport_sources = []
+    sessions = []
+
+    def tracked_start(*args, **kwargs):
+        transport_sources.append(kwargs.get('transport_source'))
+        point, session = original_start(*args, **kwargs)
+        sessions.append(session)
+        return point, session
+
+    monkeypatch.setattr(solver, '_start_canonical_session', tracked_start)
 
     def unexpected_iterative_fixed_mu(*args, **kwargs):
         raise AssertionError(
@@ -1651,11 +2138,51 @@ def test_failed_canonical_verification_resumes_fixed_n_continuation(
     assert result.canonical_verification_evaluations == 2
     assert result.canonical_verification_failures == 1
     assert result.canonical_terminal_mode == 'canonical-verification'
-    assert result.canonical_continuation_steps >= 2
+    assert result.canonical_continuation_steps == 1
+    assert result.canonical_continuation_refinements == 1
+    assert result.canonical_diis_transport_attempts == 0
+    assert len(sessions) == 2
+    assert sessions[0] is not sessions[1]
+    assert transport_sources == [None, None]
     assert result.nfev == mf.veff_calls
     assert result.nfev == (
         result.canonical_continuation_evaluations +
         result.canonical_verification_evaluations)
+
+
+def test_failed_fixed_n_retry_starts_fresh_without_transport(monkeypatch):
+    _, solver = _solver(
+        mu=-0.1, canonical_continuation=True,
+        canonical_continuation_diis_transport_delta_nelec=1.0)
+    original_start = solver._start_canonical_session
+    starts = []
+
+    def fail_second_start(*args, **kwargs):
+        point, session = original_start(*args, **kwargs)
+        starts.append((kwargs.get('transport_source'), session))
+        if len(starts) == 2:
+            point = replace(
+                point, converged=False,
+                message='injected fixed-N failure after transported solve')
+        return point, session
+
+    monkeypatch.setattr(
+        solver, '_start_canonical_session', fail_second_start)
+    h0 = [cp.asarray([
+        [-0.25, 0.2 + 0.05j],
+        [0.2 - 0.05j, 0.1]], dtype=cp.complex128)]
+
+    result = solver._kernel_canonical_continuation(h0=h0)
+
+    assert result.converged, result.message
+    assert len(starts) >= 3
+    assert starts[0][0] is None
+    assert starts[1][0] is starts[0][1]
+    # The retry of the deliberately failed point gets a new child/context and
+    # no imported Pulay model, even though the permissive threshold would
+    # otherwise select one.
+    assert starts[2][0] is None
+    assert starts[2][1] is not starts[1][1]
 
 
 def test_fock_evaluation_count_includes_fresh_initial_guess_build():
