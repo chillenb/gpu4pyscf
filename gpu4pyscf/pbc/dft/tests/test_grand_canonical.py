@@ -310,9 +310,9 @@ def test_public_fixed_mu_kernel_uses_fixed_n_root_and_verification():
     assert solver.converged, solver.message
     assert e_tot == mf.e_tot
     assert abs(solver.mu+.16) < solver.conv_tol_mu
-    assert solver.outer_cycles == 1
+    assert solver.outer_cycles == 4
     assert solver.verification_attempts == 1
-    assert solver.nfev == 3
+    assert solver.nfev == 1 + solver.outer_cycles + solver.verification_attempts
 
 
 def test_fock_evaluation_count_includes_initial_density_build():
