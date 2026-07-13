@@ -332,9 +332,9 @@ def test_fixed_mu_starts_from_initial_density_electron_number():
     assert nelec != pytest.approx(solver._nelec_at_mu(unused_h, solver.mu))
 
 
-def test_fixed_mu_clips_an_initial_density_at_capacity():
+def test_fixed_mu_clips_an_overcapacity_initial_density():
     mf = _FixedFockKRKS([cp.asarray([[-.7]])])
-    mf.get_init_guess = lambda cell, kpts=None: cp.asarray([[[2.]]])
+    mf.get_init_guess = lambda cell, kpts=None: cp.asarray([[[2.1]]])
     solver = GrandCanonicalKRKS(mf, mu=-.16, sigma=.15)
     solver.enforce_time_reversal = False
     solver.max_outer_cycle = 10
