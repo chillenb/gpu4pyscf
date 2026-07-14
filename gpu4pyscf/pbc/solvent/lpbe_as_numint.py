@@ -170,12 +170,12 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
 
     log.debug(f"Nelec by integration: {nelec_by_integration}")
     log.debug(f"Nuclear charge by integration of pseudo_nucdensityR: {nuc_charge_by_integration}")
-    log.info(f"Total solute charge by integration: {qsol}")
+    log.debug(f"Total solute charge by integration: {qsol}")
 
     Svol = cp.sum(S) * vol / ngrids
     Svol_ang = Svol * (nist.BOHR ** 3)
     cell_vol_ang = cell.vol * (nist.BOHR ** 3)
-    log.info(f"Svol: {Svol_ang} Ang^3")
+    log.debug(f"Svol: {Svol_ang} Ang^3")
     log.debug(f"Cell vol: {cell_vol_ang} Ang^3")
     log.debug(f"ebkappa2: {ebkappa2:.3e} 1/Bohr^2, debye length: {debye_length:.3f} Bohr")
     log.debug(f"ebkappa2: {ebkappa2 / (nist.BOHR ** 2):.3e} 1/Angstrom^2, debye length: {debye_length * nist.BOHR:.3f} Angstrom")
@@ -232,7 +232,7 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
     if info != 0:
         log.warn(f"Conjugate gradient did not converge: info={info}")
 
-    log.info(f"Number of CG iterations: {niter}")
+    log.debug(f"Number of CG iterations: {niter}")
 
     t1 = log.timer("LPBE CG solve", *t0)
 
@@ -345,13 +345,13 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
     surf_area = cp.sum( (-Sprime * grad_abs_r).reshape(-1) ) * vol / ngrids
     Ecav = cav_tension * surf_area
 
-    log.info(f"Ecav: {Ecav:.3e} Hartree ({Ecav*nist.HARTREE2EV:.3e} eV)")
-    log.info(f"Coulomb correction energy: {E_coul_corr:.3e} Hartree ({E_coul_corr*nist.HARTREE2EV:.3e} eV)")
-    log.info(f"Vacuum potential in empty space: {vacpot_at_zmin:.3e} Hartree ({vacpot_at_zmin*nist.HARTREE2EV:.3e} eV)")
-    log.info(f"Phi in empty space: {solpot_at_zmin:.3e} Hartree ({solpot_at_zmin*nist.HARTREE2EV:.3e} eV)")
-    log.info(f"Surface area: {surf_area:.3f} Bohr^2")
-    log.info(f"Eion: {Eion:.3e} Hartree ({Eion*nist.HARTREE2EV:.3e} eV)")
-    log.info(f"Ediel: {Ediel:.3e} Hartree ({Ediel*nist.HARTREE2EV:.3e} eV)")
+    log.debug(f"Ecav: {Ecav:.3e} Hartree ({Ecav*nist.HARTREE2EV:.3e} eV)")
+    log.debug(f"Coulomb correction energy: {E_coul_corr:.3e} Hartree ({E_coul_corr*nist.HARTREE2EV:.3e} eV)")
+    log.debug(f"Vacuum potential in empty space: {vacpot_at_zmin:.3e} Hartree ({vacpot_at_zmin*nist.HARTREE2EV:.3e} eV)")
+    log.debug(f"Phi in empty space: {solpot_at_zmin:.3e} Hartree ({solpot_at_zmin*nist.HARTREE2EV:.3e} eV)")
+    log.debug(f"Surface area: {surf_area:.3f} Bohr^2")
+    log.debug(f"Eion: {Eion:.3e} Hartree ({Eion*nist.HARTREE2EV:.3e} eV)")
+    log.debug(f"Ediel: {Ediel:.3e} Hartree ({Ediel*nist.HARTREE2EV:.3e} eV)")
 
     results = {
         'vcorr_g': vcorr_g,
