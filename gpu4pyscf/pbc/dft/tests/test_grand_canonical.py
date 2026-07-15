@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import cupy as cp
 import numpy as np
 import pytest
@@ -162,10 +164,10 @@ def test_constructor_and_stream_object_configuration():
     with pytest.raises(TypeError, match='different ensembles'):
         GrandCanonicalKRKS(mf, mu=-.1, sigma=.1, nelec=1.2)
     solver = GrandCanonicalKRKS(mf, mu=-.1, sigma=.1).set(
-        conv_tol=1e-7, diis_space=4, diis_backtrack=.4)
+        conv_tol=1e-7, diis_space=4, tighten_mu_threshold=2e-3)
     assert solver.conv_tol == 1e-7
     assert solver.diis_space == 4
-    assert solver.diis_backtrack == .4
+    assert solver.tighten_mu_threshold == 2e-3
 
 
 def test_build_caches_mean_field_setup():
@@ -199,7 +201,7 @@ def test_fixed_n_mu_uses_pyscf_smearing_convention(monkeypatch):
         seen['mo_energy'], np.concatenate([cp.asnumpy(x) for x in energies]))
     assert seen['nocc'] == 1.3 * 3 / 2
     assert seen['sigma'] == .15
-    assert abs(solver._nelec_from_eig(energies, mu)-1.3) < 1e-10
+    assert abs(solver.nelec_from_eig(energies, mu)-1.3) < 1e-10
 
 
 def test_fixed_n_state_has_target_charge_and_gauge_free_residual():
@@ -207,23 +209,23 @@ def test_fixed_n_state_has_target_charge_and_gauge_free_residual():
     unused, solver = _solver(nelec=target)
     solver.build()
     h = [cp.asarray([[-.3, .08+.03j], [.08-.03j, .2]])]
-    state = solver._evaluate(h, nelec=target)
+    state = solver.calculate_cycle(h, nelec=target)
     assert abs(state.nelec-target) < 1e-10
     assert abs(solver._trace_mean(state.residual)) < 1e-12
     assert abs(state.free_energy-(state.e_tot+state.entropy_energy)) < 1e-13
     assert np.isfinite(state.mu)
 
 
-def test_fixed_mu_candidate_preserves_occupations_and_physical_mu():
-    unused, solver = _solver(mu=-.16)
+def test_fixed_n_state_removes_scalar_gauge_without_another_fock():
+    target = 1.3
+    unused, solver = _solver(nelec=target)
     solver.build()
-    h = [cp.asarray([[-.3, .08+.03j], [.08-.03j, .2]])]
-    state = solver._evaluate(h, nelec=1.3)
-    candidate, unused_delta = solver._fixed_mu_candidate(state)
-    for new, old, eye in zip(candidate, state.h, solver.identity):
-        assert float(cp.max(cp.abs(
-            new-solver.mu*eye-(old-state.aux_mu*eye))).item()) < 1e-12
-    assert abs(solver._nelec_at_mu(candidate, solver.mu)-state.nelec) < 1e-10
+    h = [_fock() + .37*cp.eye(2)]
+    state = solver.calculate_cycle(h, nelec=target)
+    assert solver.nfev == 1
+    assert solver._rms(
+        [x-y for x, y in zip(state.h, state.fock)]) < 1e-12
+    assert abs(solver.nelec_from_eig(state.eig, state.mu)-target) < 1e-10
 
 
 def test_tagged_solvent_fock_and_energy_use_same_veff():
@@ -232,8 +234,8 @@ def test_tagged_solvent_fock_and_energy_use_same_veff():
     mf = _TaggedSolventKRKS(hcore, solvent)
     solver = GrandCanonicalKRKS(mf, sigma=.15, nelec=1.2)
     solver.build()
-    state = solver._evaluate([cp.asarray([[-.2, .1j], [-.1j, .1]])],
-                             nelec=1.2)
+    state = solver.calculate_cycle([cp.asarray([[-.2, .1j], [-.1j, .1]])],
+                                   nelec=1.2)
     expected = hcore[0]+solvent[0]
     assert float(cp.max(cp.abs(state.fock[0]-expected)).item()) < 1e-13
     assert mf.energy_veff is not None
@@ -247,12 +249,15 @@ def test_residual_diis_converges_complex_fixed_n_problem():
     solver.conv_tol = 1e-8
     solver.build()
     h0 = [cp.asarray([[-.2, .18-.07j], [.18+.07j, .5]])]
-    session = solver._new_session(h0, 1.3)
-    solver._advance_session(session, solver.conv_tol)
-    assert session.converged, session.message
-    assert session.state.residual_rms <= solver.conv_tol
-    assert abs(session.state.nelec-1.3) < 1e-10
-    assert session.cycles > 0
+    fixed_n_calc = solver.start_fixed_n_calc(h0, 1.3)
+    solver.fixed_n_subproblem(fixed_n_calc, solver.conv_tol)
+    assert fixed_n_calc.converged, fixed_n_calc.message
+    assert fixed_n_calc.cycle_data.residual_rms <= solver.conv_tol
+    assert abs(fixed_n_calc.cycle_data.nelec-1.3) < 1e-10
+    mismatch = [h-f for h, f in zip(
+        fixed_n_calc.cycle_data.h, fixed_n_calc.cycle_data.fock)]
+    assert solver._rms(mismatch) <= solver.conv_tol
+    assert fixed_n_calc.cycles > 0
 
 
 def test_same_n_refinement_preserves_diis_session():
@@ -261,31 +266,32 @@ def test_same_n_refinement_preserves_diis_session():
         _LinearFockKRKS(hcore, coupling=.15), sigma=.15, nelec=1.3)
     solver.build()
     h0 = [cp.asarray([[-.2, .18-.07j], [.18+.07j, .5]])]
-    session = solver._new_session(h0, 1.3)
-    adiis = session.diis
-    solver._advance_session(session, 1e-3)
-    coarse_cycles = session.cycles
+    fixed_n_calc = solver.start_fixed_n_calc(h0, 1.3)
+    adiis = fixed_n_calc.diis
+    solver.fixed_n_subproblem(fixed_n_calc, 1e-3)
+    coarse_cycles = fixed_n_calc.cycles
     coarse_nfev = solver.nfev
-    assert session.converged
-    solver._advance_session(session, 1e-8)
-    assert session.diis is adiis
-    assert session.converged
-    assert session.cycles >= coarse_cycles
+    assert fixed_n_calc.converged
+    solver.fixed_n_subproblem(fixed_n_calc, 1e-8)
+    assert fixed_n_calc.diis is adiis
+    assert fixed_n_calc.converged
+    assert fixed_n_calc.cycles >= coarse_cycles
     assert solver.nfev >= coarse_nfev
-    assert session.state.residual_rms <= 1e-8
+    assert fixed_n_calc.cycle_data.residual_rms <= 1e-8
 
 
 def test_secant_proposals_and_neutral_charge_cap():
     unused, solver = _solver(mu=-.1)
     solver.build()
-    state = solver._evaluate([_fock()], nelec=1.3)
-    samples = [(1., -.1, state, None), (2., .1, state, None)]
-    proposal = solver._secant_proposal(samples, state)
-    assert proposal == pytest.approx(1.8)
+    state = solver.calculate_cycle([_fock()], nelec=1.3)
+    samples = [
+        gc.MuSample(SimpleNamespace(nelec=1.), -.1, None),
+        gc.MuSample(SimpleNamespace(nelec=2.), .1, None),
+    ]
+    assert solver.secant_proposal(samples, state.h) == pytest.approx(1.8)
 
-    first = [(1., -.1, state, None)]
-    proposal = solver._secant_proposal(first, state)
-    assert abs(proposal-1.) <= .03+1e-14
+    proposal = solver.secant_proposal(samples[:1], state.h)
+    assert abs(proposal-1.) <= solver.initial_nelec_step+1e-14
 
 
 def test_public_fixed_n_kernel_publishes_standard_attributes():
@@ -298,7 +304,7 @@ def test_public_fixed_n_kernel_publishes_standard_attributes():
     assert mf.mo_coeff is solver.mo_coeff
 
 
-def test_public_fixed_mu_kernel_uses_fixed_n_root_and_verification():
+def test_public_fixed_mu_kernel_uses_fixed_n_root():
     mf, solver = _solver(mu=-.16)
     solver.conv_tol = 1e-9
     e_tot = solver.kernel()
@@ -306,8 +312,7 @@ def test_public_fixed_mu_kernel_uses_fixed_n_root_and_verification():
     assert e_tot == mf.e_tot
     assert abs(solver.mu+.16) < solver.conv_tol_mu
     assert solver.outer_cycles == 4
-    assert solver.verification_attempts == 1
-    assert solver.nfev == 1 + solver.outer_cycles + solver.verification_attempts
+    assert solver.nfev == 1 + solver.outer_cycles
 
 
 def test_fock_evaluation_count_includes_initial_density_build():
@@ -323,7 +328,7 @@ def test_fixed_mu_starts_from_initial_density_electron_number():
     dm0 = cp.asarray([[[.7, .1j], [-.1j, .2]]])
     unused_h, nelec = solver._initial_h(dm0)
     assert nelec == pytest.approx(.9)
-    assert nelec != pytest.approx(solver._nelec_at_mu(unused_h, solver.mu))
+    assert nelec != pytest.approx(solver.nelec_at_mu(unused_h, solver.mu))
 
 
 def test_fixed_mu_clips_an_overcapacity_initial_density():
@@ -359,7 +364,7 @@ def test_real_multik_fixed_n_krks():
     assert abs(solver.electron_number-1.6) < 1e-9
     assert np.isfinite(solver.mu)
     dm = mf.make_rdm1(mf.mo_coeff, mf.mo_occ)
-    assert float(cp.max(cp.abs(dm-solver._state.dm)).item()) < 1e-8
+    assert float(cp.max(cp.abs(dm-solver._cycle_data.dm)).item()) < 1e-8
 
 
 def test_real_multik_fixed_mu_krks():
@@ -370,7 +375,6 @@ def test_real_multik_fixed_mu_krks():
     solver.conv_tol = 1e-6
     solver.conv_tol_coarse = 1e-5
     solver.conv_tol_mu = 1e-5
-    solver.conv_tol_nelec = 1e-5
     solver.max_cycle = 30
     solver.kernel()
     assert solver.converged, solver.message
