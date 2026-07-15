@@ -3,6 +3,9 @@ from scipy.special import expit
 from gpu4pyscf.lib import logger
 
 
+ALPHA_TRIAL = 1.0
+
+
 def omega_gradient_wrt_h(h, f, beta, mu, diag_term_multiplier=1.0):
     # Gamma = beta[(H + H^H)/2 - mu I]
     gamma_matrix = beta * (0.5 * (h + h.conj().T) - mu * cp.eye(h.shape[0]))
@@ -55,52 +58,47 @@ def nlcg(self, dm0=None):
     h, unused_nelec = self._initial_h(dm0)
     state = self.calculate_cycle(h, mu=self.mu)
     gradient = [
-        (grad_re + 1j*grad_im)
-        for grad_re, grad_im in (
-            omega_gradient_wrt_h(h, f, self.beta, self.mu, diag_term_multiplier=1.0)
-            for h, f in zip(state.h, state.fock)
-        )
-    ]
-    direction = [-g for g in gradient]
+        0.5 * (f-h) for h, f in zip(state.h, state.fock)]
+    direction = [g.copy() for g in gradient]
 
     for unused_cycle in range(self.max_cycle):
         if state.residual_rms <= self.conv_tol:
             break
 
-        slope = self._inner(gradient, direction)
-        alpha = 1.0
+        omega_gradient = [
+            grad_re + 1j*grad_im
+            for grad_re, grad_im in (
+                omega_gradient_wrt_h(
+                    h, f, self.beta, self.mu, diag_term_multiplier=1.0)
+                for h, f in zip(state.h, state.fock)
+            )
+        ]
+        slope0 = self._inner(omega_gradient, direction)
+        probe = self.calculate_cycle(
+            [h + ALPHA_TRIAL*d for h, d in zip(state.h, direction)],
+            mu=self.mu)
+        probe_gradient = [
+            grad_re + 1j*grad_im
+            for grad_re, grad_im in (
+                omega_gradient_wrt_h(
+                    h, f, self.beta, self.mu, diag_term_multiplier=1.0)
+                for h, f in zip(probe.h, probe.fock)
+            )
+        ]
+        slope_trial = self._inner(probe_gradient, direction)
+        alpha = -ALPHA_TRIAL*slope0 / (slope_trial-slope0)
         trial = self.calculate_cycle(
             [h + alpha*d for h, d in zip(state.h, direction)],
             mu=self.mu)
-        ninner = 0
-        while trial.grand_potential > state.grand_potential + 1e-4*alpha*slope:
-            if ninner >= 10:
-                logger.info(self, "Maximum inner iterations reached; reset")
-                direction = [-g for g in gradient]
-                ninner = 0
-                slope = self._inner(gradient, direction)
-                alpha = 1.0
-                continue
-            alpha *= 0.5
-            trial = self.calculate_cycle(
-                [h + alpha*d for h, d in zip(state.h, direction)],
-                mu=self.mu)
-            logger.info(self, "Inner NLCG iteration: alpha = %f", alpha)
-            ninner += 1
 
         new_gradient = [
-            (grad_re + 1j*grad_im)
-            for grad_re, grad_im in (
-                omega_gradient_wrt_h(h, f, self.beta, self.mu, diag_term_multiplier=1.0)
-                for h, f in zip(trial.h, trial.fock)
-            )
-        ]
+            0.5 * (f-h) for h, f in zip(trial.h, trial.fock)]
         beta = max(0.0, self._inner(
             new_gradient,
             [new-old for new, old in zip(new_gradient, gradient)])
             / self._inner(gradient, gradient))
         direction = [
-            -g + beta*d for g, d in zip(new_gradient, direction)]
+            g + beta*d for g, d in zip(new_gradient, direction)]
         state = trial
         gradient = new_gradient
         self.cycles += 1
