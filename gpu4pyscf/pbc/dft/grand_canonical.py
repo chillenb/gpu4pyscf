@@ -93,11 +93,11 @@ def _fermi_entropy(gamma, occ):
 class GCSolverCycle:
     __slots__ = (
         'h', 'eig', 'coeff', 'occ', 'p', 'dm', 'fock',
-        'mu_estimate', 'mu', 'gauge', 'e_tot', 'nelec',
+        'mu', 'e_tot', 'nelec',
         'entropy', 'entropy_energy', 'free_energy', 'grand_potential',
         'residual', 'residual_rms')
 
-    def __init__(self, h, eig, coeff, occ, p, dm, fock, mu_estimate, mu, gauge,
+    def __init__(self, h, eig, coeff, occ, p, dm, fock, mu,
                  e_tot, nelec, entropy, entropy_energy, free_energy,
                  grand_potential, residual, residual_rms):
         self.h = h
@@ -107,9 +107,7 @@ class GCSolverCycle:
         self.p = p
         self.dm = dm
         self.fock = fock
-        self.mu_estimate = mu_estimate
         self.mu = mu
-        self.gauge = gauge
         self.e_tot = e_tot
         self.nelec = nelec
         self.entropy = entropy
@@ -121,13 +119,12 @@ class GCSolverCycle:
 
 
 class FixedNCalc:
-    __slots__ = ('nelec', 'cycle_data', 'previous', 'diis', 'damp', 'cycles',
+    __slots__ = ('nelec', 'cycle_data', 'diis', 'damp', 'cycles',
                  'converged', 'message')
 
     def __init__(self, nelec, cycle_data, adiis, damp):
         self.nelec = nelec
         self.cycle_data = cycle_data
-        self.previous = None
         self.diis = adiis
         self.damp = damp
         self.cycles = 0
@@ -165,15 +162,12 @@ class GrandCanonicalKRKS(lib.StreamObject):
     max_cycle = getattr(__config__, 'pbc_dft_grand_canonical_max_cycle', 100)
     max_outer_cycle = getattr(__config__, 'pbc_dft_grand_canonical_max_outer_cycle', 16)
     conv_tol = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol', 1e-8)
-    conv_tol_coarse = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_coarse', 4e-6)
+    conv_tol_coarse = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_coarse', 1e-6)
     conv_tol_mu = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_mu', 1e-6)
-    conv_tol_nelec = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_nelec', 2e-5)
+    tighten_mu_threshold = getattr(
+        __config__, 'pbc_dft_grand_canonical_tighten_mu_threshold', 1e-3)
     diis_space = getattr(__config__, 'pbc_dft_grand_canonical_diis_space', 6)
     damp = getattr(__config__, 'pbc_dft_grand_canonical_damp', 0.125)
-    diis_backtrack = getattr(__config__, 'pbc_dft_grand_canonical_diis_backtrack', 0.5)
-    diis_max_backtrack = getattr(__config__, 'pbc_dft_grand_canonical_diis_max_backtrack', 8)
-    diis_min_reduction = getattr(__config__, 'pbc_dft_grand_canonical_diis_min_reduction', 1e-3)
-    diis_trust_shrink = getattr(__config__, 'pbc_dft_grand_canonical_diis_trust_shrink', 0.25)
     diis_trust_expand = getattr(__config__, 'pbc_dft_grand_canonical_diis_trust_expand', 0.75)
     diis_expansion = getattr(__config__, 'pbc_dft_grand_canonical_diis_expansion', 2.0)
     diis_expand_reduction = getattr(__config__, 'pbc_dft_grand_canonical_diis_expand_reduction', 2e-2)
@@ -181,23 +175,20 @@ class GrandCanonicalKRKS(lib.StreamObject):
     initial_nelec_step = getattr(__config__, 'pbc_dft_grand_canonical_initial_nelec_step', 3e-2)
     max_nelec_step_fraction = getattr(__config__, 'pbc_dft_grand_canonical_max_nelec_step_fraction', 0.1)
     root_nelec_tol = getattr(__config__, 'pbc_dft_grand_canonical_root_nelec_tol', 1e-8)
-    verify_residual_tol = getattr(__config__, 'pbc_dft_grand_canonical_verify_residual_tol', 1e-6)
-    verify_density_tol = getattr(__config__, 'pbc_dft_grand_canonical_verify_density_tol', 1e-9)
     callback = None
 
     _keys = {
         'mf', 'mu', 'sigma', 'nelec', 'max_cycle', 'max_outer_cycle',
-        'conv_tol', 'conv_tol_coarse', 'conv_tol_mu', 'conv_tol_nelec',
+        'conv_tol', 'conv_tol_coarse', 'conv_tol_mu',
+        'tighten_mu_threshold',
         'diis_space', 'damp', 'callback',
-        'diis_backtrack', 'diis_max_backtrack', 'diis_min_reduction',
-        'diis_trust_shrink', 'diis_trust_expand', 'diis_expansion',
+        'diis_trust_expand', 'diis_expansion',
         'diis_expand_reduction', 'min_damp', 'initial_nelec_step',
-        'max_nelec_step_fraction', 'root_nelec_tol', 'verify_residual_tol',
-        'verify_density_tol',
+        'max_nelec_step_fraction', 'root_nelec_tol',
         'converged', 'cycles', 'outer_cycles', 'nfev', 'e_tot',
         'free_energy', 'grand_potential', 'electron_number', 'entropy',
         'entropy_energy', 'residual_rms', 'mo_energy', 'mo_coeff', 'mo_occ',
-        'refinements', 'verification_attempts', 'message', 'scf_summary',
+        'refinements', 'message', 'scf_summary',
     }
 
     def __init__(self, mf, mu=None, sigma=None, nelec=None):
@@ -230,7 +221,6 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.outer_cycles = 0
         self.nfev = 0
         self.refinements = 0
-        self.verification_attempts = 0
         self.message = ''
         self.e_tot = None
         self.free_energy = None
@@ -258,7 +248,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
             log.info('mu = %.12g Ha', self.mu)
             log.info('max outer cycles = %d', self.max_outer_cycle)
             log.info('mu tolerance = %g', self.conv_tol_mu)
-            log.info('electron-number tolerance = %g', self.conv_tol_nelec)
+            log.info('tight-residual mu threshold = %g',
+                     self.tighten_mu_threshold)
         else:
             log.info('nelec = %.12g', self.nelec)
         log.info('residual tolerance = %g', self.conv_tol)
@@ -275,17 +266,12 @@ class GrandCanonicalKRKS(lib.StreamObject):
             raise ValueError('max_outer_cycle must be a positive integer')
         if not isinstance(self.diis_space, int) or self.diis_space < 2:
             raise ValueError('diis_space must be an integer of at least 2')
-        if (not isinstance(self.diis_max_backtrack, int) or
-                self.diis_max_backtrack < 0):
-            raise ValueError('diis_max_backtrack must be a nonnegative integer')
         for name in ('conv_tol', 'conv_tol_coarse', 'conv_tol_mu',
-                     'conv_tol_nelec', 'damp', 'diis_backtrack',
-                     'diis_min_reduction', 'diis_trust_shrink',
+                     'tighten_mu_threshold', 'damp',
                      'diis_trust_expand', 'diis_expansion',
                      'diis_expand_reduction', 'min_damp',
                      'initial_nelec_step', 'max_nelec_step_fraction',
-                     'root_nelec_tol', 'verify_residual_tol',
-                     'verify_density_tol'):
+                     'root_nelec_tol'):
             value = getattr(self, name)
             if not np.isfinite(value) or value <= 0:
                 raise ValueError('%s must be finite and positive' % name)
@@ -293,12 +279,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
             raise ValueError('conv_tol_coarse may not be tighter than conv_tol')
         if self.damp > 1:
             raise ValueError('damp may not exceed 1')
-        if self.diis_backtrack >= 1:
-            raise ValueError('diis_backtrack must be less than 1')
-        if self.diis_min_reduction >= 1:
-            raise ValueError('diis_min_reduction must be less than 1')
-        if self.diis_trust_shrink >= self.diis_trust_expand:
-            raise ValueError('diis trust thresholds must be ordered')
+        if self.diis_trust_expand >= 1:
+            raise ValueError('diis_trust_expand must be less than 1')
         if self.diis_expansion < 1:
             raise ValueError('diis_expansion may not be less than 1')
         if self.diis_expand_reduction >= 1:
@@ -400,9 +382,6 @@ class GrandCanonicalKRKS(lib.StreamObject):
     def _rms(self, blocks):
         return max(0.0, self._inner(blocks, blocks) / self.ndof) ** 0.5
 
-    def _density_rms(self, a, b):
-        return self._rms([x - y for x, y in zip(a, b)])
-
     def _trace_mean(self, blocks):
         numerator = sum(float(cp.trace(x).real.item()) for x in blocks)
         return numerator / sum(x.shape[0] for x in blocks)
@@ -486,7 +465,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         eigenpairs = [cp.linalg.eigh(x) for x in h]
         eig = [x[0] for x in eigenpairs]
         coeff = [x[1] for x in eigenpairs]
-        mu_estimate = self._solve_mu(eig, nelec) if nelec is not None else mu
+        mu = self._solve_mu(eig, nelec) if nelec is not None else mu
 
         occ = []
         p = []
@@ -494,7 +473,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
                       dtype=cp.result_type(*h, cp.complex128))
         entropy_sum = 0.
         for k, (energy, c, x) in enumerate(zip(eig, coeff, self.x_ao2orth)):
-            gamma = self.beta * (energy - mu_estimate)
+            gamma = self.beta * (energy - mu)
             q = _fermi_occ(gamma)
             density = (c * q[None, :]).dot(c.conj().T)
             density = 0.5 * (density + density.conj().T)
@@ -523,16 +502,20 @@ class GrandCanonicalKRKS(lib.StreamObject):
         free_energy = e_tot + entropy_energy
 
         mismatch = self._hermi([x - y for x, y in zip(h, fock)])
-        gauge = self._trace_mean(mismatch) if nelec is not None else 0.0
         if nelec is not None:
-            mismatch = [x - gauge * eye for x, eye in zip(mismatch, self.identity)]
+            gauge = self._trace_mean(mismatch)
+            h = [x - gauge*eye for x, eye in zip(h, self.identity)]
+            eig = [x - gauge for x in eig]
+            mu -= gauge
+            mismatch = [x - gauge*eye
+                        for x, eye in zip(mismatch, self.identity)]
         residual = [-x for x in mismatch]
-        physical_mu = mu_estimate - gauge
-        grand_potential = free_energy - physical_mu * electron_number
-        if not all(np.isfinite(x) for x in (e_tot, free_energy, grand_potential, physical_mu, electron_number)):
+        grand_potential = free_energy - mu * electron_number
+        if not all(np.isfinite(x) for x in (
+                e_tot, free_energy, grand_potential, mu, electron_number)):
             raise FloatingPointError('finite-temperature cycle_data is nonfinite')
         return GCSolverCycle(
-            h, eig, coeff, occ, p, dm, fock, mu_estimate, physical_mu, gauge,
+            h, eig, coeff, occ, p, dm, fock, mu,
             e_tot, electron_number, entropy, entropy_energy, free_energy,
             grand_potential, residual, self._rms(mismatch))
 
@@ -555,49 +538,64 @@ class GrandCanonicalKRKS(lib.StreamObject):
         cycle_data = self.calculate_cycle(h, nelec=nelec)
         adiis = diis.DIIS(self)
         adiis.space = self.diis_space
+        self.cycles += 1
+
+        logger.info(
+            self,
+            'Fixed-N cycle %d  N = %.12g  mu = %.12g  A = %.12g  '
+            'residual = %.6g',
+            self.cycles,
+            nelec,
+            cycle_data.mu,
+            cycle_data.free_energy,
+            cycle_data.residual_rms,
+        )
         return FixedNCalc(float(nelec), cycle_data, adiis, self.damp)
 
-    def diis_trial(self, fixed_n_calc, target, max_backtrack):
+    def diis_trial(self, fixed_n_calc, target):
         cycle_data = fixed_n_calc.cycle_data
         direction = [x - y for x, y in zip(target, cycle_data.h)]
         if not all(bool(cp.all(cp.isfinite(x)).item()) for x in direction):
             return None, 0.0
         damp = min(1.0, max(self.min_damp, fixed_n_calc.damp))
-        limit = cycle_data.residual_rms * (1.0 - self.diis_min_reduction)
-        for unused in range(max_backtrack + 1):
-            h = self._sanitize_h([x + damp * d for x, d in zip(cycle_data.h, direction)])
-            trial = self.calculate_cycle(h, nelec=fixed_n_calc.nelec)
-            logger.debug(
-                self, 'DIIS damping %.6g residual %.6g -> %.6g', damp, cycle_data.residual_rms, trial.residual_rms
-            )
-            if trial.residual_rms < limit:
-                return trial, damp
-            damp *= self.diis_backtrack
-        return None, 0.0
+        h = self._sanitize_h(
+            [x + damp*d for x, d in zip(cycle_data.h, direction)])
+        trial = self.calculate_cycle(h, nelec=fixed_n_calc.nelec)
+        logger.debug(
+            self, 'DIIS damping %.6g residual %.6g -> %.6g',
+            damp, cycle_data.residual_rms, trial.residual_rms)
+        return trial, damp
 
-    def diis_update_damp(self, old, new, accepted, starting):
-        predicted = max(0.0, 1.0 - accepted) * old.residual_rms
+    def diis_update_damp(self, old, new, step, starting):
+        predicted = max(0.0, 1.0-step) * old.residual_rms
         predicted_reduction = old.residual_rms - predicted
         actual_reduction = old.residual_rms - new.residual_rms
         scale = max(old.residual_rms, np.finfo(float).tiny)
-        ratio = actual_reduction / predicted_reduction if predicted_reduction > np.finfo(float).eps * scale else np.nan
-        damp = accepted
-        if np.isfinite(ratio) and ratio < self.diis_trust_shrink:
-            damp *= self.diis_backtrack
-        elif (
+        if predicted_reduction > np.finfo(float).eps*scale:
+            ratio = actual_reduction / predicted_reduction
+        else:
+            ratio = np.nan
+        damp = step
+        if (
             np.isfinite(ratio)
             and ratio > self.diis_trust_expand
             and actual_reduction / scale >= self.diis_expand_reduction
-            and accepted >= starting * (1.0 - 1e-12)
+            and step >= starting * (1.0 - 1e-12)
         ):
             damp *= self.diis_expansion
         return min(1.0, max(self.min_damp, damp)), ratio
 
-    def fixed_n_subproblem(self, fixed_n_calc, tolerance):
+    def fixed_n_subproblem(self, fixed_n_calc, tolerance, target_mu=None):
         fixed_n_calc.converged = False
         fixed_n_calc.message = 'maximum fixed-N cycles reached'
+        original_tolerance = tolerance
         while fixed_n_calc.cycles < self.max_cycle:
             cycle_data = fixed_n_calc.cycle_data
+            if (target_mu is not None and
+                    abs(cycle_data.mu-target_mu) < self.tighten_mu_threshold):
+                tolerance = self.conv_tol
+            else:
+                tolerance = original_tolerance
             if cycle_data.residual_rms <= tolerance:
                 fixed_n_calc.converged = True
                 fixed_n_calc.message = 'converged fixed-N residual'
@@ -611,34 +609,45 @@ class GrandCanonicalKRKS(lib.StreamObject):
                 fixed_n_calc.diis.clear()
                 target = self._copy(cycle_data.fock)
             starting = fixed_n_calc.damp
-            trial, accepted = self.diis_trial(fixed_n_calc, target, min(2, self.diis_max_backtrack))
+            trial, step = self.diis_trial(fixed_n_calc, target)
             if trial is None:
-                trial, accepted = self.diis_trial(fixed_n_calc, cycle_data.fock, self.diis_max_backtrack)
+                trial, step = self.diis_trial(
+                    fixed_n_calc, cycle_data.fock)
             if trial is None:
                 fixed_n_calc.diis.clear()
                 fixed_n_calc.message = 'residual DIIS could not reduce the residual'
                 break
-            fixed_n_calc.damp, ratio = self.diis_update_damp(cycle_data, trial, accepted, starting)
-            fixed_n_calc.previous = cycle_data
+            fixed_n_calc.damp, ratio = self.diis_update_damp(
+                cycle_data, trial, step, starting)
             fixed_n_calc.cycle_data = trial
             fixed_n_calc.cycles += 1
             self.cycles += 1
             logger.info(
                 self,
-                'Fixed-N cycle %d  N = %.12g  mu = %.12g  A = %.12g  residual = %.6g  damping = %.3g  ratio = %.3g',
+                'Fixed-N cycle %d  N = %.12g  mu = %.12g  A = %.12g  '
+                'residual = %.6g  damping = %.3g  ratio = %.3g',
                 self.cycles,
                 fixed_n_calc.nelec,
                 trial.mu,
                 trial.free_energy,
                 trial.residual_rms,
-                accepted,
+                step,
                 ratio,
             )
             if callable(self.callback):
-                self.callback(
-                    {'solver': self, 'cycle_data': trial, 'cycle': self.cycles, 'electron_number': fixed_n_calc.nelec}
-                )
-        if fixed_n_calc.cycle_data.residual_rms <= tolerance:
+                self.callback({
+                    'solver': self,
+                    'cycle_data': trial,
+                    'cycle': self.cycles,
+                    'electron_number': fixed_n_calc.nelec,
+                })
+        cycle_data = fixed_n_calc.cycle_data
+        if (target_mu is not None and
+                abs(cycle_data.mu-target_mu) < self.tighten_mu_threshold):
+            tolerance = self.conv_tol
+        else:
+            tolerance = original_tolerance
+        if cycle_data.residual_rms <= tolerance:
             fixed_n_calc.converged = True
             fixed_n_calc.message = 'converged fixed-N residual'
         return fixed_n_calc
@@ -656,13 +665,13 @@ class GrandCanonicalKRKS(lib.StreamObject):
         right = positive[np.argmin(nelecs[positive])]
         return int(left), int(right)
 
-    def secant_proposal(self, samples, fock):
+    def secant_proposal(self, samples, h):
         last_sample = samples[-1]
         current_n = last_sample.nelec
         current_error = last_sample.delta_mu
         previous = next((x for x in reversed(samples[:-1]) if abs(x.nelec - current_n) > self.root_nelec_tol), None)
         if previous is None:
-            proposal = self.nelec_at_mu(fock, self.mu)
+            proposal = self.nelec_at_mu(h, self.mu)
             maximum = self.initial_nelec_step
         else:
             denominator = current_error - previous.delta_mu
@@ -670,7 +679,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             if denominator != 0:
                 proposal = current_n - current_error * (current_n - previous.nelec) / denominator
             if not np.isfinite(proposal):
-                proposal = self.nelec_at_mu(fock, self.mu)
+                proposal = self.nelec_at_mu(h, self.mu)
             maximum = self.max_nelec_step_fraction * float(self.cell.nelectron)
         proposal = current_n + np.clip(proposal - current_n, -maximum, maximum)
 
@@ -684,27 +693,6 @@ class GrandCanonicalKRKS(lib.StreamObject):
         margin = min(self.root_nelec_tol, 0.25 * self.capacity)
         return min(self.capacity - margin, max(margin, proposal))
 
-    def _verify(self, source):
-        shift = self.mu - source.mu_estimate
-        h = self._sanitize_h([x + shift * eye for x, eye in zip(source.h, self.identity)])
-        cycle_data = self.calculate_cycle(h, mu=self.mu)
-        self.verification_attempts += 1
-        delta_nelec = self.nelec_at_mu(cycle_data.fock, self.mu) - cycle_data.nelec
-        density_rms = self._density_rms(cycle_data.p, source.p)
-        accepted = (
-            cycle_data.residual_rms <= max(self.conv_tol, self.verify_residual_tol)
-            and abs(delta_nelec) <= self.conv_tol_nelec
-            and density_rms <= self.verify_density_tol
-        )
-        logger.info(
-            self,
-            'Fixed-mu verification residual = %.6g  delta N = %.3g  density change = %.3g',
-            cycle_data.residual_rms,
-            delta_nelec,
-            density_rms,
-        )
-        return cycle_data, accepted
-
     def _kernel_fixed_mu(self, h, current_n):
         samples = []
         margin = min(self.root_nelec_tol, 0.25 * self.capacity)
@@ -712,8 +700,6 @@ class GrandCanonicalKRKS(lib.StreamObject):
         best = None
         best_score = np.inf
         pending = None
-        force_tight = False
-        repaired_verification = False
         distinct = []
 
         for unused_pass in range(4 * self.max_outer_cycle + 4):
@@ -728,16 +714,22 @@ class GrandCanonicalKRKS(lib.StreamObject):
             else:
                 self.refinements += 1
 
-            bracket_indices = self.search_mu_root_bracket([x.nelec for x in samples], [x.delta_mu for x in samples])
-            bracket = None if bracket_indices is None else tuple(samples[i] for i in bracket_indices)
-            tolerance = self.conv_tol if bracket is not None or force_tight else self.conv_tol_coarse
-            force_tight = False
+            tolerance = self.conv_tol_coarse
+
+            if samples:
+                min_delta_mu = min(abs(x.delta_mu) for x in samples)
+                tolerance = min(tolerance, min_delta_mu**1.8)
+                tolerance = max(tolerance, self.conv_tol)
+            if pending is not None:
+                tolerance = self.conv_tol
+            logger.info(self, 'Tolerance = %.6g', tolerance)
+
             if pending is None:
                 fixed_n_calc = self.start_fixed_n_calc(h, current_n)
             else:
                 fixed_n_calc = pending
                 pending = None
-            self.fixed_n_subproblem(fixed_n_calc, tolerance)
+            self.fixed_n_subproblem(fixed_n_calc, tolerance, target_mu=self.mu)
             cycle_data = fixed_n_calc.cycle_data
             if not fixed_n_calc.converged:
                 if best is None:
@@ -745,7 +737,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
                 self.message = 'fixed-N inner solve failed: ' + fixed_n_calc.message
                 break
 
-            sample = MuSample(cycle_data, cycle_data.mu - self.mu, fixed_n_calc)
+            sample = MuSample(
+                cycle_data, cycle_data.mu-self.mu, fixed_n_calc)
             for i, old_sample in enumerate(samples):
                 if abs(old_sample.nelec - fixed_n_calc.nelec) <= self.root_nelec_tol:
                     samples.pop(i)
@@ -763,82 +756,53 @@ class GrandCanonicalKRKS(lib.StreamObject):
                     old_sample.fixed_n_calc = None
 
             error = sample.delta_mu
-            physical_delta = self.nelec_at_mu(cycle_data.fock, self.mu) - cycle_data.nelec
-            score = max(abs(error) / self.conv_tol_mu, abs(physical_delta) / self.conv_tol_nelec)
+
+            score = abs(error) / self.conv_tol_mu
             if score < best_score:
                 best_score = score
                 best = cycle_data
             logger.info(
                 self,
                 'Fixed-mu outer cycle %d  N = %.12g  optimized mu = '
-                '%.12g  delta mu = %.3g  delta N = %.3g  residual = %.6g',
+                '%.12g  delta mu = %.3g  residual = %.6g',
                 self.outer_cycles,
                 current_n,
                 cycle_data.mu,
                 error,
-                physical_delta,
                 cycle_data.residual_rms,
             )
 
-            root_ready = abs(error) <= self.conv_tol_mu and abs(physical_delta) <= self.conv_tol_nelec
+            root_ready = abs(error) <= self.conv_tol_mu
             if root_ready and cycle_data.residual_rms > self.conv_tol:
                 h = self._copy(cycle_data.h)
                 pending = fixed_n_calc
-                force_tight = True
                 continue
             if root_ready:
-                verified, accepted = self._verify(cycle_data)
-                if accepted:
-                    self.message = 'converged fixed-mu secant search'
-                    return verified, True
-                if repaired_verification:
-                    best = cycle_data
-                    self.message = 'fixed-mu verification failed after repair'
-                    break
-                repaired_verification = True
-                h = self._copy(verified.fock)
-                current_n = cycle_data.nelec
-                pending = None
-                force_tight = True
-                continue
+                self.message = 'converged fixed-mu secant search'
+                return cycle_data, True
 
             if bracket is not None:
-                endpoint = min(bracket, key=lambda x: abs(x.delta_mu))
-                if endpoint.cycle_data.residual_rms > self.conv_tol:
-                    h = self._copy(endpoint.cycle_data.fock)
-                    current_n = endpoint.nelec
-                    pending = endpoint.fixed_n_calc
-                    force_tight = True
-                    continue
                 if abs(bracket[1].nelec - bracket[0].nelec) <= self.root_nelec_tol:
                     self.message = 'fixed-mu electron-number bracket stagnated'
                     break
 
-            proposal = self.secant_proposal(samples, cycle_data.fock)
+            proposal = self.secant_proposal(samples, cycle_data.h)
             if abs(proposal - current_n) <= 1e-14 * max(1.0, abs(current_n)):
                 self.message = 'fixed-mu secant search stagnated'
                 break
 
-            if bracket is None or not bracket[0].nelec <= proposal <= bracket[1].nelec:
-                h = self._copy(cycle_data.fock)
-            else:
-                left, right = bracket
-                fraction = (proposal - left.nelec) / (right.nelec - left.nelec)
-                h = self._sanitize_h(
-                    [(1.0 - fraction) * a + fraction * b for a, b in zip(left.cycle_data.fock, right.cycle_data.fock)]
-                )
+            h = self._copy(cycle_data.h)
             current_n = proposal
         else:  # pragma: no cover
             self.message = 'fixed-mu safety iteration limit reached'
 
         if best is None:
             raise RuntimeError(self.message or 'fixed-mu search produced no cycle_data')
-        verified, unused = self._verify(best)
-        return verified, False
+        return best, False
 
     def _finalize(self, cycle_data, converged):
         mo_coeff = [x.dot(c) for x, c in zip(self.x_ao2orth, cycle_data.coeff)]
-        mo_energy = [e-cycle_data.gauge for e in cycle_data.eig]
+        mo_energy = [e for e in cycle_data.eig]
         mo_occ = [2.*x for x in cycle_data.occ]
         self.mo_coeff = _stack_or_list(mo_coeff)
         self.mo_energy = _stack_or_list(mo_energy)
@@ -866,7 +830,6 @@ class GrandCanonicalKRKS(lib.StreamObject):
             'fixed_n_cycles': self.cycles,
             'outer_cycles': self.outer_cycles,
             'refinements': self.refinements,
-            'verification_attempts': self.verification_attempts,
         }
 
         self.mf.converged = self.converged
@@ -892,7 +855,6 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.outer_cycles = 0
         self.nfev = 0
         self.refinements = 0
-        self.verification_attempts = 0
         self.message = ''
         h, initial_nelec = self._initial_h(dm0)
         if self.nelec is None:

@@ -16,13 +16,9 @@ class GrandCanonicalKRKS(StreamObject):
     conv_tol: float
     conv_tol_coarse: float
     conv_tol_mu: float
-    conv_tol_nelec: float
+    tighten_mu_threshold: float
     diis_space: int
     damp: float
-    diis_backtrack: float
-    diis_max_backtrack: int
-    diis_min_reduction: float
-    diis_trust_shrink: float
     diis_trust_expand: float
     diis_expansion: float
     diis_expand_reduction: float
@@ -30,15 +26,12 @@ class GrandCanonicalKRKS(StreamObject):
     initial_nelec_step: float
     max_nelec_step_fraction: float
     root_nelec_tol: float
-    verify_residual_tol: float
-    verify_density_tol: float
     callback: Callable[[dict[str, Any]], None] | None
     converged: bool
     cycles: int
     outer_cycles: int
     nfev: int
     refinements: int
-    verification_attempts: int
     message: str
     e_tot: float | None
     free_energy: float | None
