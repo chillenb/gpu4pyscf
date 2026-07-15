@@ -93,6 +93,9 @@ def nlcg(self, dm0=None):
 
         new_gradient = [
             0.5 * (f-h) for h, f in zip(trial.h, trial.fock)]
+        beta_fletcher_reeves = (
+            self._inner(new_gradient, new_gradient)
+            / self._inner(gradient, gradient))
         beta = max(0.0, self._inner(
             new_gradient,
             [new-old for new, old in zip(new_gradient, gradient)])
