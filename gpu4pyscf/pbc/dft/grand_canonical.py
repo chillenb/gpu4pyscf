@@ -20,8 +20,12 @@ number of a sequence of fixed-N problems.  This avoids applying DIIS directly
 to the discontinuously changing low-temperature occupations.
 '''
 
+import csv
+from pathlib import Path
+
 import numpy as np
 import cupy as cp
+import h5py
 from scipy.special import expit
 
 from pyscf import __config__, lib
@@ -803,6 +807,98 @@ class GrandCanonicalKRKS(lib.StreamObject):
         if best is None:
             raise RuntimeError(self.message or 'fixed-mu search produced no cycle_data')
         return best, False
+
+    def nelec_scan(self, nelecs, output_prefix, dm0=None):
+        self.build()
+        nelecs = [_as_float(x, 'nelec') for x in nelecs]
+        if not nelecs:
+            raise ValueError('nelecs must not be empty')
+        for nelec in nelecs:
+            if not 0 < nelec < self.capacity:
+                raise ValueError(
+                    'nelec must lie between 0 and %g' % self.capacity)
+
+        self.converged = False
+        self.cycles = 0
+        self.outer_cycles = 0
+        self.nfev = 0
+        self.refinements = 0
+        self.message = ''
+        h, unused_nelec = self._initial_h(dm0)
+        records = []
+        orbitals = []
+        last_cycle_data = None
+        last_converged = False
+
+        for index, nelec in enumerate(nelecs):
+            cycle_start = self.cycles
+            nfev_start = self.nfev
+            fixed_n_calc = self.start_fixed_n_calc(h, nelec)
+            self.fixed_n_subproblem(fixed_n_calc, self.conv_tol)
+            cycle_data = fixed_n_calc.cycle_data
+            records.append({
+                'index': index,
+                'requested_nelec': nelec,
+                'electron_number': cycle_data.nelec,
+                'converged': bool(fixed_n_calc.converged),
+                'message': fixed_n_calc.message,
+                'mu': cycle_data.mu,
+                'e_tot': cycle_data.e_tot,
+                'free_energy': cycle_data.free_energy,
+                'grand_potential': cycle_data.grand_potential,
+                'entropy': cycle_data.entropy,
+                'entropy_energy': cycle_data.entropy_energy,
+                'residual_rms': cycle_data.residual_rms,
+                'cycles': self.cycles-cycle_start,
+                'fock_evaluations': self.nfev-nfev_start,
+            })
+            orbitals.append({
+                'mo_coeff': [cp.asnumpy(x.dot(c)) for x, c in zip(
+                    self.x_ao2orth, cycle_data.coeff)],
+                'mo_occ': [cp.asnumpy(2.*x) for x in cycle_data.occ],
+                'mo_energy': [cp.asnumpy(x) for x in cycle_data.eig],
+            })
+            h = self._copy(cycle_data.h)
+            last_cycle_data = cycle_data
+            last_converged = fixed_n_calc.converged
+
+        self.nelec = nelecs[-1]
+        self.message = records[-1]['message']
+        self._finalize(last_cycle_data, last_converged)
+
+        prefix = Path(output_prefix)
+        csv_path = Path(str(prefix) + '.csv')
+        h5_path = Path(str(prefix) + '.h5')
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        columns = (
+            'index', 'requested_nelec', 'electron_number', 'converged',
+            'message', 'mu', 'e_tot', 'free_energy', 'grand_potential',
+            'entropy', 'entropy_energy', 'residual_rms', 'cycles',
+            'fock_evaluations')
+        with csv_path.open('w', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(records)
+
+        with h5py.File(h5_path, 'w') as h5f:
+            h5f.create_dataset('sigma', data=self.sigma)
+            for name in columns:
+                values = [record[name] for record in records]
+                if name == 'message':
+                    h5f.create_dataset(
+                        name, data=values,
+                        dtype=h5py.string_dtype(encoding='utf-8'))
+                else:
+                    h5f.create_dataset(name, data=values)
+            points = h5f.create_group('points')
+            for index, data in enumerate(orbitals):
+                point = points.create_group(str(index))
+                for name in ('mo_coeff', 'mo_occ', 'mo_energy'):
+                    group = point.create_group(name)
+                    for k, value in enumerate(data[name]):
+                        group.create_dataset(str(k), data=value)
+
+        return records
 
     def _finalize(self, cycle_data, converged):
         mo_coeff = [x.dot(c) for x, c in zip(self.x_ao2orth, cycle_data.coeff)]
