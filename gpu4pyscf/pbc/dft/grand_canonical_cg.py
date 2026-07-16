@@ -1,9 +1,9 @@
 import cupy as cp
 from scipy.special import expit
-from gpu4pyscf.lib import logger
+from gpu4pyscf.lib import diis, logger
 
 
-ALPHA_TRIAL = 1.0
+ALPHA_TRIAL = 5e-2
 
 
 def omega_gradient_wrt_h(h, f, beta, mu, diag_term_multiplier=1.0):
@@ -93,17 +93,19 @@ def nlcg(self, dm0=None):
 
         new_gradient = [
             0.5 * (f-h) for h, f in zip(trial.h, trial.fock)]
-        beta_fletcher_reeves = (
-            self._inner(new_gradient, new_gradient)
-            / self._inner(gradient, gradient))
         beta = max(0.0, self._inner(
             new_gradient,
             [new-old for new, old in zip(new_gradient, gradient)])
             / self._inner(gradient, gradient))
-        direction = [
+
+        if trial.grand_potential < state.grand_potential:
+            state = trial
+            gradient = new_gradient
+            direction = [
             g + beta*d for g, d in zip(new_gradient, direction)]
-        state = trial
-        gradient = new_gradient
+        else:
+            direction = [g for g in gradient]
+
         self.cycles += 1
         logger.info(self, 'NLCG cycle %d: grand potential = %f, residual = %f, nelec = %f',
                     self.cycles, state.grand_potential, state.residual_rms, state.nelec)
@@ -111,4 +113,48 @@ def nlcg(self, dm0=None):
     converged = state.residual_rms <= self.conv_tol
     self.message = ('converged NLCG residual' if converged else
                     'maximum NLCG cycles reached')
+    return self._finalize(state, converged)
+
+
+def fixed_mu_diis(self, dm0=None):
+    self.build()
+    self.converged = False
+    self.cycles = 0
+    self.outer_cycles = 0
+    self.nfev = 0
+    self.refinements = 0
+    self.message = ''
+
+    h, unused_nelec = self._initial_h(dm0)
+    state = self.calculate_cycle(h, mu=self.mu)
+    adiis = diis.DIIS(self)
+    adiis.space = self.diis_space
+
+    for unused_cycle in range(self.max_cycle):
+        if state.residual_rms <= self.conv_tol:
+            break
+
+        gradient = [
+            grad_re + 1j*grad_im
+            for grad_re, grad_im in (
+                omega_gradient_wrt_h(
+                    h, f, self.beta, self.mu, diag_term_multiplier=1.0)
+                for h, f in zip(state.h, state.fock)
+            )
+        ]
+        fock = self.diis_pack(state.fock)
+        error = self.diis_pack(gradient, weight_errors=True)
+        h = self.diis_unpack(adiis.update(fock, xerr=error), state.fock)
+        state = self.calculate_cycle(h, mu=self.mu)
+        self.cycles += 1
+        logger.info(
+            self,
+            'Fixed-mu DIIS cycle %d: grand potential = %f, residual = %f, '
+            'nelec = %f',
+            self.cycles, state.grand_potential, state.residual_rms,
+            state.nelec)
+
+    converged = state.residual_rms <= self.conv_tol
+    self.message = ('converged fixed-mu gradient DIIS' if converged else
+                    'maximum fixed-mu DIIS cycles reached')
     return self._finalize(state, converged)
