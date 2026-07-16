@@ -826,9 +826,37 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.message = ''
         h, unused_nelec = self._initial_h(dm0)
         records = []
-        orbitals = []
         last_cycle_data = None
         last_converged = False
+        prefix = Path(output_prefix)
+        csv_path = Path(str(prefix) + '.csv')
+        h5_path = Path(str(prefix) + '.h5')
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        columns = (
+            'index', 'requested_nelec', 'electron_number', 'converged',
+            'message', 'mu', 'e_tot', 'free_energy', 'grand_potential',
+            'entropy', 'entropy_energy', 'residual_rms', 'cycles',
+            'fock_evaluations')
+
+        with csv_path.open('w', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=columns)
+            writer.writeheader()
+
+        with h5py.File(h5_path, 'w') as h5f:
+            h5f.create_dataset('sigma', data=self.sigma)
+            for name in columns:
+                if name == 'message':
+                    dtype = h5py.string_dtype(encoding='utf-8')
+                elif name in ('index', 'cycles', 'fock_evaluations'):
+                    dtype = np.int64
+                elif name == 'converged':
+                    dtype = np.bool_
+                else:
+                    dtype = np.float64
+                h5f.create_dataset(
+                    name, shape=(0,), maxshape=(None,), dtype=dtype)
+            h5f.create_group('points')
+            h5f.attrs['completed_points'] = 0
 
         for index, nelec in enumerate(nelecs):
             cycle_start = self.cycles
@@ -836,7 +864,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             fixed_n_calc = self.start_fixed_n_calc(h, nelec)
             self.fixed_n_subproblem(fixed_n_calc, self.conv_tol)
             cycle_data = fixed_n_calc.cycle_data
-            records.append({
+            record = {
                 'index': index,
                 'requested_nelec': nelec,
                 'electron_number': cycle_data.nelec,
@@ -851,13 +879,34 @@ class GrandCanonicalKRKS(lib.StreamObject):
                 'residual_rms': cycle_data.residual_rms,
                 'cycles': self.cycles-cycle_start,
                 'fock_evaluations': self.nfev-nfev_start,
-            })
-            orbitals.append({
-                'mo_coeff': [cp.asnumpy(x.dot(c)) for x, c in zip(
-                    self.x_ao2orth, cycle_data.coeff)],
-                'mo_occ': [cp.asnumpy(2.*x) for x in cycle_data.occ],
-                'mo_energy': [cp.asnumpy(x) for x in cycle_data.eig],
-            })
+            }
+            records.append(record)
+
+            with h5py.File(h5_path, 'a') as h5f:
+                point = h5f['points'].create_group(str(index))
+                data = {
+                    'mo_coeff': [cp.asnumpy(x.dot(c)) for x, c in zip(
+                        self.x_ao2orth, cycle_data.coeff)],
+                    'mo_occ': [cp.asnumpy(2.*x) for x in cycle_data.occ],
+                    'mo_energy': [cp.asnumpy(x) for x in cycle_data.eig],
+                }
+                for name, values in data.items():
+                    group = point.create_group(name)
+                    for k, value in enumerate(values):
+                        group.create_dataset(str(k), data=value)
+                for name in columns:
+                    dataset = h5f[name]
+                    dataset.resize(index+1, axis=0)
+                    dataset[index] = record[name]
+                point.attrs['complete'] = True
+                h5f.attrs['completed_points'] = index+1
+                h5f.flush()
+
+            with csv_path.open('a', newline='') as stream:
+                writer = csv.DictWriter(stream, fieldnames=columns)
+                writer.writerow(record)
+                stream.flush()
+
             h = self._copy(cycle_data.h)
             last_cycle_data = cycle_data
             last_converged = fixed_n_calc.converged
@@ -865,38 +914,6 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.nelec = nelecs[-1]
         self.message = records[-1]['message']
         self._finalize(last_cycle_data, last_converged)
-
-        prefix = Path(output_prefix)
-        csv_path = Path(str(prefix) + '.csv')
-        h5_path = Path(str(prefix) + '.h5')
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-        columns = (
-            'index', 'requested_nelec', 'electron_number', 'converged',
-            'message', 'mu', 'e_tot', 'free_energy', 'grand_potential',
-            'entropy', 'entropy_energy', 'residual_rms', 'cycles',
-            'fock_evaluations')
-        with csv_path.open('w', newline='') as stream:
-            writer = csv.DictWriter(stream, fieldnames=columns)
-            writer.writeheader()
-            writer.writerows(records)
-
-        with h5py.File(h5_path, 'w') as h5f:
-            h5f.create_dataset('sigma', data=self.sigma)
-            for name in columns:
-                values = [record[name] for record in records]
-                if name == 'message':
-                    h5f.create_dataset(
-                        name, data=values,
-                        dtype=h5py.string_dtype(encoding='utf-8'))
-                else:
-                    h5f.create_dataset(name, data=values)
-            points = h5f.create_group('points')
-            for index, data in enumerate(orbitals):
-                point = points.create_group(str(index))
-                for name in ('mo_coeff', 'mo_occ', 'mo_energy'):
-                    group = point.create_group(name)
-                    for k, value in enumerate(data[name]):
-                        group.create_dataset(str(k), data=value)
 
         return records
 
