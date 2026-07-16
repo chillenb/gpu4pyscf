@@ -46,7 +46,7 @@ def omega_gradient_wrt_h(h, f, beta, mu, diag_term_multiplier=1.0):
     return grad_re_h, grad_im_h
 
 
-def nlcg(self, dm0=None):
+def nlcg(self, dm0=None, h=None):
     self.build()
     self.converged = False
     self.cycles = 0
@@ -55,7 +55,8 @@ def nlcg(self, dm0=None):
     self.refinements = 0
     self.message = ''
 
-    h, unused_nelec = self._initial_h(dm0)
+    if h is None:
+        h, unused_nelec = self._initial_h(dm0)
     state = self.calculate_cycle(h, mu=self.mu)
     gradient = [
         0.5 * (f-h) for h, f in zip(state.h, state.fock)]
@@ -107,7 +108,7 @@ def nlcg(self, dm0=None):
             direction = [g for g in gradient]
 
         self.cycles += 1
-        logger.info(self, 'NLCG cycle %d: grand potential = %f, residual = %f, nelec = %f',
+        logger.info(self, 'NLCG cycle %d: grand potential = %f, residual = %e, nelec = %f',
                     self.cycles, state.grand_potential, state.residual_rms, state.nelec)
 
     converged = state.residual_rms <= self.conv_tol
@@ -116,7 +117,7 @@ def nlcg(self, dm0=None):
     return self._finalize(state, converged)
 
 
-def fixed_mu_diis(self, dm0=None):
+def fixed_mu_diis(self, dm0=None, h=None):
     self.build()
     self.converged = False
     self.cycles = 0
@@ -125,7 +126,8 @@ def fixed_mu_diis(self, dm0=None):
     self.refinements = 0
     self.message = ''
 
-    h, unused_nelec = self._initial_h(dm0)
+    if h is None:
+        h, unused_nelec = self._initial_h(dm0)
     state = self.calculate_cycle(h, mu=self.mu)
     adiis = diis.DIIS(self)
     adiis.space = self.diis_space
@@ -133,23 +135,14 @@ def fixed_mu_diis(self, dm0=None):
     for unused_cycle in range(self.max_cycle):
         if state.residual_rms <= self.conv_tol:
             break
-
-        gradient = [
-            grad_re + 1j*grad_im
-            for grad_re, grad_im in (
-                omega_gradient_wrt_h(
-                    h, f, self.beta, self.mu, diag_term_multiplier=1.0)
-                for h, f in zip(state.h, state.fock)
-            )
-        ]
         fock = self.diis_pack(state.fock)
-        error = self.diis_pack(gradient, weight_errors=True)
+        error = self.diis_pack(state.residual, weight_errors=False)
         h = self.diis_unpack(adiis.update(fock, xerr=error), state.fock)
         state = self.calculate_cycle(h, mu=self.mu)
         self.cycles += 1
         logger.info(
             self,
-            'Fixed-mu DIIS cycle %d: grand potential = %f, residual = %f, '
+            'Fixed-mu DIIS cycle %d: grand potential = %f, residual = %e, '
             'nelec = %f',
             self.cycles, state.grand_potential, state.residual_rms,
             state.nelec)
