@@ -28,7 +28,7 @@ from pyscf import __config__, lib
 from pyscf.scf.addons import _fermi_smearing_occ, _smearing_optimize
 
 from gpu4pyscf.lib import diis, logger
-from gpu4pyscf.pbc.dft.grand_canonical_cg import nlcg
+from gpu4pyscf.pbc.dft.grand_canonical_cg import fixed_mu_diis, nlcg
 
 
 __all__ = ['GrandCanonicalKRKS']
@@ -161,6 +161,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
     '''
 
     nlcg = nlcg
+    fixed_mu_diis = fixed_mu_diis
 
     max_cycle = getattr(__config__, 'pbc_dft_grand_canonical_max_cycle', 100)
     max_outer_cycle = getattr(__config__, 'pbc_dft_grand_canonical_max_outer_cycle', 16)
