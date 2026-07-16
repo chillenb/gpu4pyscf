@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 import cupy as cp
 import h5py
+from scipy.interpolate import PchipInterpolator
 from scipy.special import expit
 
 from pyscf import __config__, lib
@@ -148,6 +149,15 @@ class MuSample:
     @property
     def nelec(self):
         return self.cycle_data.nelec
+
+
+class MuSeed:
+    __slots__ = ('nelec', 'delta_mu', 'fixed_n_calc')
+
+    def __init__(self, nelec, delta_mu):
+        self.nelec = nelec
+        self.delta_mu = delta_mu
+        self.fixed_n_calc = None
 
 
 class GrandCanonicalKRKS(lib.StreamObject):
@@ -701,8 +711,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
         margin = min(self.root_nelec_tol, 0.25 * self.capacity)
         return min(self.capacity - margin, max(margin, proposal))
 
-    def _kernel_fixed_mu(self, h, current_n):
-        samples = []
+    def _kernel_fixed_mu(self, h, current_n, seed_samples=None):
+        samples = list(seed_samples or ())
         margin = min(self.root_nelec_tol, 0.25 * self.capacity)
         current_n = min(self.capacity - margin, max(margin, current_n))
         best = None
@@ -808,6 +818,52 @@ class GrandCanonicalKRKS(lib.StreamObject):
             raise RuntimeError(self.message or 'fixed-mu search produced no cycle_data')
         return best, False
 
+    def _initialize_scan_output(self, output_prefix, columns):
+        prefix = Path(output_prefix)
+        csv_path = Path(str(prefix) + '.csv')
+        h5_path = Path(str(prefix) + '.h5')
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with csv_path.open('w', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=columns)
+            writer.writeheader()
+        with h5py.File(h5_path, 'w') as h5f:
+            h5f.create_dataset('sigma', data=self.sigma)
+            for name, dtype in columns.items():
+                if dtype is str:
+                    dtype = h5py.string_dtype(encoding='utf-8')
+                h5f.create_dataset(
+                    name, shape=(0,), maxshape=(None,), dtype=dtype)
+            h5f.create_group('points')
+            h5f.attrs['completed_points'] = 0
+        return csv_path, h5_path
+
+    def _append_scan_output(
+            self, csv_path, h5_path, columns, record, cycle_data):
+        index = record['index']
+        with h5py.File(h5_path, 'a') as h5f:
+            point = h5f['points'].create_group(str(index))
+            data = {
+                'mo_coeff': [cp.asnumpy(x.dot(c)) for x, c in zip(
+                    self.x_ao2orth, cycle_data.coeff)],
+                'mo_occ': [cp.asnumpy(2.*x) for x in cycle_data.occ],
+                'mo_energy': [cp.asnumpy(x) for x in cycle_data.eig],
+            }
+            for name, values in data.items():
+                group = point.create_group(name)
+                for k, value in enumerate(values):
+                    group.create_dataset(str(k), data=value)
+            for name in columns:
+                dataset = h5f[name]
+                dataset.resize(index+1, axis=0)
+                dataset[index] = record[name]
+            point.attrs['complete'] = True
+            h5f.attrs['completed_points'] = index+1
+            h5f.flush()
+        with csv_path.open('a', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=columns)
+            writer.writerow(record)
+            stream.flush()
+
     def nelec_scan(self, nelecs, output_prefix, dm0=None):
         self.build()
         nelecs = [_as_float(x, 'nelec') for x in nelecs]
@@ -828,35 +884,24 @@ class GrandCanonicalKRKS(lib.StreamObject):
         records = []
         last_cycle_data = None
         last_converged = False
-        prefix = Path(output_prefix)
-        csv_path = Path(str(prefix) + '.csv')
-        h5_path = Path(str(prefix) + '.h5')
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-        columns = (
-            'index', 'requested_nelec', 'electron_number', 'converged',
-            'message', 'mu', 'e_tot', 'free_energy', 'grand_potential',
-            'entropy', 'entropy_energy', 'residual_rms', 'cycles',
-            'fock_evaluations')
-
-        with csv_path.open('w', newline='') as stream:
-            writer = csv.DictWriter(stream, fieldnames=columns)
-            writer.writeheader()
-
-        with h5py.File(h5_path, 'w') as h5f:
-            h5f.create_dataset('sigma', data=self.sigma)
-            for name in columns:
-                if name == 'message':
-                    dtype = h5py.string_dtype(encoding='utf-8')
-                elif name in ('index', 'cycles', 'fock_evaluations'):
-                    dtype = np.int64
-                elif name == 'converged':
-                    dtype = np.bool_
-                else:
-                    dtype = np.float64
-                h5f.create_dataset(
-                    name, shape=(0,), maxshape=(None,), dtype=dtype)
-            h5f.create_group('points')
-            h5f.attrs['completed_points'] = 0
+        columns = {
+            'index': np.int64,
+            'requested_nelec': np.float64,
+            'electron_number': np.float64,
+            'converged': np.bool_,
+            'message': str,
+            'mu': np.float64,
+            'e_tot': np.float64,
+            'free_energy': np.float64,
+            'grand_potential': np.float64,
+            'entropy': np.float64,
+            'entropy_energy': np.float64,
+            'residual_rms': np.float64,
+            'cycles': np.int64,
+            'fock_evaluations': np.int64,
+        }
+        csv_path, h5_path = self._initialize_scan_output(
+            output_prefix, columns)
 
         for index, nelec in enumerate(nelecs):
             cycle_start = self.cycles
@@ -881,31 +926,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
                 'fock_evaluations': self.nfev-nfev_start,
             }
             records.append(record)
-
-            with h5py.File(h5_path, 'a') as h5f:
-                point = h5f['points'].create_group(str(index))
-                data = {
-                    'mo_coeff': [cp.asnumpy(x.dot(c)) for x, c in zip(
-                        self.x_ao2orth, cycle_data.coeff)],
-                    'mo_occ': [cp.asnumpy(2.*x) for x in cycle_data.occ],
-                    'mo_energy': [cp.asnumpy(x) for x in cycle_data.eig],
-                }
-                for name, values in data.items():
-                    group = point.create_group(name)
-                    for k, value in enumerate(values):
-                        group.create_dataset(str(k), data=value)
-                for name in columns:
-                    dataset = h5f[name]
-                    dataset.resize(index+1, axis=0)
-                    dataset[index] = record[name]
-                point.attrs['complete'] = True
-                h5f.attrs['completed_points'] = index+1
-                h5f.flush()
-
-            with csv_path.open('a', newline='') as stream:
-                writer = csv.DictWriter(stream, fieldnames=columns)
-                writer.writerow(record)
-                stream.flush()
+            self._append_scan_output(
+                csv_path, h5_path, columns, record, cycle_data)
 
             h = self._copy(cycle_data.h)
             last_cycle_data = cycle_data
@@ -915,6 +937,295 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.message = records[-1]['message']
         self._finalize(last_cycle_data, last_converged)
 
+        return records
+
+    @staticmethod
+    def _read_nelec_scan_csv(filename):
+        required = {
+            'index', 'electron_number', 'converged', 'mu', 'residual_rms'}
+        records = []
+        with Path(filename).open(newline='') as stream:
+            reader = csv.DictReader(stream)
+            missing = required.difference(reader.fieldnames or ())
+            if missing:
+                raise ValueError(
+                    'N-scan CSV is missing columns: ' +
+                    ', '.join(sorted(missing)))
+            for row in reader:
+                converged = row['converged'].strip().lower()
+                if converged not in ('true', 'false'):
+                    raise ValueError('invalid converged value in N-scan CSV')
+                records.append({
+                    'index': int(row['index']),
+                    'nelec': float(row['electron_number']),
+                    'mu': float(row['mu']),
+                    'converged': converged == 'true',
+                    'residual_rms': float(row['residual_rms']),
+                })
+        return records
+
+    def _read_nelec_scan_h5(self, filename):
+        required = {
+            'index', 'electron_number', 'converged', 'mu', 'residual_rms'}
+        records = []
+        with h5py.File(filename, 'r') as h5f:
+            missing = required.difference(h5f.keys())
+            if missing:
+                raise ValueError(
+                    'N-scan HDF5 is missing datasets: ' +
+                    ', '.join(sorted(missing)))
+            if 'sigma' not in h5f:
+                raise ValueError('N-scan HDF5 is missing sigma')
+            sigma = float(h5f['sigma'][()])
+            if not np.isclose(sigma, self.sigma, rtol=1e-12, atol=1e-14):
+                raise ValueError('N-scan sigma does not match solver sigma')
+            completed = int(h5f.attrs.get(
+                'completed_points', len(h5f['index'])))
+            if any(len(h5f[name]) != completed for name in required):
+                raise ValueError('N-scan HDF5 scalar datasets are incomplete')
+            if 'points' not in h5f or len(h5f['points']) != completed:
+                raise ValueError('N-scan HDF5 point groups are incomplete')
+            for i in range(completed):
+                index = int(h5f['index'][i])
+                key = str(index)
+                if (key not in h5f['points'] or
+                        not bool(h5f['points'][key].attrs.get(
+                            'complete', False))):
+                    raise ValueError(
+                        'N-scan HDF5 contains an incomplete point')
+                records.append({
+                    'index': index,
+                    'nelec': float(h5f['electron_number'][i]),
+                    'mu': float(h5f['mu'][i]),
+                    'converged': bool(h5f['converged'][i]),
+                    'residual_rms': float(h5f['residual_rms'][i]),
+                })
+        return records
+
+    @staticmethod
+    def _crosscheck_nelec_scan_records(csv_records, h5_records):
+        csv_records = sorted(csv_records, key=lambda x: x['index'])
+        h5_records = sorted(h5_records, key=lambda x: x['index'])
+        if len(csv_records) != len(h5_records):
+            raise ValueError('N-scan CSV and HDF5 point counts differ')
+        for csv_record, h5_record in zip(csv_records, h5_records):
+            if (csv_record['index'] != h5_record['index'] or
+                    csv_record['converged'] != h5_record['converged']):
+                raise ValueError('N-scan CSV and HDF5 records differ')
+            for name in ('nelec', 'mu', 'residual_rms'):
+                if not np.isclose(
+                        csv_record[name], h5_record[name],
+                        rtol=1e-10, atol=1e-12, equal_nan=True):
+                    raise ValueError('N-scan CSV and HDF5 records differ')
+
+    def _prepare_mu_calibration(self, records):
+        records = [dict(record) for record in records
+                   if record['converged'] and
+                   all(np.isfinite(record[name]) for name in (
+                       'nelec', 'mu', 'residual_rms'))]
+        records.sort(key=lambda x: x['nelec'])
+        unique = []
+        for record in records:
+            if not 0 < record['nelec'] < self.capacity:
+                raise ValueError(
+                    'calibration nelec must lie between 0 and %g' %
+                    self.capacity)
+            if (unique and abs(record['nelec']-unique[-1]['nelec']) <=
+                    self.root_nelec_tol):
+                if record['residual_rms'] < unique[-1]['residual_rms']:
+                    unique[-1] = record
+            else:
+                unique.append(record)
+        if len(unique) < 2:
+            raise ValueError(
+                'at least two converged N-scan points are required')
+        if any(right['mu'] <= left['mu']
+               for left, right in zip(unique, unique[1:])):
+            raise ValueError('N-scan mu must increase strictly with nelec')
+        return unique
+
+    def _mu_scan_seed(self, calibration, target_mu):
+        nelecs = np.asarray([x['nelec'] for x in calibration])
+        mus = np.asarray([x['mu'] for x in calibration])
+        if target_mu < mus[0]:
+            left, right = 0, 1
+            nelec = (nelecs[left] +
+                     (target_mu-mus[left]) *
+                     (nelecs[right]-nelecs[left]) /
+                     (mus[right]-mus[left]))
+        elif target_mu > mus[-1]:
+            left, right = len(mus)-2, len(mus)-1
+            nelec = (nelecs[left] +
+                     (target_mu-mus[left]) *
+                     (nelecs[right]-nelecs[left]) /
+                     (mus[right]-mus[left]))
+        elif target_mu == mus[0]:
+            left, right = 0, 1
+            nelec = nelecs[0]
+        elif target_mu == mus[-1]:
+            left, right = len(mus)-2, len(mus)-1
+            nelec = nelecs[-1]
+        else:
+            model = PchipInterpolator(nelecs, mus, extrapolate=False)
+            roots = np.asarray(
+                model.solve(y=target_mu, extrapolate=False))
+            roots = roots[
+                np.isfinite(roots) &
+                (roots >= nelecs[0]-self.root_nelec_tol) &
+                (roots <= nelecs[-1]+self.root_nelec_tol)]
+            roots.sort()
+            distinct = []
+            for root in roots:
+                if (not distinct or
+                        abs(root-distinct[-1]) > self.root_nelec_tol):
+                    distinct.append(float(root))
+            if len(distinct) != 1:
+                raise RuntimeError(
+                    'PCHIP mu(N) interpolation did not have a unique root')
+            nelec = distinct[0]
+            right = min(len(mus)-1, int(np.searchsorted(
+                mus, target_mu, side='right')))
+            left = right-1
+
+        margin = min(self.root_nelec_tol, 0.25*self.capacity)
+        nelec = min(self.capacity-margin, max(margin, float(nelec)))
+        pair = [calibration[left], calibration[right]]
+        pair.sort(key=lambda x: abs(x['nelec']-nelec), reverse=True)
+        seeds = [MuSeed(x['nelec'], x['mu']-target_mu) for x in pair]
+        return nelec, seeds
+
+    def _density_from_nelec_scan_h5(self, filename, index):
+        with h5py.File(filename, 'r') as h5f:
+            point = h5f['points'][str(index)]
+            coeff_group = point['mo_coeff']
+            occ_group = point['mo_occ']
+            coeff_keys = sorted(coeff_group, key=int)
+            occ_keys = sorted(occ_group, key=int)
+            expected = [str(k) for k in range(self.nkpts)]
+            if coeff_keys != expected or occ_keys != expected:
+                raise ValueError(
+                    'N-scan orbital k-points do not match the solver')
+            dm = []
+            for key in expected:
+                coeff = cp.asarray(coeff_group[key][()])
+                occ = cp.asarray(occ_group[key][()])
+                if (coeff.ndim != 2 or occ.ndim != 1 or
+                        coeff.shape != (self.nao, occ.size)):
+                    raise ValueError('invalid N-scan orbital dimensions')
+                value = (coeff*occ[None, :]).dot(coeff.conj().T)
+                dm.append(0.5*(value+value.conj().T))
+        return cp.stack(dm)
+
+    def mu_scan(self, mus, output_prefix, nelec_scan_csv=None,
+                nelec_scan_h5=None, dm0=None):
+        self.build()
+        mus = [_as_float(x, 'mu') for x in mus]
+        if not mus:
+            raise ValueError('mus must not be empty')
+        if nelec_scan_csv is None and nelec_scan_h5 is None:
+            raise TypeError(
+                'nelec_scan_csv or nelec_scan_h5 is required')
+
+        csv_records = (None if nelec_scan_csv is None else
+                       self._read_nelec_scan_csv(nelec_scan_csv))
+        h5_records = (None if nelec_scan_h5 is None else
+                      self._read_nelec_scan_h5(nelec_scan_h5))
+        if csv_records is not None and h5_records is not None:
+            self._crosscheck_nelec_scan_records(csv_records, h5_records)
+        calibration = self._prepare_mu_calibration(
+            h5_records if h5_records is not None else csv_records)
+        initial_nelec, unused_seeds = self._mu_scan_seed(
+            calibration, mus[0])
+
+        self.converged = False
+        self.cycles = 0
+        self.outer_cycles = 0
+        self.nfev = 0
+        self.refinements = 0
+        self.message = ''
+        self.nelec = None
+        if nelec_scan_h5 is not None:
+            nearest = min(
+                calibration,
+                key=lambda x: abs(x['nelec']-initial_nelec))
+            dm0 = self._density_from_nelec_scan_h5(
+                nelec_scan_h5, nearest['index'])
+        h, unused_nelec = self._initial_h(dm0)
+
+        columns = {
+            'index': np.int64,
+            'requested_mu': np.float64,
+            'optimized_mu': np.float64,
+            'interpolated_nelec': np.float64,
+            'electron_number': np.float64,
+            'converged': np.bool_,
+            'message': str,
+            'e_tot': np.float64,
+            'free_energy': np.float64,
+            'grand_potential': np.float64,
+            'entropy': np.float64,
+            'entropy_energy': np.float64,
+            'residual_rms': np.float64,
+            'cycles': np.int64,
+            'outer_cycles': np.int64,
+            'refinements': np.int64,
+            'fock_evaluations': np.int64,
+        }
+        csv_path, h5_path = self._initialize_scan_output(
+            output_prefix, columns)
+        records = []
+        last_cycle_data = None
+        last_converged = False
+
+        for index, target_mu in enumerate(mus):
+            interpolated_nelec, seed_samples = self._mu_scan_seed(
+                calibration, target_mu)
+            cycle_start = self.cycles
+            outer_start = self.outer_cycles
+            refinement_start = self.refinements
+            nfev_start = self.nfev
+            self.mu = target_mu
+            self.message = ''
+            cycle_data, converged = self._kernel_fixed_mu(
+                h, interpolated_nelec, seed_samples=seed_samples)
+            record = {
+                'index': index,
+                'requested_mu': target_mu,
+                'optimized_mu': cycle_data.mu,
+                'interpolated_nelec': interpolated_nelec,
+                'electron_number': cycle_data.nelec,
+                'converged': bool(converged),
+                'message': self.message,
+                'e_tot': cycle_data.e_tot,
+                'free_energy': cycle_data.free_energy,
+                'grand_potential': cycle_data.grand_potential,
+                'entropy': cycle_data.entropy,
+                'entropy_energy': cycle_data.entropy_energy,
+                'residual_rms': cycle_data.residual_rms,
+                'cycles': self.cycles-cycle_start,
+                'outer_cycles': self.outer_cycles-outer_start,
+                'refinements': self.refinements-refinement_start,
+                'fock_evaluations': self.nfev-nfev_start,
+            }
+            records.append(record)
+            self._append_scan_output(
+                csv_path, h5_path, columns, record, cycle_data)
+            h = self._copy(cycle_data.h)
+            last_cycle_data = cycle_data
+            last_converged = converged
+            if converged:
+                calibration = self._prepare_mu_calibration(
+                    calibration + [{
+                        'index': None,
+                        'nelec': cycle_data.nelec,
+                        'mu': cycle_data.mu,
+                        'converged': True,
+                        'residual_rms': cycle_data.residual_rms,
+                    }])
+
+        self.nelec = None
+        self.message = records[-1]['message']
+        self._finalize(last_cycle_data, last_converged)
         return records
 
     def _finalize(self, cycle_data, converged):
