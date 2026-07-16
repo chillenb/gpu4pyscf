@@ -851,7 +851,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.mf.scf_summary.update(self.scf_summary)
         return self.e_tot
 
-    def kernel(self, dm0=None):
+    def kernel(self, dm0=None, h=None, initial_nelec=None):
         self.build()
         self.dump_flags()
         self.converged = False
@@ -860,7 +860,10 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.nfev = 0
         self.refinements = 0
         self.message = ''
-        h, initial_nelec = self._initial_h(dm0)
+        if h is None:
+            h, initial_nelec = self._initial_h(dm0)
+        if initial_nelec is None:
+            initial_nelec = self.nelec
         if self.nelec is None:
             logger.info(self, 'Initial density electron number = %.12g',
                         initial_nelec)
