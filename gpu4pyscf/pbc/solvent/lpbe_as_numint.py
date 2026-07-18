@@ -7,6 +7,8 @@ import cupyx
 import cupyx.scipy.fft as fft
 from cupyx.scipy.sparse.linalg import LinearOperator, cg
 
+from cupy.cuda.nvtx import RangePush, RangePop
+
 import pyscf.pbc.gto as gto
 from pyscf import lib
 from pyscf.data import nist
@@ -116,6 +118,9 @@ def divergence_recip(Fv, Gv, out=None):
 
 
 def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
+
+    RangePush("lpbe_inner")
+
     if options is None:
         options = {}
     tol = options.get('tol', 1e-8)
@@ -163,7 +168,9 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
     qsol = nelec_by_integration - nuc_charge_by_integration
 
 
+    RangePush("shape_function")
     S, Sprime = shape_function(rhoR + pseudo_nucdensityR, cav_smear, cav_dens_cutoff)
+    RangePop()
 
     eps_r_field = 1. + (rel_permittivity - 1.) * S
 
@@ -226,8 +233,11 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
         nonlocal niter
         niter += 1
 
+    RangePush("lpbe_cg_solve")
     # Div( eps_r * Grad(phi) ) - S phi / (debye_length^2) = -4*pi*solute_chargeR.
     solution_phi_G, info = cg(A, rhs, M=M, x0=pot_guess, tol=tol, maxiter=400, callback=callback)
+
+    RangePop()
 
     if info != 0:
         log.warn(f"Conjugate gradient did not converge: info={info}")
@@ -238,6 +248,8 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
 
     t2 = log.init_timer()
 
+
+    RangePush("lpbe_postprocess")
     solution_phi_R = pbc_tools.ifft(solution_phi_G.reshape(-1), mesh).real.reshape(*mesh) / weight
 
     # rho_ion_R = solution_phi_R * S * (ebkappa2 / (4*np.pi))
@@ -362,6 +374,8 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
         'pot_guess': solution_phi_G,
     }
 
+    RangePop()
+    RangePop()
 
     return results
 
@@ -389,6 +403,7 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
         veff : (nkpts, nao, nao) ndarray
             or list of veff if the input dm_kpts is a list of DMs
     '''
+    RangePush("nr_rks_lpbe")
     cell = ni.cell
     log = logger.new_logger(cell, verbose)
     t0 = log.init_timer()
@@ -412,8 +427,10 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
     mesh = ni.mesh
     ngrids = np.prod(mesh)
 
+    RangePush("evaluate_density_on_g_mesh")
     density = evaluate_density_on_g_mesh(ni, dm_kpts, kpts, xc_type)
     rho_sf = density[0, 0]
+    RangePop()
 
     Gv = pbc_tools._get_Gv(cell, mesh)
     coulomb_kernel_on_g_mesh = pbc_tools.get_coulG(cell, Gv=Gv)
@@ -440,11 +457,13 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
     n_electrons = float(density[0].sum().real.get())
     density /= weight
 
+    RangePush("eval_xc_eff")
     # eval_xc_eff supports float64 only
     density = cp.asarray(density, dtype=np.float64, order='C')
     xc_for_energy, xc_for_fock = ni.eval_xc_eff(
         xc_code, density, deriv=1, xctype=xc_type, spin=0
     )[:2]
+    RangePop()
 
     rho_sf = density[0].real
     xc_energy_sum = float(rho_sf.dot(xc_for_energy.ravel()).get()) * weight
@@ -477,10 +496,13 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
         xc_for_fock[0] += coulomb_on_g_mesh + vcorr_g
 
     kpts_band, input_band = _format_kpts_band(kpts_band, kpts), kpts_band
+    RangePush("convert_xc_on_g_mesh_to_fock")
     veff = convert_xc_on_g_mesh_to_fock(ni, xc_for_fock, hermi, kpts_band, with_tau = (xc_type == "MGGA"))
+    RangePop()
     veff = _format_jks(veff, dm_kpts, input_band, kpts)
     veff = tag_array(veff, ecoul=coulomb_energy, exc=xc_energy_sum)
     t0 = log.timer("xc", *t0)
+    RangePop()
     return n_electrons, xc_energy_sum, veff
 
 
