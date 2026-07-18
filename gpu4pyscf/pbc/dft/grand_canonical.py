@@ -864,7 +864,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
             writer.writerow(record)
             stream.flush()
 
-    def nelec_scan(self, nelecs, output_prefix, dm0=None):
+    def nelec_scan(self, nelecs, output_prefix, dm0=None,
+                   nelec_scan_h5=None):
         self.build()
         nelecs = [_as_float(x, 'nelec') for x in nelecs]
         if not nelecs:
@@ -873,6 +874,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
             if not 0 < nelec < self.capacity:
                 raise ValueError(
                     'nelec must lie between 0 and %g' % self.capacity)
+        restart_points = (None if nelec_scan_h5 is None else
+                          self._nelec_scan_restarts(nelec_scan_h5))
 
         self.converged = False
         self.cycles = 0
@@ -880,7 +883,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.nfev = 0
         self.refinements = 0
         self.message = ''
-        h, unused_nelec = self._initial_h(dm0)
+        h = None if restart_points is not None else self._initial_h(dm0)[0]
         records = []
         last_cycle_data = None
         last_converged = False
@@ -906,6 +909,15 @@ class GrandCanonicalKRKS(lib.StreamObject):
         for index, nelec in enumerate(nelecs):
             cycle_start = self.cycles
             nfev_start = self.nfev
+            if restart_points is not None:
+                nearest = min(
+                    restart_points,
+                    key=lambda x: (
+                        abs(x['nelec']-nelec), x['residual_rms']))
+                if (last_cycle_data is None or
+                        abs(nearest['nelec']-nelec) <
+                        abs(last_cycle_data.nelec-nelec)):
+                    h = self._initial_h(nearest['dm'])[0]
             fixed_n_calc = self.start_fixed_n_calc(h, nelec)
             self.fixed_n_subproblem(fixed_n_calc, self.conv_tol)
             cycle_data = fixed_n_calc.cycle_data
@@ -1115,6 +1127,30 @@ class GrandCanonicalKRKS(lib.StreamObject):
                 value = (coeff*occ[None, :]).dot(coeff.conj().T)
                 dm.append(0.5*(value+value.conj().T))
         return cp.stack(dm)
+
+    def _nelec_scan_restarts(self, filename):
+        records = [dict(record) for record in
+                   self._read_nelec_scan_h5(filename)
+                   if record['converged'] and
+                   0 < record['nelec'] < self.capacity and
+                   all(np.isfinite(record[name]) for name in (
+                       'nelec', 'mu', 'residual_rms'))]
+        records.sort(key=lambda x: x['nelec'])
+        unique = []
+        for record in records:
+            if (unique and abs(record['nelec']-unique[-1]['nelec']) <=
+                    self.root_nelec_tol):
+                if record['residual_rms'] < unique[-1]['residual_rms']:
+                    unique[-1] = record
+            else:
+                unique.append(record)
+        if not unique:
+            raise ValueError(
+                'N-scan HDF5 contains no usable converged points')
+        for record in unique:
+            record['dm'] = self._density_from_nelec_scan_h5(
+                filename, record['index'])
+        return unique
 
     def mu_scan(self, mus, output_prefix, nelec_scan_csv=None,
                 nelec_scan_h5=None, dm0=None):
