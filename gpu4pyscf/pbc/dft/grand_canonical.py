@@ -510,7 +510,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         e_elec = _as_float(self.mf.energy_elec(dm, self.hcore, veff)[0], 'electronic energy')
         fock = self._to_orth(fock_ao)
         e_tot = e_elec + self.e_nuc
-        entropy = -2.0 * self.weight * entropy_sum
+        entropy = 2.0 * self.weight * entropy_sum
         entropy_energy = -self.sigma * entropy
         free_energy = e_tot + entropy_energy
 
