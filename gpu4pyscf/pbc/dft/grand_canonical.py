@@ -84,16 +84,11 @@ def _fermi_occ(gamma):
     return expit(-cp.asarray(gamma))
 
 
-def _fermi_entropy(gamma, occ):
-    gamma = cp.asarray(gamma)
+def _fermi_entropy(occ):
     occ = cp.asarray(occ)
-    positive = gamma >= 0
-    out = cp.empty_like(occ, dtype=cp.result_type(occ, cp.float64))
-    out[positive] = (-occ[positive] * gamma[positive]
-                     - cp.logaddexp(0., -gamma[positive]))
-    out[~positive] = ((1. - occ[~positive]) * gamma[~positive]
-                      - cp.logaddexp(0., gamma[~positive]))
-    return out
+    f = occ[(occ>0) & (occ<1)]
+    entropy = -(f*cp.log(f) + (1-f)*cp.log(1-f)).sum()
+    return entropy
 
 
 class GCSolverCycle:
@@ -499,7 +494,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             dm[k] = 0.5 * (dmk + dmk.conj().T)
             occ.append(q)
             p.append(density)
-            entropy_sum += float(cp.sum(_fermi_entropy(gamma, q)).item())
+            entropy_sum += float(_fermi_entropy(q))
         p = self._hermi(p)
         dm = cp.stack(self._hermi([dm[k] for k in range(self.nkpts)]))
 
