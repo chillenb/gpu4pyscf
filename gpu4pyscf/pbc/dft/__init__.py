@@ -22,6 +22,7 @@ from . import krks
 from . import kuks
 from . import krkspu
 from . import kukspu
+from . import simple_krks
 from .grand_canonical import GrandCanonicalKRKS
 from .rks import KohnShamDFT
 
@@ -29,6 +30,7 @@ KRKS = krks.KRKS
 KUKS = kuks.KUKS
 KRKSpU = krkspu.KRKSpU
 KUKSpU = kukspu.KUKSpU
+SimpleKRKS = simple_krks.SimpleKRKS
 
 def RKS(cell, *args, **kwargs):
     if 'kpts' in kwargs:
