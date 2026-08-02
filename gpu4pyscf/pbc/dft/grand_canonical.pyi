@@ -16,6 +16,8 @@ class GrandCanonicalKRKS(StreamObject):
     conv_tol: float
     conv_tol_coarse: float
     conv_tol_mu: float
+    nlcg_initial_step: float
+    nlcg_max_line_search_evaluations: int
     tighten_mu_threshold: float
     diis_space: int
     damp: float
@@ -55,6 +57,7 @@ class GrandCanonicalKRKS(StreamObject):
     def dump_flags(self, verbose: int | None = ...) -> GrandCanonicalKRKS: ...
     def check_sanity(self) -> GrandCanonicalKRKS: ...
     def build(self) -> GrandCanonicalKRKS: ...
+    def nlcg(self, dm0: Any = ..., h: Any = ...) -> float: ...
     @staticmethod
     def search_mu_root_bracket(
         nelec: list[float], delta_mu: list[float]

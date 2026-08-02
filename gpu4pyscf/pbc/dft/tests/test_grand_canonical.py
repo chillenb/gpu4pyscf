@@ -8,6 +8,7 @@ from pyscf.pbc import gto
 
 from gpu4pyscf.lib.cupy_helper import tag_array
 from gpu4pyscf.pbc.dft import grand_canonical as gc
+from gpu4pyscf.pbc.dft import grand_canonical_cg as gc_cg
 from gpu4pyscf.pbc.dft.grand_canonical import GrandCanonicalKRKS
 
 
@@ -140,17 +141,340 @@ def _solver(mf=None, mu=None, nelec=None, sigma=.15):
     return mf, solver
 
 
+def _line_sample(alpha, value, slope):
+    return gc_cg._LineSample(
+        alpha, None, value, None, slope, 'test')
+
+
+def _scripted_state(h, fock, residual_rms, value, exact_gradient):
+    return SimpleNamespace(
+        h=[cp.asarray([[h]], dtype=cp.float64)],
+        fock=[cp.asarray([[fock]], dtype=cp.float64)],
+        residual_rms=residual_rms,
+        free_energy=value,
+        grand_potential=value,
+        exact_gradient=[cp.asarray([[exact_gradient]], dtype=cp.float64)],
+        mu=0.,
+        nelec=1.,
+    )
+
+
+class _ScriptedNLCGSolver:
+    nelec = None
+    mu = 0.
+    conv_tol = 1e-8
+    max_cycle = 3
+    nlcg_initial_step = 1.
+    nlcg_max_line_search_evaluations = 6
+    verbose = 0
+    stdout = None
+
+    def __init__(self, initial):
+        self.initial = initial
+
+    def build(self):
+        return self
+
+    def calculate_cycle(self, unused_h, nelec=None, mu=None):
+        return self.initial
+
+    @staticmethod
+    def _inner(left, right):
+        return sum(float(cp.vdot(x, y).real.item())
+                   for x, y in zip(left, right))
+
+    def _finalize(self, state, converged):
+        self.converged = converged
+        self.residual_rms = state.residual_rms
+        self.grand_potential = state.grand_potential
+        return state.grand_potential
+
+
 def test_fermi_functions_are_stable():
     gamma = cp.asarray([-1000., -50., 0., 50., 1000.])
     occ = gc._fermi_occ(gamma)
-    entropy = gc._fermi_entropy(gamma, occ)
+    entropy = gc._fermi_entropy(occ)
     assert bool(cp.all(cp.isfinite(occ)))
-    assert bool(cp.all(cp.isfinite(entropy)))
+    assert np.isfinite(float(entropy))
     assert float(occ.min()) >= 0.
     assert float(occ.max()) <= 1.
     assert abs(float((occ[0]+occ[-1]).item())-1.) < 1e-14
-    assert float(abs(entropy[0]).item()) == 0.
-    assert float(abs(entropy[-1]).item()) == 0.
+
+
+def test_nlcg_fermi_divided_difference_is_stable():
+    gamma = cp.asarray([-1000., .4, .4, .4+1e-13, 1000.])
+    occ = gc_cg._fermi_occ(gamma)
+    divided = gc_cg.fermi_divided_difference(gamma, occ)
+    expected_diagonal = -occ * (1.-occ)
+    assert bool(cp.all(cp.isfinite(occ)))
+    assert bool(cp.all(cp.isfinite(divided)))
+    assert float(cp.max(cp.abs(divided-divided.T)).item()) < 1e-14
+    assert float(cp.max(divided).item()) <= 0.
+    assert float(cp.max(cp.abs(
+        cp.diag(divided)-expected_diagonal)).item()) < 1e-14
+    assert abs(float((divided[1, 2]-expected_diagonal[1]).item())) < 1e-14
+    assert abs(float((divided[1, 3]-expected_diagonal[1]).item())) < 1e-10
+
+
+def test_nlcg_harmonic_step_finds_positive_curvature_derivative_root():
+    alpha, curvature, interval = gc_cg._harmonic_step([
+        _line_sample(0., 4., -4.),
+        _line_sample(3., 1., 2.),
+    ])
+    assert alpha == pytest.approx(2.)
+    assert curvature == pytest.approx(2.)
+    assert interval == (0., 3.)
+
+
+@pytest.mark.parametrize('count', [3, 4, 5])
+def test_nlcg_polynomial_step_finds_convex_minimum(count):
+    alphas = np.linspace(0., 3., count)
+    values = (alphas-1.25)**2 + 7.
+    alpha, curvature = gc_cg._polynomial_step(
+        alphas, values, (0., 3.))
+    assert alpha == pytest.approx(1.25, abs=1e-8)
+    assert curvature > 0.
+
+
+def test_nlcg_polynomial_step_rejects_concave_stationary_point():
+    alphas = np.asarray([0., 1., 2.])
+    values = -(alphas-1.)**2
+    assert gc_cg._polynomial_step(
+        alphas, values, (0., 2.)) == (None, None)
+
+
+def test_nlcg_spline_step_finds_convex_minimum():
+    alphas = np.arange(6, dtype=float)
+    values = (alphas-2.)**2
+    alpha, curvature = gc_cg._spline_step(
+        alphas, values, (1., 3.))
+    assert alpha == pytest.approx(2.)
+    assert curvature > 0.
+
+
+def test_nlcg_line_search_uses_absolute_unique_slots(monkeypatch):
+    solver = SimpleNamespace(
+        nelec=None,
+        conv_tol=1e-12,
+        nlcg_max_line_search_evaluations=6,
+        verbose=0,
+        stdout=None,
+    )
+    solver._inner = lambda left, right: sum(
+        float(cp.vdot(x, y).real.item()) for x, y in zip(left, right))
+    origin_h = 10.
+    origin = SimpleNamespace(
+        h=[cp.asarray([[origin_h]])],
+        value=1.3**2,
+        residual_rms=1.,
+        gradient=[cp.asarray([[-2.6]])],
+    )
+    seen = []
+
+    def evaluate(h):
+        alpha = float(h[0][0, 0].item())-origin_h
+        seen.append(alpha)
+        return SimpleNamespace(
+            h=h,
+            value=(alpha-1.3)**2,
+            residual_rms=1.,
+            gradient=[cp.asarray([[2.*(alpha-1.3)]])],
+        )
+
+    monkeypatch.setattr(
+        gc_cg, 'objective_gradient',
+        lambda unused_solver, state, unused_fixed_n: state.gradient)
+    result = gc_cg._line_search(
+        solver, origin, origin.gradient, [cp.asarray([[1.]])], evaluate,
+        lambda state: state.value, initial_step=1.)
+    assert result.resolved
+    assert result.evaluations == 3
+    assert seen[:2] == [1., 2.]
+    assert seen[2] == pytest.approx(1.3)
+    assert len(seen) == len(set(seen))
+
+
+def test_nlcg_line_search_honors_evaluation_limit(monkeypatch):
+    solver = SimpleNamespace(
+        nelec=None,
+        conv_tol=1e-12,
+        nlcg_max_line_search_evaluations=6,
+        verbose=0,
+        stdout=None,
+    )
+    solver._inner = lambda left, right: sum(
+        float(cp.vdot(x, y).real.item()) for x, y in zip(left, right))
+    origin = SimpleNamespace(
+        h=[cp.asarray([[0.]])], value=0., residual_rms=1.,
+        gradient=[cp.asarray([[-1.]])])
+    seen = []
+
+    def evaluate(h):
+        alpha = float(h[0][0, 0].item())
+        seen.append(alpha)
+        return SimpleNamespace(
+            h=h, value=-alpha, residual_rms=1.,
+            gradient=[cp.asarray([[-1.]])])
+
+    monkeypatch.setattr(
+        gc_cg, 'objective_gradient',
+        lambda unused_solver, state, unused_fixed_n: state.gradient)
+    result = gc_cg._line_search(
+        solver, origin, origin.gradient, [cp.asarray([[1.]])], evaluate,
+        lambda state: state.value, initial_step=1.)
+    assert not result.resolved
+    assert result.evaluations == 6
+    assert result.reason == 'line-search evaluation limit'
+    assert seen == [1., 2., 4., 8., 16., 32.]
+
+
+def test_nlcg_failed_conjugate_search_retries_residual_then_exact_gradient(
+        monkeypatch):
+    initial = _scripted_state(0., 2., 1., 0., -1.)
+    first = _scripted_state(1., 5., 1., -1., -1.)
+    converged = _scripted_state(2., 2., 0., -2., 0.)
+    solver = _ScriptedNLCGSolver(initial)
+    directions = []
+
+    monkeypatch.setattr(
+        gc_cg, 'objective_gradient',
+        lambda unused_solver, state, unused_fixed_n: state.exact_gradient)
+
+    def scripted_line_search(
+            solver, unused_origin, unused_origin_gradient, direction,
+            unused_evaluate, unused_objective, unused_initial_step):
+        directions.append(float(direction[0][0, 0].item()))
+        if len(directions) == 1:
+            sample = gc_cg._LineSample(
+                1., first, first.grand_potential, first.exact_gradient,
+                solver._inner(first.exact_gradient, direction), 'scripted')
+            return gc_cg._LineSearchResult(
+                sample, True, 1, 'resolved line minimum')
+        if len(directions) in (2, 3):
+            return gc_cg._LineSearchResult(
+                None, False, 1, 'no lower objective sample')
+        sample = gc_cg._LineSample(
+            1., converged, converged.grand_potential,
+            converged.exact_gradient, 0., 'scripted')
+        return gc_cg._LineSearchResult(
+            sample, True, 1, 'converged line sample')
+
+    monkeypatch.setattr(gc_cg, '_line_search', scripted_line_search)
+    gc_cg.nlcg(solver, h=initial.h)
+    assert solver.converged
+    assert solver.cycles == 2
+    assert directions == pytest.approx([1., 4., 2., 1.])
+
+
+def test_nlcg_inexact_line_minimum_restarts_conjugacy(monkeypatch):
+    initial = _scripted_state(0., 2., 1., 0., -1.)
+    first = _scripted_state(1., 5., 1., -1., -1.)
+    converged = _scripted_state(2., 2., 0., -2., 0.)
+    solver = _ScriptedNLCGSolver(initial)
+    directions = []
+
+    monkeypatch.setattr(
+        gc_cg, 'objective_gradient',
+        lambda unused_solver, state, unused_fixed_n: state.exact_gradient)
+
+    def scripted_line_search(
+            solver, unused_origin, unused_origin_gradient, direction,
+            unused_evaluate, unused_objective, unused_initial_step):
+        directions.append(float(direction[0][0, 0].item()))
+        state = first if len(directions) == 1 else converged
+        sample = gc_cg._LineSample(
+            1., state, state.grand_potential, state.exact_gradient,
+            solver._inner(state.exact_gradient, direction), 'scripted')
+        return gc_cg._LineSearchResult(
+            sample, len(directions) > 1, 1,
+            ('line-search evaluation limit' if len(directions) == 1
+             else 'converged line sample'))
+
+    monkeypatch.setattr(gc_cg, '_line_search', scripted_line_search)
+    gc_cg.nlcg(solver, h=initial.h)
+    assert solver.converged
+    assert directions == pytest.approx([1., 2.])
+
+
+@pytest.mark.parametrize('direction', [
+    cp.asarray([[.15, .04], [.04, -.07]], dtype=cp.complex128),
+    cp.asarray([[0., .06j], [-.06j, 0.]], dtype=cp.complex128),
+])
+def test_fixed_mu_nlcg_gradient_matches_complex_finite_difference(direction):
+    unused, solver = _solver(mu=-.1)
+    solver.build()
+    h = [cp.asarray(
+        [[-.3, .08+.03j], [.08-.03j, .2]], dtype=cp.complex128)]
+    state = solver.calculate_cycle(h, mu=solver.mu)
+    gradient = gc_cg.objective_gradient(solver, state, fixed_n=False)
+    epsilon = 1e-5
+    plus = solver.calculate_cycle(
+        [state.h[0]+epsilon*direction], mu=solver.mu)
+    minus = solver.calculate_cycle(
+        [state.h[0]-epsilon*direction], mu=solver.mu)
+    finite_difference = (
+        plus.grand_potential-minus.grand_potential) / (2.*epsilon)
+    analytic = solver._inner(gradient, [direction])
+    assert abs(finite_difference-analytic) < 2e-6
+
+
+def test_fixed_n_nlcg_gradients_match_multik_finite_difference():
+    target = 1.3
+    fock = [
+        cp.asarray([[-.7, .12j], [-.12j, .3]], dtype=cp.complex128),
+        cp.asarray([[-.55, .03+.04j], [.03-.04j, .42]],
+                   dtype=cp.complex128),
+    ]
+    solver = GrandCanonicalKRKS(
+        _FixedFockKRKS(fock), sigma=.15, nelec=target)
+    solver.build()
+    h = [
+        cp.asarray([[-.3, .08+.03j], [.08-.03j, .2]],
+                   dtype=cp.complex128),
+        cp.asarray([[-.2, -.05+.02j], [-.05-.02j, .35]],
+                   dtype=cp.complex128),
+    ]
+    direction = [
+        cp.asarray([[.15, .04j], [-.04j, -.07]],
+                   dtype=cp.complex128),
+        cp.asarray([[-.11, .02-.01j], [.02+.01j, .08]],
+                   dtype=cp.complex128),
+    ]
+    state = solver.calculate_cycle(h, nelec=target)
+    mu_gradient = gc_cg.mu_gradient_wrt_h(
+        state.coeff, state.occ, solver.weight)
+    free_energy_gradient = gc_cg.objective_gradient(
+        solver, state, fixed_n=True)
+    epsilon = 1e-5
+    plus_h = [x+epsilon*d for x, d in zip(state.h, direction)]
+    minus_h = [x-epsilon*d for x, d in zip(state.h, direction)]
+
+    mu_plus = solver._solve_mu(
+        [cp.linalg.eigvalsh(x) for x in plus_h], target)
+    mu_minus = solver._solve_mu(
+        [cp.linalg.eigvalsh(x) for x in minus_h], target)
+    finite_difference_mu = (mu_plus-mu_minus) / (2.*epsilon)
+    assert abs(
+        finite_difference_mu-solver._inner(mu_gradient, direction)) < 2e-6
+    assert abs(solver._inner(mu_gradient, solver.identity)-1.) < 1e-12
+
+    plus = solver.calculate_cycle(plus_h, nelec=target)
+    minus = solver.calculate_cycle(minus_h, nelec=target)
+    finite_difference_free_energy = (
+        plus.free_energy-minus.free_energy) / (2.*epsilon)
+    assert abs(finite_difference_free_energy-solver._inner(
+        free_energy_gradient, direction)) < 2e-6
+    assert abs(solver._inner(
+        free_energy_gradient, solver.identity)) < 1e-12
+    assert abs(state.nelec-target) < 1e-10
+    assert abs(plus.nelec-target) < 1e-10
+    assert abs(minus.nelec-target) < 1e-10
+
+
+def test_fixed_n_mu_gradient_rejects_singular_fermi_response():
+    with pytest.raises(RuntimeError, match='numerically singular'):
+        gc_cg.mu_gradient_wrt_h(
+            [cp.eye(2)], [cp.asarray([0., 1.])], weight=1.)
 
 
 def test_constructor_and_stream_object_configuration():
@@ -164,10 +488,21 @@ def test_constructor_and_stream_object_configuration():
     with pytest.raises(TypeError, match='different ensembles'):
         GrandCanonicalKRKS(mf, mu=-.1, sigma=.1, nelec=1.2)
     solver = GrandCanonicalKRKS(mf, mu=-.1, sigma=.1).set(
-        conv_tol=1e-7, diis_space=4, tighten_mu_threshold=2e-3)
+        conv_tol=1e-7, diis_space=4, tighten_mu_threshold=2e-3,
+        nlcg_initial_step=.75, nlcg_max_line_search_evaluations=5)
     assert solver.conv_tol == 1e-7
     assert solver.diis_space == 4
     assert solver.tighten_mu_threshold == 2e-3
+    assert solver.nlcg_initial_step == .75
+    assert solver.nlcg_max_line_search_evaluations == 5
+
+    solver.nlcg_initial_step = 0.
+    with pytest.raises(ValueError, match='nlcg_initial_step'):
+        solver.check_sanity()
+    solver.nlcg_initial_step = 1.
+    solver.nlcg_max_line_search_evaluations = 1
+    with pytest.raises(ValueError, match='nlcg_max_line_search_evaluations'):
+        solver.check_sanity()
 
 
 def test_build_caches_mean_field_setup():
@@ -240,6 +575,87 @@ def test_tagged_solvent_fock_and_energy_use_same_veff():
     assert float(cp.max(cp.abs(state.fock[0]-expected)).item()) < 1e-13
     assert mf.energy_veff is not None
     assert getattr(mf.energy_veff, 'v_solvent', None) is not None
+
+
+def test_fixed_mu_nlcg_converges_complex_fixed_fock_problem():
+    mf, solver = _solver(mu=-.1)
+    solver.conv_tol = 1e-8
+    solver.max_cycle = 20
+    solver.build()
+    displacement = cp.asarray(
+        [[.075, .02+.01j], [.02-.01j, -.035]],
+        dtype=cp.complex128)
+    h0 = [_fock()+displacement]
+    initial = solver.calculate_cycle(h0, mu=solver.mu)
+    e_tot = solver.nlcg(h=h0)
+    assert solver.converged, solver.message
+    assert solver.residual_rms <= solver.conv_tol
+    assert solver.grand_potential < initial.grand_potential
+    assert e_tot == solver.e_tot == mf.e_tot
+    assert solver.mu == pytest.approx(-.1)
+    assert solver.mo_coeff is mf.mo_coeff
+
+
+def test_fixed_n_nlcg_converges_complex_fixed_fock_problem():
+    target = 1.25
+    mf, solver = _solver(nelec=target)
+    solver.conv_tol = 1e-8
+    solver.max_cycle = 20
+    solver.build()
+    h0 = [cp.asarray(
+        [[-.1, .19-.11j], [.19+.11j, .6]], dtype=cp.complex128)]
+    initial = solver.calculate_cycle(h0, nelec=target)
+    e_tot = solver.nlcg(h=h0)
+    assert solver.converged, solver.message
+    assert solver.residual_rms <= solver.conv_tol
+    assert solver.free_energy < initial.free_energy
+    assert abs(solver.electron_number-target) < 1e-10
+    assert np.isfinite(solver.mu)
+    assert e_tot == solver.e_tot == mf.e_tot
+    reconstructed = (
+        (solver.mo_coeff * solver.mo_occ[:, None, :])
+        @ solver.mo_coeff.conj().transpose(0, 2, 1))
+    assert float(cp.max(cp.abs(
+        reconstructed-solver._cycle_data.dm)).item()) < 1e-10
+
+
+@pytest.mark.parametrize('solver_kwargs,coupling,objective_name', [
+    ({'nelec': 1.3}, .3, 'free_energy'),
+    ({'mu': -.1}, .15, 'grand_potential'),
+])
+def test_nlcg_interpolation_converges_nonlinear_problem(
+        monkeypatch, solver_kwargs, coupling, objective_name):
+    hcore = [cp.asarray(
+        [[-.7, .08j], [-.08j, .3]], dtype=cp.complex128)]
+    h0 = [cp.asarray(
+        [[-.2, .18-.07j], [.18+.07j, .5]], dtype=cp.complex128)]
+    mf = _LinearFockKRKS(hcore, coupling=coupling)
+    solver = GrandCanonicalKRKS(mf, sigma=.15, **solver_kwargs)
+    solver.conv_tol = 1e-8
+    solver.max_cycle = 30
+    solver.build()
+    if 'nelec' in solver_kwargs:
+        initial = solver.calculate_cycle(h0, nelec=solver.nelec)
+    else:
+        initial = solver.calculate_cycle(h0, mu=solver.mu)
+
+    original_line_search = gc_cg._line_search
+    accepted_values = []
+
+    def recording_line_search(*args, **kwargs):
+        result = original_line_search(*args, **kwargs)
+        if result.sample is not None:
+            accepted_values.append(result.sample.value)
+        return result
+
+    monkeypatch.setattr(gc_cg, '_line_search', recording_line_search)
+    solver.nlcg(h=h0)
+
+    values = [getattr(initial, objective_name)] + accepted_values
+    assert solver.converged, solver.message
+    assert solver.residual_rms <= solver.conv_tol
+    assert solver.nfev < 61
+    assert all(new <= old+1e-12 for old, new in zip(values, values[1:]))
 
 
 def test_residual_diis_converges_complex_fixed_n_problem():
@@ -361,6 +777,22 @@ def test_real_multik_fixed_n_krks():
     solver.max_cycle = 30
     solver.kernel()
     assert solver.converged, solver.message
+    assert abs(solver.electron_number-1.6) < 1e-9
+    assert np.isfinite(solver.mu)
+    dm = mf.make_rdm1(mf.mo_coeff, mf.mo_occ)
+    assert float(cp.max(cp.abs(dm-solver._cycle_data.dm)).item()) < 1e-8
+
+
+def test_real_multik_fixed_n_nlcg():
+    cell = _small_periodic_cell()
+    mf = cell.KRKS(kpts=cell.make_kpts([3, 1, 1])).to_gpu()
+    mf.xc = 'LDA,VWN'
+    solver = GrandCanonicalKRKS(mf, sigma=.08, nelec=1.6)
+    solver.conv_tol = 1e-6
+    solver.max_cycle = 30
+    solver.nlcg()
+    assert solver.converged, solver.message
+    assert solver.residual_rms <= solver.conv_tol
     assert abs(solver.electron_number-1.6) < 1e-9
     assert np.isfinite(solver.mu)
     dm = mf.make_rdm1(mf.mo_coeff, mf.mo_occ)

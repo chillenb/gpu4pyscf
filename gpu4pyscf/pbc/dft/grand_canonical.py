@@ -177,6 +177,11 @@ class GrandCanonicalKRKS(lib.StreamObject):
     conv_tol = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol', 1e-8)
     conv_tol_coarse = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_coarse', 1e-6)
     conv_tol_mu = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_mu', 1e-6)
+    nlcg_initial_step = getattr(
+        __config__, 'pbc_dft_grand_canonical_nlcg_initial_step', 1.0)
+    nlcg_max_line_search_evaluations = getattr(
+        __config__,
+        'pbc_dft_grand_canonical_nlcg_max_line_search_evaluations', 20)
     tighten_mu_threshold = getattr(
         __config__, 'pbc_dft_grand_canonical_tighten_mu_threshold', 1e-3)
     diis_space = getattr(__config__, 'pbc_dft_grand_canonical_diis_space', 6)
@@ -193,6 +198,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
     _keys = {
         'mf', 'mu', 'sigma', 'nelec', 'max_cycle', 'max_outer_cycle',
         'conv_tol', 'conv_tol_coarse', 'conv_tol_mu',
+        'nlcg_initial_step', 'nlcg_max_line_search_evaluations',
         'tighten_mu_threshold',
         'diis_space', 'damp', 'callback',
         'diis_trust_expand', 'diis_expansion',
@@ -268,6 +274,10 @@ class GrandCanonicalKRKS(lib.StreamObject):
         log.info('residual tolerance = %g', self.conv_tol)
         log.info('coarse residual tolerance = %g', self.conv_tol_coarse)
         log.info('max fixed-N cycles = %d', self.max_cycle)
+        log.info('NLCG initial line-search step = %g',
+                 self.nlcg_initial_step)
+        log.info('NLCG max line-search evaluations = %d',
+                 self.nlcg_max_line_search_evaluations)
         log.info('DIIS space = %d', self.diis_space)
         log.info('initial damping = %g', self.damp)
         return self
@@ -277,12 +287,18 @@ class GrandCanonicalKRKS(lib.StreamObject):
             raise ValueError('max_cycle must be a positive integer')
         if not isinstance(self.max_outer_cycle, int) or self.max_outer_cycle < 1:
             raise ValueError('max_outer_cycle must be a positive integer')
+        if (not isinstance(self.nlcg_max_line_search_evaluations, int) or
+                self.nlcg_max_line_search_evaluations < 2):
+            raise ValueError(
+                'nlcg_max_line_search_evaluations must be an integer of '
+                'at least 2')
         if not isinstance(self.diis_space, int) or self.diis_space < 2:
             raise ValueError('diis_space must be an integer of at least 2')
         for name in ('conv_tol', 'conv_tol_coarse', 'conv_tol_mu',
                      'tighten_mu_threshold', 'damp',
                      'diis_trust_expand', 'diis_expansion',
                      'diis_expand_reduction', 'min_damp',
+                     'nlcg_initial_step',
                      'initial_nelec_step', 'max_nelec_step_fraction',
                      'root_nelec_tol'):
             value = getattr(self, name)
