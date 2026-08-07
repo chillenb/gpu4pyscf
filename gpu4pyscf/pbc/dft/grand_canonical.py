@@ -182,6 +182,12 @@ class GrandCanonicalKRKS(lib.StreamObject):
     nlcg_max_line_search_evaluations = getattr(
         __config__,
         'pbc_dft_grand_canonical_nlcg_max_line_search_evaluations', 20)
+    nlcg_line_search_alpha_rtol = getattr(
+        __config__,
+        'pbc_dft_grand_canonical_nlcg_line_search_alpha_rtol', None)
+    nlcg_line_search_slope_atol = getattr(
+        __config__,
+        'pbc_dft_grand_canonical_nlcg_line_search_slope_atol', None)
     tighten_mu_threshold = getattr(
         __config__, 'pbc_dft_grand_canonical_tighten_mu_threshold', 1e-3)
     diis_space = getattr(__config__, 'pbc_dft_grand_canonical_diis_space', 6)
@@ -199,6 +205,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         'mf', 'mu', 'sigma', 'nelec', 'max_cycle', 'max_outer_cycle',
         'conv_tol', 'conv_tol_coarse', 'conv_tol_mu',
         'nlcg_initial_step', 'nlcg_max_line_search_evaluations',
+        'nlcg_line_search_alpha_rtol', 'nlcg_line_search_slope_atol',
         'tighten_mu_threshold',
         'diis_space', 'damp', 'callback',
         'diis_trust_expand', 'diis_expansion',
@@ -278,6 +285,19 @@ class GrandCanonicalKRKS(lib.StreamObject):
                  self.nlcg_initial_step)
         log.info('NLCG max line-search evaluations = %d',
                  self.nlcg_max_line_search_evaluations)
+        if (self.nlcg_line_search_alpha_rtol is None and
+                self.nlcg_line_search_slope_atol is None):
+            log.info('NLCG strict line minimization = disabled')
+        elif (self.nlcg_line_search_alpha_rtol is None or
+                self.nlcg_line_search_slope_atol is None):
+            log.info('NLCG strict line minimization configuration is '
+                     'incomplete')
+        else:
+            log.info('NLCG line-search alpha relative tolerance = %g '
+                     '(%.6g%%)', self.nlcg_line_search_alpha_rtol,
+                     100.0*self.nlcg_line_search_alpha_rtol)
+            log.info('NLCG normalized line-search slope tolerance = %g',
+                     self.nlcg_line_search_slope_atol)
         log.info('DIIS space = %d', self.diis_space)
         log.info('initial damping = %g', self.damp)
         return self
@@ -292,6 +312,19 @@ class GrandCanonicalKRKS(lib.StreamObject):
             raise ValueError(
                 'nlcg_max_line_search_evaluations must be an integer of '
                 'at least 2')
+        strict_alpha = self.nlcg_line_search_alpha_rtol
+        strict_slope = self.nlcg_line_search_slope_atol
+        if (strict_alpha is None) != (strict_slope is None):
+            raise ValueError(
+                'nlcg_line_search_alpha_rtol and '
+                'nlcg_line_search_slope_atol must both be set or both be '
+                'None')
+        if strict_alpha is not None:
+            for name, value in (
+                    ('nlcg_line_search_alpha_rtol', strict_alpha),
+                    ('nlcg_line_search_slope_atol', strict_slope)):
+                if not np.isfinite(value) or value <= 0:
+                    raise ValueError('%s must be finite and positive' % name)
         if not isinstance(self.diis_space, int) or self.diis_space < 2:
             raise ValueError('diis_space must be an integer of at least 2')
         for name in ('conv_tol', 'conv_tol_coarse', 'conv_tol_mu',
