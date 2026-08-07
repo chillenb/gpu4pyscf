@@ -484,9 +484,9 @@ class GrandCanonicalKRKS(lib.StreamObject):
     def _initial_h(self, dm0=None):
         if dm0 is None:
             try:
-                dm0 = self.mf.get_init_guess(self.cell, kpts=self.mf.kpts)
+                dm0 = self.mf.get_init_guess(self.cell, kpts=self.mf.kpts, key=self.mf.init_guess)
             except TypeError:
-                dm0 = self.mf.get_init_guess(self.cell)
+                dm0 = self.mf.get_init_guess(self.cell, key=self.mf.init_guess)
         dm = cp.stack(self._hermi(coerce_to_list_of_matrices(dm0, 'initial density')))
         nelec = self.weight * sum(_as_float(
             cp.einsum('ij,ji->', d, s), 'initial electron number')
