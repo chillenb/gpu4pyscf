@@ -18,6 +18,8 @@ class GrandCanonicalKRKS(StreamObject):
     conv_tol_mu: float
     nlcg_initial_step: float
     nlcg_max_line_search_evaluations: int
+    nlcg_line_search_alpha_rtol: float | None
+    nlcg_line_search_slope_atol: float | None
     tighten_mu_threshold: float
     diis_space: int
     damp: float
