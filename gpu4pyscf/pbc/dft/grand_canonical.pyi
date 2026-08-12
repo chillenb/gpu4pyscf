@@ -69,6 +69,7 @@ class GrandCanonicalKRKS(StreamObject):
         alpha: float = ...,
         anderson_space: int = ...,
         potential_conv_tol: float | None = ...,
+        initial_nelec: float | None = ...,
         **kwargs: Any,
     ) -> float: ...
     @staticmethod

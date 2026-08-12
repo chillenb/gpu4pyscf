@@ -173,8 +173,26 @@ def test_initial_density_supplies_first_potential(setup):
         rtol=0.0, atol=2e-13)
 
 
-def test_fixed_mu_potential_driver_remains_gated(setup):
-    mf, unused_solver, unused_target = setup
-    solver = GrandCanonicalKRKS(mf, sigma=0.1, mu=0.0)
-    with pytest.raises(NotImplementedError, match='fixed-N potential gate'):
-        solver.potential_scf(v0_g=mf._numint.target_g)
+def test_fixed_mu_potential_driver_uses_fixed_n_root(setup):
+    mf, unused_solver, target_g = setup
+    target_h = mf._numint.local_potential_to_ao(target_g)[0, 0, 0].item()
+    solver = GrandCanonicalKRKS(mf, sigma=0.1, mu=target_h)
+    solver.conv_tol = 1e-11
+    solver.conv_tol_coarse = 1e-8
+    solver.conv_tol_mu = 1e-10
+    solver.max_cycle = 6
+    solver.max_outer_cycle = 6
+    initial = cp.asarray([4.0, -2.0, -2.0], dtype=cp.complex128)
+
+    energy = solver.potential_scf(
+        v0_g=initial, initial_nelec=0.7,
+        preconditioner='identity', alpha=1.0, anderson_space=0,
+        potential_conv_tol=1e-11,
+        max_step_rms=100.0, max_step_abs=100.0)
+
+    assert np.isfinite(energy)
+    assert solver.converged, solver.message
+    assert solver.outer_cycles == 2
+    assert abs(solver.electron_number - 1.0) < 1e-9
+    assert abs(solver.mu - target_h) < solver.conv_tol_mu
+    assert solver.potential_residual_rms <= solver.conv_tol
