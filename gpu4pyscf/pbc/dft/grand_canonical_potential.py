@@ -219,8 +219,8 @@ def _score(cycle, grid_tolerance, matrix_tolerance):
         cycle.electronic.residual_rms / matrix_tolerance)
 
 
-def _run_fixed_n_potential(solver, v0_g, nelec, config, tolerance,
-                           target_mu=None):
+def _run_fixed_n_potential(solver, v0_g, nelec, config, grid_tolerance,
+                           matrix_tolerance, target_mu=None):
     """Converge one fixed-N sample without finalizing public solver state."""
     preconditioner_object = _make_preconditioner(
         config.preconditioner, config.q0_sq, config.a_out,
@@ -238,7 +238,7 @@ def _run_fixed_n_potential(solver, v0_g, nelec, config, tolerance,
     solver.cycles += 1
     local_cycles = 1
     best = current
-    best_score = _score(current, tolerance, tolerance)
+    best_score = _score(current, grid_tolerance, matrix_tolerance)
     converged = False
     message = 'maximum fixed-N potential cycles reached'
 
@@ -251,14 +251,18 @@ def _run_fixed_n_potential(solver, v0_g, nelec, config, tolerance,
         current.electronic.residual_rms, current.delta_v0)
 
     while local_cycles < solver.max_cycle:
-        active_tolerance = (
+        tighten = (
+            target_mu is not None and
+            abs(current.electronic.mu-target_mu)
+            < solver.tighten_mu_threshold)
+        active_grid_tolerance = (
+            config.potential_conv_tol
+            if tighten else grid_tolerance)
+        active_matrix_tolerance = (
             solver.conv_tol
-            if (target_mu is not None and
-                abs(current.electronic.mu-target_mu)
-                < solver.tighten_mu_threshold)
-            else tolerance)
-        if (current.grid_residual_rms <= active_tolerance and
-                current.electronic.residual_rms <= active_tolerance):
+            if tighten else matrix_tolerance)
+        if (current.grid_residual_rms <= active_grid_tolerance and
+                current.electronic.residual_rms <= active_matrix_tolerance):
             converged = True
             message = 'converged fixed-N potential residuals'
             break
@@ -304,7 +308,7 @@ def _run_fixed_n_potential(solver, v0_g, nelec, config, tolerance,
         mixer.accept(current.v_in_g, current.residual_g, context)
         solver.cycles += 1
         local_cycles += 1
-        score = _score(current, tolerance, tolerance)
+        score = _score(current, grid_tolerance, matrix_tolerance)
         if score < best_score:
             best = current
             best_score = score
@@ -334,14 +338,16 @@ def _run_fixed_n_potential(solver, v0_g, nelec, config, tolerance,
                 'rejected_trials': rejected,
             })
 
-    active_tolerance = (
-        solver.conv_tol
-        if (target_mu is not None and
-            abs(current.electronic.mu-target_mu)
-            < solver.tighten_mu_threshold)
-        else tolerance)
-    if (current.grid_residual_rms <= active_tolerance and
-            current.electronic.residual_rms <= active_tolerance):
+    tighten = (
+        target_mu is not None and
+        abs(current.electronic.mu-target_mu)
+        < solver.tighten_mu_threshold)
+    active_grid_tolerance = (
+        config.potential_conv_tol if tighten else grid_tolerance)
+    active_matrix_tolerance = (
+        solver.conv_tol if tighten else matrix_tolerance)
+    if (current.grid_residual_rms <= active_grid_tolerance and
+            current.electronic.residual_rms <= active_matrix_tolerance):
         converged = True
         message = 'converged fixed-N potential residuals'
         best = current
@@ -381,7 +387,8 @@ def _fixed_mu_potential(solver, initial_v_g, initial_nelec, config):
             tolerance = min(tolerance, minimum_error ** 1.8)
             tolerance = max(tolerance, solver.conv_tol)
         state, fixed_n_converged, fixed_n_message = _run_fixed_n_potential(
-            solver, current_v_g, current_n, config, tolerance,
+            solver, current_v_g, current_n, config,
+            grid_tolerance=tolerance, matrix_tolerance=tolerance,
             target_mu=solver.mu)
         if not fixed_n_converged:
             if best is None:
@@ -489,7 +496,8 @@ def potential_scf(self, dm0=None, v0_g=None, preconditioner='identity',
         preconditioner_maxiter=preconditioner_maxiter,
         max_step_rms=max_step_rms, max_step_abs=max_step_abs,
         residual_growth_factor=residual_growth_factor,
-        max_backtracks=max_backtracks)
+        max_backtracks=max_backtracks,
+        potential_conv_tol=potential_conv_tol)
     logger.info(
         self,
         'Potential backend: preconditioner=%s alpha=%.6g Anderson space=%d '
@@ -507,7 +515,9 @@ def potential_scf(self, dm0=None, v0_g=None, preconditioner='identity',
             self, v0_g, initial_nelec, config)
     else:
         best, converged, self.message = _run_fixed_n_potential(
-            self, v0_g, self.nelec, config, potential_conv_tol)
+            self, v0_g, self.nelec, config,
+            grid_tolerance=potential_conv_tol,
+            matrix_tolerance=self.conv_tol)
 
     self._potential_cycle = best
     logger.info(
