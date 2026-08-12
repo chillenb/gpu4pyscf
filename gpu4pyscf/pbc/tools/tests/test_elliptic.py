@@ -17,7 +17,7 @@ def _grid(skew=False):
         unit='bohr', mesh=[7, 8, 9], verbose=0)
     mesh = tuple(cell.mesh)
     Gv = cp.asarray(pbc_tools.get_Gv(cell, mesh))
-    G2 = cp.einsum('gi,gi->g', Gv, Gv)
+    G2 = elliptic.reciprocal_laplacian_symbol(Gv, mesh)
     return cell, mesh, Gv, G2
 
 
