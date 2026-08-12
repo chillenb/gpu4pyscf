@@ -18,13 +18,15 @@ from gpu4pyscf.pbc.tools import pbc as pbc_tools
 
 
 class PreconditionerDiagnostics:
-    __slots__ = ('name', 'success', 'message', 'inner')
+    __slots__ = ('name', 'success', 'message', 'inner', 'metadata')
 
-    def __init__(self, name, success=True, message='', inner=None):
+    def __init__(self, name, success=True, message='', inner=None,
+                 metadata=None):
         self.name = str(name)
         self.success = bool(success)
         self.message = str(message)
         self.inner = inner
+        self.metadata = {} if metadata is None else dict(metadata)
 
 
 class PreconditionerResult:
@@ -236,8 +238,14 @@ class EllipticPreconditioner:
             return PreconditionerResult(
                 value_g,
                 PreconditionerDiagnostics(
-                    'elliptic', inner=solved.diagnostics))
-        except (FloatingPointError, RuntimeError) as error:
+                    'elliptic', inner=solved.diagnostics,
+                    metadata={
+                        'a_min': float(cp.min(a_r).item()),
+                        'a_max': float(cp.max(a_r).item()),
+                        'b_min': float(cp.min(b_r).item()),
+                        'b_max': float(cp.max(b_r).item()),
+                    }))
+        except (FloatingPointError, RuntimeError, ValueError) as error:
             fallback = self.fallback.apply(residual_g, context)
             return PreconditionerResult(
                 fallback.value_g,
