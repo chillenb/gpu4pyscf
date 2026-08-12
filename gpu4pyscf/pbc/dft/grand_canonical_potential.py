@@ -308,15 +308,20 @@ def _run_fixed_n_potential(solver, v0_g, nelec, config, tolerance,
         if score < best_score:
             best = current
             best_score = score
+        preconditioner_diagnostics = proposal.diagnostics.preconditioner
+        inner = preconditioner_diagnostics.inner
+        inner_iterations = 0 if inner is None else inner.iterations
         logger.info(
             solver,
             'Potential cycle %d  N = %.12g  mu = %.12g  A = %.12g  '
             'grid residual = %.6g  matrix residual = %.6g  '
-            'step RMS = %.6g  backtracks = %d',
+            'step RMS = %.6g  backtracks = %d  preconditioner = %s  '
+            'inner iterations = %d',
             solver.cycles, nelec, current.electronic.mu,
             current.electronic.free_energy, current.grid_residual_rms,
             current.electronic.residual_rms,
-            proposal.diagnostics.step_rms, rejected)
+            proposal.diagnostics.step_rms, rejected,
+            preconditioner_diagnostics.name, inner_iterations)
         if callable(solver.callback):
             solver.callback({
                 'solver': solver,
@@ -485,6 +490,14 @@ def potential_scf(self, dm0=None, v0_g=None, preconditioner='identity',
         max_step_rms=max_step_rms, max_step_abs=max_step_abs,
         residual_growth_factor=residual_growth_factor,
         max_backtracks=max_backtracks)
+    logger.info(
+        self,
+        'Potential backend: preconditioner=%s alpha=%.6g Anderson space=%d '
+        'grid tolerance=%.6g q0_sq=%.6g a_out=%.6g b_metal=%.6g '
+        'inner tolerance=%.6g inner maxiter=%d',
+        str(preconditioner), alpha, anderson_space, potential_conv_tol,
+        q0_sq, a_out, b_metal, preconditioner_tol,
+        preconditioner_maxiter)
 
     if self.nelec is None:
         if initial_nelec is None:
