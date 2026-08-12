@@ -44,6 +44,7 @@ class GrandCanonicalKRKS(StreamObject):
     entropy: float | None
     entropy_energy: float | None
     residual_rms: float | None
+    potential_residual_rms: float | None
     mo_energy: Any
     mo_coeff: Any
     mo_occ: Any
@@ -60,6 +61,16 @@ class GrandCanonicalKRKS(StreamObject):
     def check_sanity(self) -> GrandCanonicalKRKS: ...
     def build(self) -> GrandCanonicalKRKS: ...
     def nlcg(self, dm0: Any = ..., h: Any = ...) -> float: ...
+    def potential_scf(
+        self,
+        dm0: Any = ...,
+        v0_g: Any = ...,
+        preconditioner: Any = ...,
+        alpha: float = ...,
+        anderson_space: int = ...,
+        potential_conv_tol: float | None = ...,
+        **kwargs: Any,
+    ) -> float: ...
     @staticmethod
     def search_mu_root_bracket(
         nelec: list[float], delta_mu: list[float]

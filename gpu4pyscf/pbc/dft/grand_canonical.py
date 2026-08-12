@@ -34,6 +34,7 @@ from pyscf.scf.addons import _fermi_smearing_occ, _smearing_optimize
 
 from gpu4pyscf.lib import diis, logger
 from gpu4pyscf.pbc.dft.grand_canonical_cg import fixed_mu_diis, nlcg
+from gpu4pyscf.pbc.dft.grand_canonical_potential import potential_scf
 
 
 __all__ = ['GrandCanonicalKRKS']
@@ -96,11 +97,11 @@ class GCSolverCycle:
         'h', 'eig', 'coeff', 'occ', 'p', 'dm', 'fock',
         'mu', 'e_tot', 'nelec',
         'entropy', 'entropy_energy', 'free_energy', 'grand_potential',
-        'residual', 'residual_rms')
+        'residual', 'residual_rms', 'grid_data')
 
     def __init__(self, h, eig, coeff, occ, p, dm, fock, mu,
                  e_tot, nelec, entropy, entropy_energy, free_energy,
-                 grand_potential, residual, residual_rms):
+                 grand_potential, residual, residual_rms, grid_data=None):
         self.h = h
         self.eig = eig
         self.coeff = coeff
@@ -117,6 +118,7 @@ class GCSolverCycle:
         self.grand_potential = grand_potential
         self.residual = residual
         self.residual_rms = residual_rms
+        self.grid_data = grid_data
 
 
 class FixedNCalc:
@@ -171,6 +173,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
 
     nlcg = nlcg
     fixed_mu_diis = fixed_mu_diis
+    potential_scf = potential_scf
 
     max_cycle = getattr(__config__, 'pbc_dft_grand_canonical_max_cycle', 100)
     max_outer_cycle = getattr(__config__, 'pbc_dft_grand_canonical_max_outer_cycle', 16)
@@ -215,6 +218,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         'free_energy', 'grand_potential', 'electron_number', 'entropy',
         'entropy_energy', 'residual_rms', 'mo_energy', 'mo_coeff', 'mo_occ',
         'refinements', 'message', 'scf_summary',
+        'potential_residual_rms',
     }
 
     def __init__(self, mf, mu=None, sigma=None, nelec=None):
@@ -255,6 +259,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.entropy = None
         self.entropy_energy = None
         self.residual_rms = None
+        self.potential_residual_rms = None
         self.mo_energy = None
         self.mo_coeff = None
         self.mo_occ = None
@@ -262,6 +267,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
 
         self._built = False
         self._cycle_data = None
+        self._potential_cycle = None
 
     def dump_flags(self, verbose=None):
         log = logger.new_logger(self, verbose)
@@ -519,7 +525,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
     def nelec_at_mu(self, h, mu):
         return self.nelec_from_eig([cp.linalg.eigvalsh(x) for x in h], mu)
 
-    def calculate_cycle(self, h, nelec=None, mu=None):
+    def calculate_cycle(self, h, nelec=None, mu=None,
+                        align_fixed_n_gauge=True):
         if (nelec is None) == (mu is None):
             raise TypeError('specify exactly one of nelec and mu')
         self.nfev += 1
@@ -564,7 +571,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         free_energy = e_tot + entropy_energy
 
         mismatch = self._hermi([x - y for x, y in zip(h, fock)])
-        if nelec is not None:
+        if nelec is not None and align_fixed_n_gauge:
             gauge = self._trace_mean(mismatch)
             h = [x - gauge*eye for x, eye in zip(h, self.identity)]
             eig = [x - gauge for x in eig]
@@ -579,7 +586,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
         return GCSolverCycle(
             h, eig, coeff, occ, p, dm, fock, mu,
             e_tot, electron_number, entropy, entropy_energy, free_energy,
-            grand_potential, residual, self._rms(mismatch))
+            grand_potential, residual, self._rms(mismatch),
+            getattr(veff, 'lpbe_grid', None))
 
     def diis_pack(self, blocks, weight_errors=False):
         scale = self.weight**.5 if weight_errors else 1.
