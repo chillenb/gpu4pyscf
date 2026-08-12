@@ -69,18 +69,41 @@ def _as_real_field(values, mesh, name):
     return values
 
 
-def _zero_nyquist_component(values, mesh, axis):
-    if mesh is not None and mesh[axis] % 2 == 0:
-        view = values.reshape(tuple(mesh))
-        index = [slice(None)] * 3
-        index[axis] = mesh[axis] // 2
-        view[tuple(index)] = 0.0
+def _conjugate_grid(values, mesh):
+    mesh = tuple(int(x) for x in mesh)
+    values = cp.asarray(values)
+    original_shape = values.shape
+    if values.shape[:3] == mesh:
+        trailing = values.shape[3:]
+    elif values.ndim >= 1 and values.shape[0] == int(np.prod(mesh)):
+        trailing = values.shape[1:]
+    else:
+        raise ValueError('values and mesh sizes differ')
+    values = values.reshape(mesh + trailing)
+    negative = [(-cp.arange(n)) % n for n in mesh]
+    return values[
+        negative[0][:, None, None],
+        negative[1][None, :, None],
+        negative[2][None, None, :],
+    ].reshape(original_shape)
+
+
+def reciprocal_derivative_vectors(Gv, mesh):
+    """Return the conjugate-antisymmetric reciprocal derivative symbol."""
+    mesh = tuple(int(x) for x in mesh)
+    Gv = cp.asarray(Gv, dtype=cp.float64).reshape(-1, 3)
+    if Gv.shape[0] != int(np.prod(mesh)):
+        raise ValueError('Gv and mesh sizes differ')
+    conjugate = _conjugate_grid(Gv, mesh).reshape(-1, 3)
+    return 0.5 * (Gv - conjugate)
 
 
 def reciprocal_gradient(field_g, Gv, out=None, mesh=None):
     """Return ``grad(field)`` in reciprocal space."""
     field_g = cp.asarray(field_g).reshape(-1)
     Gv = cp.asarray(Gv).reshape(-1, 3)
+    if mesh is not None:
+        Gv = reciprocal_derivative_vectors(Gv, mesh)
     if field_g.size != Gv.shape[0]:
         raise ValueError('field and reciprocal grid sizes differ')
     if out is None:
@@ -89,10 +112,6 @@ def reciprocal_gradient(field_g, Gv, out=None, mesh=None):
         raise ValueError('gradient output has the wrong shape')
     for axis in range(3):
         out[axis] = 1j * Gv[:, axis] * field_g
-        # A first derivative at the self-conjugate Nyquist frequency has no
-        # real-valued spectral representation.  Zero that component so real
-        # fields remain real on even meshes.
-        _zero_nyquist_component(out[axis], mesh, axis)
     return out
 
 
@@ -100,6 +119,8 @@ def reciprocal_divergence(vector_g, Gv, out=None, mesh=None):
     """Return ``div(vector)`` in reciprocal space."""
     vector_g = cp.asarray(vector_g)
     Gv = cp.asarray(Gv).reshape(-1, 3)
+    if mesh is not None:
+        Gv = reciprocal_derivative_vectors(Gv, mesh)
     if vector_g.shape != (3, Gv.shape[0]):
         raise ValueError('vector field and reciprocal grid sizes differ')
     if out is None:
@@ -109,11 +130,7 @@ def reciprocal_divergence(vector_g, Gv, out=None, mesh=None):
             raise ValueError('divergence output has the wrong shape')
         out.fill(0.0)
     for axis in range(3):
-        component = 1j * Gv[:, axis] * vector_g[axis]
-        if mesh is not None:
-            component = component.copy()
-            _zero_nyquist_component(component, mesh, axis)
-        out += component
+        out += 1j * Gv[:, axis] * vector_g[axis]
     return out
 
 
@@ -142,19 +159,14 @@ def reciprocal_laplacian_symbol(Gv, mesh):
     if Gv.shape[0] != int(np.prod(mesh)):
         raise ValueError('Gv and mesh sizes differ')
     raw = cp.einsum('gi,gi->g', Gv, Gv).reshape(mesh)
-    negative = [(-cp.arange(n)) % n for n in mesh]
-    conjugate = raw[
-        negative[0][:, None, None],
-        negative[1][None, :, None],
-        negative[2][None, None, :],
-    ]
+    conjugate = _conjugate_grid(raw, mesh)
     return (0.5 * (raw + conjugate)).reshape(-1)
 
 
-def _apply_periodic_elliptic_unchecked(field_g, mesh, Gv, G2, base_a,
+def _apply_periodic_elliptic_unchecked(field_g, mesh, derivative_Gv, G2, base_a,
                                        delta_a_r, m_r, zero_mean):
     grad_g = reciprocal_gradient(
-        field_g, Gv, mesh=mesh).reshape((3,) + mesh)
+        field_g, derivative_Gv).reshape((3,) + mesh)
     # The omitted 1/weight on IFFT and weight on FFT cancel by linearity.
     grad_r_scaled = pbc_tools.ifft(grad_g.reshape(3, -1), mesh).reshape(
         (3,) + mesh)
@@ -162,7 +174,7 @@ def _apply_periodic_elliptic_unchecked(field_g, mesh, Gv, G2, base_a,
         (delta_a_r * grad_r_scaled).reshape(3, -1), mesh).reshape(3, -1)
     kinetic_g = (
         base_a * G2 * field_g
-        - reciprocal_divergence(flux_g, Gv, mesh=mesh))
+        - reciprocal_divergence(flux_g, derivative_Gv))
 
     field_r_scaled = pbc_tools.ifft(field_g, mesh).reshape(mesh)
     mass_g = pbc_tools.fft((m_r * field_r_scaled).reshape(-1), mesh)
@@ -184,10 +196,11 @@ def apply_periodic_elliptic(field_g, mesh, Gv, a_r, m_r,
     if Gv.shape[0] != ngrids:
         raise ValueError('Gv and mesh sizes differ')
     G2 = reciprocal_laplacian_symbol(Gv, mesh)
+    derivative_Gv = reciprocal_derivative_vectors(Gv, mesh)
     base_a = float(cp.min(a_r).item())
     delta_a_r = a_r - base_a
     return _apply_periodic_elliptic_unchecked(
-        field_g, mesh, Gv, G2, base_a, delta_a_r, m_r,
+        field_g, mesh, derivative_Gv, G2, base_a, delta_a_r, m_r,
         bool(zero_mean))
 
 
@@ -245,6 +258,7 @@ def solve_periodic_elliptic(rhs_g, mesh, Gv, a_r, m_r, tol=1e-8,
     if Gv.shape[0] != ngrids:
         raise ValueError('Gv and mesh sizes differ')
     G2 = reciprocal_laplacian_symbol(Gv, mesh)
+    derivative_Gv = reciprocal_derivative_vectors(Gv, mesh)
     base_a = amin
     delta_a_r = a_r - base_a
     rhs_g = _as_flat_complex(rhs_g, ngrids, 'right-hand side').copy()
@@ -259,7 +273,7 @@ def solve_periodic_elliptic(rhs_g, mesh, Gv, a_r, m_r, tol=1e-8,
 
     def matvec(vector):
         return _apply_periodic_elliptic_unchecked(
-            cp.asarray(vector).reshape(-1), mesh, Gv, G2, base_a,
+            cp.asarray(vector).reshape(-1), mesh, derivative_Gv, G2, base_a,
             delta_a_r, m_r, zero_mean)
 
     operator = LinearOperator((ngrids, ngrids), matvec=matvec)
