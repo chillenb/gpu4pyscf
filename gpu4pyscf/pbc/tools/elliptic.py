@@ -128,6 +128,29 @@ def project_zero_mean_g(field_g, copy=True):
     return field_g
 
 
+def reciprocal_laplacian_symbol(Gv, mesh):
+    """Return a real-field-safe ``G2`` symbol for an FFT mesh.
+
+    On a skew cell with an even mesh, the raw ``|G|^2`` values are not
+    conjugate-symmetric on Nyquist planes because those self-conjugate integer
+    frequencies have an ambiguous sign and reciprocal-vector cross terms do
+    not cancel.  Averaging conjugate partners selects the unique Hermitian
+    Laplacian symbol.  It is identical to raw ``|G|^2`` away from that case.
+    """
+    mesh = tuple(int(x) for x in mesh)
+    Gv = cp.asarray(Gv, dtype=cp.float64).reshape(-1, 3)
+    if Gv.shape[0] != int(np.prod(mesh)):
+        raise ValueError('Gv and mesh sizes differ')
+    raw = cp.einsum('gi,gi->g', Gv, Gv).reshape(mesh)
+    negative = [(-cp.arange(n)) % n for n in mesh]
+    conjugate = raw[
+        negative[0][:, None, None],
+        negative[1][None, :, None],
+        negative[2][None, None, :],
+    ]
+    return (0.5 * (raw + conjugate)).reshape(-1)
+
+
 def _apply_periodic_elliptic_unchecked(field_g, mesh, Gv, G2, base_a,
                                        delta_a_r, m_r, zero_mean):
     grad_g = reciprocal_gradient(
@@ -160,7 +183,7 @@ def apply_periodic_elliptic(field_g, mesh, Gv, a_r, m_r,
     Gv = cp.asarray(Gv, dtype=cp.float64).reshape(-1, 3)
     if Gv.shape[0] != ngrids:
         raise ValueError('Gv and mesh sizes differ')
-    G2 = cp.einsum('gi,gi->g', Gv, Gv)
+    G2 = reciprocal_laplacian_symbol(Gv, mesh)
     base_a = float(cp.min(a_r).item())
     delta_a_r = a_r - base_a
     return _apply_periodic_elliptic_unchecked(
@@ -221,7 +244,7 @@ def solve_periodic_elliptic(rhs_g, mesh, Gv, a_r, m_r, tol=1e-8,
     Gv = cp.asarray(Gv, dtype=cp.float64).reshape(-1, 3)
     if Gv.shape[0] != ngrids:
         raise ValueError('Gv and mesh sizes differ')
-    G2 = cp.einsum('gi,gi->g', Gv, Gv)
+    G2 = reciprocal_laplacian_symbol(Gv, mesh)
     base_a = amin
     delta_a_r = a_r - base_a
     rhs_g = _as_flat_complex(rhs_g, ngrids, 'right-hand side').copy()

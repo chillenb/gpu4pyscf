@@ -6,6 +6,7 @@ import numpy as np
 from pyscf.pbc import gto
 
 from gpu4pyscf.pbc.dft import potential_mixing as mixing
+from gpu4pyscf.pbc.tools import elliptic
 from gpu4pyscf.pbc.tools import pbc as pbc_tools
 
 
@@ -17,7 +18,7 @@ def _context(mesh=(7, 8, 9), skew=False):
         a=lattice, atom='He 0 0 0', basis='gth-szv', pseudo='gth-pade',
         unit='bohr', mesh=mesh, verbose=0)
     Gv = cp.asarray(pbc_tools.get_Gv(cell, mesh))
-    G2 = cp.einsum('gi,gi->g', Gv, Gv)
+    G2 = elliptic.reciprocal_laplacian_symbol(Gv, mesh)
     return SimpleNamespace(
         cell=cell, mesh=tuple(mesh), Gv=Gv, G2=G2,
         cavity_r=cp.zeros(mesh))
