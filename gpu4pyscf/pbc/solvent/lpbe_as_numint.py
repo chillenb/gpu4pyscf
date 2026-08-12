@@ -29,6 +29,33 @@ from gpu4pyscf.pbc.dft.multigrid_v2 import MultiGridNumInt
 from gpu4pyscf.pbc.dft.multigrid_v2 import fft_in_place, ifft_in_place, evaluate_density_on_g_mesh, convert_xc_on_g_mesh_to_fock
 
 
+class LPBEGridResult:
+    """Persistent reciprocal/real-space data from one LPBE NumInt call.
+
+    The arrays are snapshots rather than views of NumInt scratch storage.  In
+    particular, ``vlocal_g`` uses the convention
+
+        f_G = (cell.vol / ngrids) * fft(f_R)
+
+    and is the complete density-dependent local KS potential (XC + Hartree +
+    LPBE correction) immediately before its conversion to AO matrices.
+    """
+
+    __slots__ = (
+        'vlocal_g', 'rho_g', 'cavity_r', 'eps_r', 'lpbe_mass_r',
+        'lpbe_pot_guess',
+    )
+
+    def __init__(self, vlocal_g, rho_g, cavity_r, eps_r, lpbe_mass_r,
+                 lpbe_pot_guess):
+        self.vlocal_g = vlocal_g
+        self.rho_g = rho_g
+        self.cavity_r = cavity_r
+        self.eps_r = eps_r
+        self.lpbe_mass_r = lpbe_mass_r
+        self.lpbe_pot_guess = lpbe_pot_guess
+
+
 def shape_function(rhoR, sigma_k, nc_k, eps=1e-10):
     Z = cp.log(cp.maximum(rhoR.real, eps) / nc_k) * (1.0 / (np.sqrt(2) * sigma_k))
     S = 0.5 * cupyx.scipy.special.erfc(Z)
@@ -372,6 +399,9 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
         'Ecav': Ecav,
         'E_coul_corr': E_coul_corr,
         'pot_guess': solution_phi_G,
+        'cavity_r': S,
+        'eps_r': eps_r_field,
+        'mass_r': S * ebkappa2,
     }
 
     RangePop()
@@ -430,9 +460,12 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
     RangePush("evaluate_density_on_g_mesh")
     density = evaluate_density_on_g_mesh(ni, dm_kpts, kpts, xc_type)
     rho_sf = density[0, 0]
+    # ``ifft_in_place`` below reuses ``density`` storage, so retain the
+    # reciprocal density now for the persistent grid contract.
+    rho_g = rho_sf.copy()
     RangePop()
 
-    Gv = pbc_tools._get_Gv(cell, mesh)
+    Gv = pbc_tools.get_Gv(cell, mesh)
     coulomb_kernel_on_g_mesh = pbc_tools.get_coulG(cell, Gv=Gv)
     coulomb_on_g_mesh = rho_sf * coulomb_kernel_on_g_mesh
     coulomb_energy = complex(rho_sf.conj().dot(coulomb_on_g_mesh).get())
@@ -495,12 +528,23 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
     if with_j:
         xc_for_fock[0] += coulomb_on_g_mesh + vcorr_g
 
+    grid_result = LPBEGridResult(
+        vlocal_g=xc_for_fock[0].copy(),
+        rho_g=rho_g,
+        cavity_r=lpbe_res['cavity_r'].copy(),
+        eps_r=lpbe_res['eps_r'].copy(),
+        lpbe_mass_r=lpbe_res['mass_r'].copy(),
+        lpbe_pot_guess=lpbe_res['pot_guess'].copy(),
+    )
+
     kpts_band, input_band = _format_kpts_band(kpts_band, kpts), kpts_band
     RangePush("convert_xc_on_g_mesh_to_fock")
     veff = convert_xc_on_g_mesh_to_fock(ni, xc_for_fock, hermi, kpts_band, with_tau = (xc_type == "MGGA"))
     RangePop()
     veff = _format_jks(veff, dm_kpts, input_band, kpts)
-    veff = tag_array(veff, ecoul=coulomb_energy, exc=xc_energy_sum)
+    veff = tag_array(
+        veff, ecoul=coulomb_energy, exc=xc_energy_sum,
+        lpbe_grid=grid_result)
     t0 = log.timer("xc", *t0)
     RangePop()
     return n_electrons, xc_energy_sum, veff
@@ -531,6 +575,30 @@ class LPBEMultiGridNumInt(MultiGridNumInt):
             self.pot_guess = None
             self._lpbe_mesh = mesh
         return self.vpplocG
+
+    def local_potential_to_ao(self, vlocal_g, kpts=None, hermi=1):
+        """Convert one scalar reciprocal-space local potential to AO blocks.
+
+        Parameters follow :func:`convert_xc_on_g_mesh_to_fock`.  The returned
+        array always has shape ``(nkpts, nao, nao)``; unlike ``nr_rks`` it is
+        independent of the input density-matrix rank.
+        """
+        vlocal_g = cp.asarray(vlocal_g)
+        ngrids = int(np.prod(self.mesh))
+        if vlocal_g.size != ngrids:
+            raise ValueError(
+                'local potential has %d values; mesh requires %d' %
+                (vlocal_g.size, ngrids))
+        if not bool(cp.all(cp.isfinite(vlocal_g)).item()):
+            raise FloatingPointError('local potential contains nonfinite values')
+        if self.sorted_gaussian_pairs is None:
+            self.build('LDA')
+        if kpts is not None:
+            kpts = np.asarray(kpts).reshape(-1, 3)
+        matrices = convert_xc_on_g_mesh_to_fock(
+            self, vlocal_g.reshape(-1), hermi=hermi, kpts=kpts,
+            with_tau=False)
+        return matrices[0]
 
     nr_rks = nr_rks_lpbe
     nr_uks = NotImplemented
