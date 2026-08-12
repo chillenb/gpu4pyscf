@@ -197,6 +197,8 @@ else:
             'GC_POTENTIAL_RESIDUAL_GROWTH', '2.0')),
         max_backtracks=int(os.environ.get(
             'GC_POTENTIAL_MAX_BACKTRACKS', '6')),
+        cavity_change_threshold=float(os.environ.get(
+            'GC_POTENTIAL_CAVITY_RESET', '0.1')),
     )
 
 print(
