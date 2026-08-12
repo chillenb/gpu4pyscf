@@ -11,6 +11,7 @@ for aligning that gauge exactly before invoking these routines.
 
 import cupy as cp
 import numpy as np
+from numpy.linalg import LinAlgError
 
 from gpu4pyscf.pbc.tools import elliptic
 from gpu4pyscf.pbc.tools import pbc as pbc_tools
@@ -326,7 +327,11 @@ class AndersonMixer:
             regularized = gram + self.regularization * scale * cp.eye(
                 len(self._y), dtype=cp.float64)
             try:
-                condition = float(cp.linalg.cond(regularized).item())
+                gram_eigenvalues = cp.linalg.eigvalsh(regularized)
+                smallest = float(gram_eigenvalues[0].item())
+                largest = float(gram_eigenvalues[-1].item())
+                condition = (
+                    largest / smallest if smallest > 0.0 else np.inf)
                 coefficients = cp.linalg.solve(regularized, rhs)
                 if (not bool(cp.all(cp.isfinite(coefficients)).item())
                         or float(cp.max(cp.abs(coefficients)).item())
@@ -343,7 +348,7 @@ class AndersonMixer:
                         preconditioned.value_g, context))
                 step_r = zero_mean_real(step_r)
                 preconditioner_diagnostics = preconditioned.diagnostics
-            except (FloatingPointError, cp.linalg.LinAlgError):
+            except (FloatingPointError, LinAlgError):
                 fallback = True
                 self.reset()
                 step_r, preconditioner_diagnostics = self._simple_step(
