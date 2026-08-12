@@ -109,7 +109,23 @@ def _initial_potential(solver, dm0):
     # This seed evaluation is accepted as a warm-start source.  The first
     # fixed-N evaluation below remains transactional relative to it.
     ni.pot_guess = _copy_optional(grid.lpbe_pot_guess)
-    return vlocal_g
+    electron_number = solver.weight * sum(
+        float(cp.einsum('ij,ji->', d, s).real.item())
+        for d, s in zip(dm, solver.s_ao))
+    return vlocal_g, electron_number
+
+
+def _hamiltonian_from_potential(solver, v_in_g):
+    ni = _numint(solver)
+    local_ao = cp.asarray(ni.local_potential_to_ao(
+        v_in_g, kpts=solver.mf.kpts, hermi=1))
+    if local_ao.shape != (solver.nkpts, solver.nao, solver.nao):
+        raise ValueError('local-potential AO conversion has the wrong shape')
+    h_ao = cp.stack([
+        hcore + local_ao[k]
+        for k, hcore in enumerate(solver.hcore_ao)
+    ])
+    return solver._sanitize_h(solver._to_orth(h_ao))
 
 
 def evaluate_fixed_n_potential(solver, v_in_g, nelec):
@@ -119,16 +135,7 @@ def evaluate_fixed_n_potential(solver, v_in_g, nelec):
     v_in_g = _validate_vlocal(v_in_g, mesh, 'input local potential')
     accepted_lpbe_guess = _copy_optional(ni.pot_guess)
 
-    local_ao = ni.local_potential_to_ao(
-        v_in_g, kpts=solver.mf.kpts, hermi=1)
-    local_ao = cp.asarray(local_ao)
-    if local_ao.shape != (solver.nkpts, solver.nao, solver.nao):
-        raise ValueError('local-potential AO conversion has the wrong shape')
-    h_ao = cp.stack([
-        hcore + local_ao[k]
-        for k, hcore in enumerate(solver.hcore_ao)
-    ])
-    h = solver._sanitize_h(solver._to_orth(h_ao))
+    h = _hamiltonian_from_potential(solver, v_in_g)
 
     try:
         electronic = solver.calculate_cycle(
@@ -212,23 +219,237 @@ def _score(cycle, grid_tolerance, matrix_tolerance):
         cycle.electronic.residual_rms / matrix_tolerance)
 
 
+def _run_fixed_n_potential(solver, v0_g, nelec, config, tolerance,
+                           target_mu=None):
+    """Converge one fixed-N sample without finalizing public solver state."""
+    preconditioner_object = _make_preconditioner(
+        config.preconditioner, config.q0_sq, config.a_out,
+        config.b_metal, config.preconditioner_tol,
+        config.preconditioner_maxiter)
+    mixer = potential_mixing.AndersonMixer(
+        alpha=config.alpha, history=config.anderson_space,
+        max_step_rms=config.max_step_rms,
+        max_step_abs=config.max_step_abs)
+
+    current = evaluate_fixed_n_potential(solver, v0_g, nelec)
+    commit_potential_cycle(solver, current)
+    context = _context(solver, current.cavity_r)
+    mixer.accept(current.v_in_g, current.residual_g, context)
+    solver.cycles += 1
+    local_cycles = 1
+    best = current
+    best_score = _score(current, tolerance, tolerance)
+    converged = False
+    message = 'maximum fixed-N potential cycles reached'
+
+    logger.info(
+        solver,
+        'Potential cycle %d  N = %.12g  mu = %.12g  A = %.12g  '
+        'grid residual = %.6g  matrix residual = %.6g  delta V0 = %.6g',
+        solver.cycles, nelec, current.electronic.mu,
+        current.electronic.free_energy, current.grid_residual_rms,
+        current.electronic.residual_rms, current.delta_v0)
+
+    while local_cycles < solver.max_cycle:
+        active_tolerance = (
+            solver.conv_tol
+            if (target_mu is not None and
+                abs(current.electronic.mu-target_mu)
+                < solver.tighten_mu_threshold)
+            else tolerance)
+        if (current.grid_residual_rms <= active_tolerance and
+                current.electronic.residual_rms <= active_tolerance):
+            converged = True
+            message = 'converged fixed-N potential residuals'
+            break
+
+        context = _context(solver, current.cavity_r)
+        proposal = mixer.propose(
+            current.v_in_g, current.residual_g,
+            preconditioner_object, context)
+        step_g = proposal.step_g
+        accepted = None
+        rejected = 0
+        for contraction in range(config.max_backtracks + 1):
+            scale = 0.5 ** contraction
+            trial_v_g = current.v_in_g + scale * step_g
+            trial = evaluate_fixed_n_potential(solver, trial_v_g, nelec)
+            trial.mixing_diagnostics = proposal.diagnostics
+            growth_limit = (
+                config.residual_growth_factor
+                * max(current.grid_residual_rms,
+                      np.finfo(float).tiny))
+            if trial.grid_residual_rms <= growth_limit:
+                accepted = trial
+                break
+            rejected += 1
+            logger.info(
+                solver,
+                'Rejected potential trial contraction %.6g  grid '
+                'residual %.6g > %.6g',
+                scale, trial.grid_residual_rms, growth_limit)
+
+        if accepted is None:
+            mixer.reset()
+            message = (
+                'potential step rejected after %d backtracks' %
+                config.max_backtracks)
+            break
+        if rejected:
+            mixer.reset()
+
+        current = accepted
+        commit_potential_cycle(solver, current)
+        context = _context(solver, current.cavity_r)
+        mixer.accept(current.v_in_g, current.residual_g, context)
+        solver.cycles += 1
+        local_cycles += 1
+        score = _score(current, tolerance, tolerance)
+        if score < best_score:
+            best = current
+            best_score = score
+        logger.info(
+            solver,
+            'Potential cycle %d  N = %.12g  mu = %.12g  A = %.12g  '
+            'grid residual = %.6g  matrix residual = %.6g  '
+            'step RMS = %.6g  backtracks = %d',
+            solver.cycles, nelec, current.electronic.mu,
+            current.electronic.free_energy, current.grid_residual_rms,
+            current.electronic.residual_rms,
+            proposal.diagnostics.step_rms, rejected)
+        if callable(solver.callback):
+            solver.callback({
+                'solver': solver,
+                'cycle_data': current.electronic,
+                'potential_cycle': current,
+                'best_cycle_data': best.electronic,
+                'best_potential_cycle': best,
+                'cycle': solver.cycles,
+                'electron_number': nelec,
+                'rejected_trials': rejected,
+            })
+
+    active_tolerance = (
+        solver.conv_tol
+        if (target_mu is not None and
+            abs(current.electronic.mu-target_mu)
+            < solver.tighten_mu_threshold)
+        else tolerance)
+    if (current.grid_residual_rms <= active_tolerance and
+            current.electronic.residual_rms <= active_tolerance):
+        converged = True
+        message = 'converged fixed-N potential residuals'
+        best = current
+    chosen = current if converged else best
+    commit_potential_cycle(solver, chosen)
+    return chosen, converged, message
+
+
+def _fixed_mu_potential(solver, initial_v_g, initial_nelec, config):
+    samples = []
+    current_n = float(initial_nelec)
+    margin = min(solver.root_nelec_tol, 0.25 * solver.capacity)
+    current_n = min(solver.capacity-margin, max(margin, current_n))
+    current_v_g = initial_v_g
+    best = None
+    best_score = np.inf
+    distinct = []
+
+    for unused_pass in range(4 * solver.max_outer_cycle + 4):
+        distinct_tol = max(
+            solver.root_nelec_tol,
+            32 * np.finfo(float).eps * max(1.0, abs(current_n)))
+        is_distinct = not any(
+            abs(value-current_n) <= distinct_tol for value in distinct)
+        if is_distinct:
+            if len(distinct) >= solver.max_outer_cycle:
+                solver.message = 'maximum fixed-mu outer cycles reached'
+                break
+            distinct.append(current_n)
+            solver.outer_cycles += 1
+        else:
+            solver.refinements += 1
+
+        tolerance = solver.conv_tol_coarse
+        if samples:
+            minimum_error = min(abs(sample.delta_mu) for sample in samples)
+            tolerance = min(tolerance, minimum_error ** 1.8)
+            tolerance = max(tolerance, solver.conv_tol)
+        state, fixed_n_converged, fixed_n_message = _run_fixed_n_potential(
+            solver, current_v_g, current_n, config, tolerance,
+            target_mu=solver.mu)
+        if not fixed_n_converged:
+            if best is None:
+                best = state
+            solver.message = 'fixed-N inner solve failed: ' + fixed_n_message
+            break
+
+        error = state.electronic.mu - solver.mu
+        sample = SimpleNamespace(
+            cycle_data=state.electronic, potential_cycle=state,
+            delta_mu=error, nelec=state.electronic.nelec,
+            fixed_n_calc=None)
+        samples = [old for old in samples
+                   if abs(old.nelec-sample.nelec) > solver.root_nelec_tol]
+        samples.append(sample)
+        score = abs(error) / solver.conv_tol_mu
+        if score < best_score:
+            best = state
+            best_score = score
+        logger.info(
+            solver,
+            'Fixed-mu potential outer cycle %d  N = %.12g  optimized '
+            'mu = %.12g  delta mu = %.3g  grid residual = %.6g  '
+            'matrix residual = %.6g',
+            solver.outer_cycles, current_n, state.electronic.mu, error,
+            state.grid_residual_rms, state.electronic.residual_rms)
+
+        if abs(error) <= solver.conv_tol_mu:
+            solver.message = 'converged fixed-mu potential secant search'
+            return state, True
+
+        bracket_indices = solver.search_mu_root_bracket(
+            [value.nelec for value in samples],
+            [value.delta_mu for value in samples])
+        if bracket_indices is not None:
+            left, right = (samples[index] for index in bracket_indices)
+            if abs(right.nelec-left.nelec) <= solver.root_nelec_tol:
+                solver.message = (
+                    'fixed-mu potential electron-number bracket stagnated')
+                break
+
+        proposal = solver.secant_proposal(samples, state.electronic.h)
+        if abs(proposal-current_n) <= 1e-14 * max(1.0, abs(current_n)):
+            solver.message = 'fixed-mu potential secant search stagnated'
+            break
+        # Transport only the converged potential and physical LPBE warm start;
+        # _run_fixed_n_potential constructs a fresh Anderson history.
+        current_v_g = state.v_in_g.copy()
+        current_n = proposal
+    else:  # pragma: no cover
+        solver.message = 'fixed-mu potential safety iteration limit reached'
+
+    if best is None:
+        raise RuntimeError(
+            solver.message or 'fixed-mu potential search produced no state')
+    commit_potential_cycle(solver, best)
+    return best, False
+
+
 def potential_scf(self, dm0=None, v0_g=None, preconditioner='identity',
                   alpha=0.2, anderson_space=0, potential_conv_tol=None,
                   q0_sq=1.0, a_out=1.0, b_metal=0.1,
                   preconditioner_tol=1e-8, preconditioner_maxiter=200,
                   max_step_rms=0.5, max_step_abs=2.0,
-                  residual_growth_factor=2.0, max_backtracks=6):
-    """Run the opt-in fixed-N LPBE potential-space SCF backend.
+                  residual_growth_factor=2.0, max_backtracks=6,
+                  initial_nelec=None):
+    """Run the opt-in LPBE potential-space SCF backend.
 
     ``R_G = V_out,G - V_in,G`` is used throughout.  Rejected contractions
     restore the accepted physical LPBE warm start and never enter Anderson
     history.
     """
     self.build()
-    if self.nelec is None:
-        raise NotImplementedError(
-            'potential_scf fixed-mu integration requires the fixed-N '
-            'potential gate first')
     if potential_conv_tol is None:
         potential_conv_tol = self.conv_tol
     potential_conv_tol = float(potential_conv_tol)
@@ -249,118 +470,32 @@ def potential_scf(self, dm0=None, v0_g=None, preconditioner='identity',
     self.message = ''
     ni = _numint(self)
     if v0_g is None:
-        v0_g = _initial_potential(self, dm0)
+        v0_g, density_nelec = _initial_potential(self, dm0)
+        if initial_nelec is None:
+            initial_nelec = density_nelec
     else:
         v0_g = _validate_vlocal(v0_g, ni.mesh, 'initial local potential')
+    if initial_nelec is not None:
+        initial_nelec = float(initial_nelec)
+    config = SimpleNamespace(
+        preconditioner=preconditioner, alpha=alpha,
+        anderson_space=anderson_space, q0_sq=q0_sq, a_out=a_out,
+        b_metal=b_metal, preconditioner_tol=preconditioner_tol,
+        preconditioner_maxiter=preconditioner_maxiter,
+        max_step_rms=max_step_rms, max_step_abs=max_step_abs,
+        residual_growth_factor=residual_growth_factor,
+        max_backtracks=max_backtracks)
 
-    preconditioner_object = _make_preconditioner(
-        preconditioner, q0_sq, a_out, b_metal,
-        preconditioner_tol, preconditioner_maxiter)
-    mixer = potential_mixing.AndersonMixer(
-        alpha=alpha, history=anderson_space,
-        max_step_rms=max_step_rms, max_step_abs=max_step_abs)
-
-    current = evaluate_fixed_n_potential(self, v0_g, self.nelec)
-    commit_potential_cycle(self, current)
-    context = _context(self, current.cavity_r)
-    mixer.accept(current.v_in_g, current.residual_g, context)
-    self.cycles = 1
-    best = current
-    best_score = _score(current, potential_conv_tol, self.conv_tol)
-    converged = False
-
-    logger.info(
-        self,
-        'Potential cycle %d  N = %.12g  mu = %.12g  A = %.12g  '
-        'grid residual = %.6g  matrix residual = %.6g  delta V0 = %.6g',
-        self.cycles, self.nelec, current.electronic.mu,
-        current.electronic.free_energy, current.grid_residual_rms,
-        current.electronic.residual_rms, current.delta_v0)
-
-    while self.cycles < self.max_cycle:
-        if (current.grid_residual_rms <= potential_conv_tol and
-                current.electronic.residual_rms <= self.conv_tol):
-            converged = True
-            self.message = 'converged fixed-N potential residuals'
-            break
-
-        context = _context(self, current.cavity_r)
-        proposal = mixer.propose(
-            current.v_in_g, current.residual_g,
-            preconditioner_object, context)
-        step_g = proposal.step_g
-        accepted = None
-        rejected = 0
-        for contraction in range(max_backtracks + 1):
-            scale = 0.5 ** contraction
-            trial_v_g = current.v_in_g + scale * step_g
-            trial = evaluate_fixed_n_potential(
-                self, trial_v_g, self.nelec)
-            trial.mixing_diagnostics = proposal.diagnostics
-            growth_limit = (
-                residual_growth_factor
-                * max(current.grid_residual_rms,
-                      np.finfo(float).tiny))
-            if trial.grid_residual_rms <= growth_limit:
-                accepted = trial
-                break
-            rejected += 1
-            logger.info(
-                self,
-                'Rejected potential trial contraction %.6g  grid '
-                'residual %.6g > %.6g',
-                scale, trial.grid_residual_rms, growth_limit)
-
-        if accepted is None:
-            mixer.reset()
-            self.message = (
-                'potential step rejected after %d backtracks' %
-                max_backtracks)
-            break
-        if rejected:
-            mixer.reset()
-
-        current = accepted
-        commit_potential_cycle(self, current)
-        context = _context(self, current.cavity_r)
-        mixer.accept(current.v_in_g, current.residual_g, context)
-        self.cycles += 1
-        score = _score(current, potential_conv_tol, self.conv_tol)
-        if score < best_score:
-            best = current
-            best_score = score
-        logger.info(
-            self,
-            'Potential cycle %d  N = %.12g  mu = %.12g  A = %.12g  '
-            'grid residual = %.6g  matrix residual = %.6g  '
-            'step RMS = %.6g  backtracks = %d',
-            self.cycles, self.nelec, current.electronic.mu,
-            current.electronic.free_energy, current.grid_residual_rms,
-            current.electronic.residual_rms,
-            proposal.diagnostics.step_rms, rejected)
-        if callable(self.callback):
-            self.callback({
-                'solver': self,
-                'cycle_data': current.electronic,
-                'potential_cycle': current,
-                'best_cycle_data': best.electronic,
-                'best_potential_cycle': best,
-                'cycle': self.cycles,
-                'electron_number': self.nelec,
-                'rejected_trials': rejected,
-            })
+    if self.nelec is None:
+        if initial_nelec is None:
+            initial_h = _hamiltonian_from_potential(self, v0_g)
+            initial_nelec = self.nelec_at_mu(initial_h, self.mu)
+        best, converged = _fixed_mu_potential(
+            self, v0_g, initial_nelec, config)
     else:
-        self.message = 'maximum fixed-N potential cycles reached'
+        best, converged, self.message = _run_fixed_n_potential(
+            self, v0_g, self.nelec, config, potential_conv_tol)
 
-    if (current.grid_residual_rms <= potential_conv_tol and
-            current.electronic.residual_rms <= self.conv_tol):
-        converged = True
-        self.message = 'converged fixed-N potential residuals'
-        best = current
-    elif not self.message:
-        self.message = 'maximum fixed-N potential cycles reached'
-
-    commit_potential_cycle(self, best)
     self._potential_cycle = best
     logger.info(
         self, '%s; total Fock/LPBE evaluations = %d',
