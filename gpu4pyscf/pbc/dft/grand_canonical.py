@@ -651,6 +651,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             and ratio > self.diis_trust_expand
             and actual_reduction / scale >= self.diis_expand_reduction
             and step >= starting * (1.0 - 1e-12)
+            and False
         ):
             damp *= self.diis_expansion
         return min(1.0, max(self.min_damp, damp)), ratio
