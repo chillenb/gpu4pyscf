@@ -18,6 +18,7 @@ class _PotentialNumInt:
         self.target_g = cp.asarray(target_g, dtype=cp.complex128)
         self.pot_guess = cp.asarray([99.0])
         self.calls = 0
+        self.cavity_by_call = None
         self.libxc = None
 
     def local_potential_to_ao(self, vlocal_g, kpts=None, hermi=1):
@@ -69,7 +70,11 @@ class _PotentialKRKS:
         matrix = ni.local_potential_to_ao(ni.target_g, kpts=self.kpts)
         grid = SimpleNamespace(
             vlocal_g=ni.target_g.copy(),
-            cavity_r=cp.zeros(ni.mesh),
+            cavity_r=(
+                cp.zeros(ni.mesh)
+                if ni.cavity_by_call is None
+                else cp.asarray(ni.cavity_by_call[
+                    min(ni.calls-1, len(ni.cavity_by_call)-1)])),
             lpbe_pot_guess=candidate.copy(),
         )
         return tag_array(matrix, ecoul=0.0, exc=0.0, lpbe_grid=grid)
@@ -171,6 +176,31 @@ def test_initial_density_supplies_first_potential(setup):
     cp.testing.assert_allclose(
         solver._potential_cycle.v_in_g, target_g,
         rtol=0.0, atol=2e-13)
+
+
+def test_material_cavity_change_resets_history(setup, monkeypatch):
+    mf, solver, unused_target = setup
+    mf._numint.cavity_by_call = [
+        cp.zeros(mf._numint.mesh), cp.ones(mf._numint.mesh)]
+    reset_calls = []
+    original_reset = potential.potential_mixing.AndersonMixer.reset
+
+    def counting_reset(mixer):
+        reset_calls.append(True)
+        return original_reset(mixer)
+
+    monkeypatch.setattr(
+        potential.potential_mixing.AndersonMixer, 'reset', counting_reset)
+    solver.max_cycle = 4
+    solver.potential_scf(
+        v0_g=cp.asarray([4.0, -2.0, -2.0]),
+        preconditioner='identity', alpha=1.0, anderson_space=3,
+        potential_conv_tol=1e-11, max_step_rms=100.0,
+        max_step_abs=100.0, cavity_change_threshold=0.2)
+
+    # One reset initializes the mixer and the second clears accepted history
+    # after the deliberately discontinuous cavity update.
+    assert len(reset_calls) >= 2
 
 
 def test_fixed_mu_potential_driver_uses_fixed_n_root(setup):
