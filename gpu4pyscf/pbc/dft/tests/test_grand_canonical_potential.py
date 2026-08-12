@@ -166,11 +166,26 @@ def test_opt_in_fixed_n_potential_driver_converges(setup, preconditioner):
 
 
 def test_initial_density_supplies_first_potential(setup):
-    unused_mf, solver, target_g = setup
+    mf, solver, target_g = setup
+    requested_keys = []
+
+    # GPU KRKS accepts ``key`` but gets its k-points from the object.
+    def gpu_krks_initial_guess(cell=None, key='minao', s1e=None):
+        requested_keys.append(key)
+        return cp.ones((1, 1, 1))
+
+    mf.init_guess = 'atom'
+    mf.get_init_guess = gpu_krks_initial_guess
+    dm = potential._initial_dm(solver, None)
+    assert dm.shape == (solver.nkpts, solver.nao, solver.nao)
+    assert requested_keys == ['atom']
+
+    requested_keys.clear()
     solver.max_cycle = 3
     solver.potential_scf(
         preconditioner='identity', alpha=0.5,
         potential_conv_tol=1e-11)
+    assert requested_keys == ['atom']
     assert solver.converged
     assert solver.nfev == 2
     cp.testing.assert_allclose(

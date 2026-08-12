@@ -75,17 +75,20 @@ def _validate_vlocal(vlocal_g, mesh, name='local potential'):
 
 def _initial_dm(solver, dm0):
     if dm0 is None:
-        kwargs = {'kpts': solver.mf.kpts}
+        attempts = []
         if hasattr(solver.mf, 'init_guess'):
-            kwargs['key'] = solver.mf.init_guess
-        try:
-            dm0 = solver.mf.get_init_guess(solver.cell, **kwargs)
-        except TypeError:
-            kwargs.pop('key', None)
+            attempts.extend((
+                {'kpts': solver.mf.kpts, 'key': solver.mf.init_guess},
+                {'key': solver.mf.init_guess},
+            ))
+        attempts.extend(({'kpts': solver.mf.kpts}, {}))
+        for kwargs in attempts:
             try:
                 dm0 = solver.mf.get_init_guess(solver.cell, **kwargs)
+                break
             except TypeError:
-                dm0 = solver.mf.get_init_guess(solver.cell)
+                if not kwargs:
+                    raise
     dm = cp.asarray(dm0)
     if dm.ndim == 2 and solver.nkpts == 1:
         dm = dm[None]
