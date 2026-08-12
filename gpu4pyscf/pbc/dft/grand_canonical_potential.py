@@ -302,6 +302,17 @@ def _run_fixed_n_potential(solver, v0_g, nelec, config, grid_tolerance,
         if rejected:
             mixer.reset()
 
+        cavity_change = float(cp.max(cp.abs(
+            accepted.cavity_r-current.cavity_r)).item())
+        if cavity_change > config.cavity_change_threshold:
+            mixer.reset()
+            if hasattr(preconditioner_object, 'reset'):
+                preconditioner_object.reset()
+            logger.info(
+                solver,
+                'Reset potential history after cavity change %.6g > %.6g',
+                cavity_change, config.cavity_change_threshold)
+
         current = accepted
         commit_potential_cycle(solver, current)
         context = _context(solver, current.cavity_r)
@@ -454,7 +465,7 @@ def potential_scf(self, dm0=None, v0_g=None, preconditioner='identity',
                   preconditioner_tol=1e-8, preconditioner_maxiter=200,
                   max_step_rms=0.5, max_step_abs=2.0,
                   residual_growth_factor=2.0, max_backtracks=6,
-                  initial_nelec=None):
+                  initial_nelec=None, cavity_change_threshold=0.1):
     """Run the opt-in LPBE potential-space SCF backend.
 
     ``R_G = V_out,G - V_in,G`` is used throughout.  Rejected contractions
@@ -472,6 +483,11 @@ def potential_scf(self, dm0=None, v0_g=None, preconditioner='identity',
         raise ValueError('residual_growth_factor must exceed one')
     if not isinstance(max_backtracks, int) or max_backtracks < 0:
         raise ValueError('max_backtracks must be a nonnegative integer')
+    cavity_change_threshold = float(cavity_change_threshold)
+    if (not np.isfinite(cavity_change_threshold)
+            or cavity_change_threshold < 0.0):
+        raise ValueError(
+            'cavity_change_threshold must be finite and nonnegative')
 
     self.dump_flags()
     self.converged = False
@@ -497,7 +513,8 @@ def potential_scf(self, dm0=None, v0_g=None, preconditioner='identity',
         max_step_rms=max_step_rms, max_step_abs=max_step_abs,
         residual_growth_factor=residual_growth_factor,
         max_backtracks=max_backtracks,
-        potential_conv_tol=potential_conv_tol)
+        potential_conv_tol=potential_conv_tol,
+        cavity_change_threshold=cavity_change_threshold)
     logger.info(
         self,
         'Potential backend: preconditioner=%s alpha=%.6g Anderson space=%d '
