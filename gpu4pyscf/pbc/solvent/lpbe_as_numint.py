@@ -528,8 +528,14 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
     if with_j:
         xc_for_fock[0] += coulomb_on_g_mesh + vcorr_g
 
+    # Reciprocal GGA differentiation can leave imaginary values on Nyquist
+    # planes.  The existing AO conversion projects through ``ifft(...).real``;
+    # expose that same physical real scalar field, in normalized G space, so
+    # potential mixing starts from an exactly Hermitian representation.
+    vlocal_g = pbc_tools.fft(
+        pbc_tools.ifft(xc_for_fock[0], mesh).real.reshape(-1), mesh)
     grid_result = LPBEGridResult(
-        vlocal_g=xc_for_fock[0].copy(),
+        vlocal_g=vlocal_g.reshape(-1).copy(),
         rho_g=rho_g,
         cavity_r=lpbe_res['cavity_r'].copy(),
         eps_r=lpbe_res['eps_r'].copy(),
