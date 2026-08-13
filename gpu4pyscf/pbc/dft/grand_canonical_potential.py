@@ -216,12 +216,6 @@ def _make_preconditioner(kind, q0_sq, a_out, b_metal,
         'or an object with apply()')
 
 
-def _score(cycle, grid_tolerance, matrix_tolerance):
-    return max(
-        cycle.grid_residual_rms / grid_tolerance,
-        cycle.electronic.residual_rms / matrix_tolerance)
-
-
 def _run_fixed_n_potential(solver, v0_g, nelec, config, grid_tolerance,
                            matrix_tolerance, target_mu=None):
     """Converge one fixed-N sample without finalizing public solver state."""
@@ -241,7 +235,7 @@ def _run_fixed_n_potential(solver, v0_g, nelec, config, grid_tolerance,
     solver.cycles += 1
     local_cycles = 1
     best = current
-    best_score = _score(current, grid_tolerance, matrix_tolerance)
+    best_free_energy = current.electronic.free_energy
     converged = False
     message = 'maximum fixed-N potential cycles reached'
 
@@ -322,10 +316,10 @@ def _run_fixed_n_potential(solver, v0_g, nelec, config, grid_tolerance,
         mixer.accept(current.v_in_g, current.residual_g, context)
         solver.cycles += 1
         local_cycles += 1
-        score = _score(current, grid_tolerance, matrix_tolerance)
-        if score < best_score:
+        free_energy = current.electronic.free_energy
+        if free_energy < best_free_energy:
             best = current
-            best_score = score
+            best_free_energy = free_energy
         preconditioner_diagnostics = proposal.diagnostics.preconditioner
         inner = preconditioner_diagnostics.inner
         inner_iterations = 0 if inner is None else inner.iterations
@@ -364,7 +358,6 @@ def _run_fixed_n_potential(solver, v0_g, nelec, config, grid_tolerance,
             current.electronic.residual_rms <= active_matrix_tolerance):
         converged = True
         message = 'converged fixed-N potential residuals'
-        best = current
     chosen = current if converged else best
     commit_potential_cycle(solver, chosen)
     return chosen, converged, message
