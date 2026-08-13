@@ -193,6 +193,40 @@ def test_initial_density_supplies_first_potential(setup):
         rtol=0.0, atol=2e-13)
 
 
+def test_nonconverged_fixed_n_uses_minimum_free_energy(setup):
+    mf, solver, unused_target = setup
+    current_and_best = []
+
+    def scheduled_energy(dm, hcore, veff):
+        return (-2.0 if mf._numint.calls == 1 else -1.0), 0.0
+
+    def callback(environment):
+        current_and_best.append((
+            environment['cycle_data'].free_energy,
+            environment['best_cycle_data'].free_energy,
+            environment['potential_cycle'].grid_residual_rms,
+            environment['best_potential_cycle'].grid_residual_rms,
+        ))
+
+    mf.energy_elec = scheduled_energy
+    solver.callback = callback
+    solver.max_cycle = 2
+    solver.potential_scf(
+        v0_g=cp.asarray([4.0, -2.0, -2.0]),
+        preconditioner='identity', alpha=0.5, anderson_space=0,
+        potential_conv_tol=1e-30,
+        max_step_rms=100.0, max_step_abs=100.0)
+
+    assert not solver.converged
+    assert len(current_and_best) == 1
+    current_energy, best_energy, current_residual, best_residual = (
+        current_and_best[0])
+    assert current_energy > best_energy
+    assert current_residual < best_residual
+    assert solver.free_energy == best_energy
+    assert solver.potential_residual_rms == best_residual
+
+
 def test_material_cavity_change_resets_history(setup, monkeypatch):
     mf, solver, unused_target = setup
     mf._numint.cavity_by_call = [
