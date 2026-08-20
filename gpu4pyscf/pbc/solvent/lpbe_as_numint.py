@@ -18,10 +18,11 @@ from pyscf.pbc.df.df_jk import _format_kpts_band
 from pyscf.pbc.gto.pseudo import pp_int
 from pyscf.pbc.lib.kpts_helper import is_gamma_point
 from gpu4pyscf.dft import numint
+from gpu4pyscf.gpu4pyscf.pbc.gto.cell import get_Gv_weights
 from gpu4pyscf.pbc.df.fft_jk import _format_dms, _format_jks
 from gpu4pyscf.lib import logger, utils
 from gpu4pyscf.pbc.tools import pbc as pbc_tools
-from gpu4pyscf.lib.cupy_helper import contract, tag_array
+from gpu4pyscf.lib.cupy_helper import batched_vec_norm2, contract, tag_array
 
 import gpu4pyscf.pbc.dft.multigrid as multigrid_v1
 import gpu4pyscf.pbc.dft.multigrid_v2 as multigrid_v2
@@ -143,6 +144,45 @@ def divergence_recip(Fv, Gv, out=None):
     return div_F
 
 
+def pseudocore_density(cell, mesh):
+    assert cell.dimension == 3
+    Gv, (basex, basey, basez) = get_Gv_weights(cell, mesh)[:2]
+    b = cell.reciprocal_vectors()
+    coords = cell.atom_coords()
+    rb = cp.asarray(coords.dot(b.T))
+    SIx = cp.exp(-1j*rb[:,0,None] * basex)
+    SIy = cp.exp(-1j*rb[:,1,None] * basey)
+    SIz = cp.exp(-1j*rb[:,2,None] * basez)
+    # G2 = contract('px,px->p', Gv, Gv)
+    G2 = batched_vec_norm2(Gv)
+    charges = cell.atom_charges()
+
+    rhocoreG = cp.zeros(len(G2), dtype=np.complex128)
+
+    for ia in range(cell.natm):
+        symb = cell.atom_symbol(ia)
+        if symb not in cell._pseudo:
+            continue
+
+        if charges[ia] == 0:
+            continue
+
+        pp = cell._pseudo[symb]
+        rloc = pp[1]
+
+        # pure Gaussian density
+        # with width rloc/2.5 and magnitude 1.0
+        rcore = rloc / 2.5
+        pcharge = 1.0
+
+
+        SI = (SIx[ia,:,None,None] * SIy[ia,:,None] * SIz[ia]).ravel()
+        G2_red = G2 * rcore**2
+        SI *= cp.exp(-0.5*G2_red)
+        rhocoreG += pcharge * SI
+    return rhocoreG
+
+
 
 def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
 
@@ -194,9 +234,11 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
     nuc_charge_by_integration = cp.sum(pseudo_nucdensityR) * vol / ngrids
     qsol = nelec_by_integration - nuc_charge_by_integration
 
+    pseudocore_densityG = pseudocore_density(cell, mesh)
+    pseudocore_densityR = pbc_tools.ifft(pseudocore_densityG.reshape(-1), mesh).real.reshape(*mesh) / weight
 
     RangePush("shape_function")
-    S, Sprime = shape_function(rhoR + pseudo_nucdensityR, cav_smear, cav_dens_cutoff)
+    S, Sprime = shape_function(rhoR + pseudocore_densityR, cav_smear, cav_dens_cutoff)
     RangePop()
 
     eps_r_field = 1. + (rel_permittivity - 1.) * S
