@@ -18,7 +18,7 @@ from pyscf.pbc.df.df_jk import _format_kpts_band
 from pyscf.pbc.gto.pseudo import pp_int
 from pyscf.pbc.lib.kpts_helper import is_gamma_point
 from gpu4pyscf.dft import numint
-from gpu4pyscf.gpu4pyscf.pbc.gto.cell import get_Gv_weights
+from gpu4pyscf.pbc.gto.cell import get_Gv_weights
 from gpu4pyscf.pbc.df.fft_jk import _format_dms, _format_jks
 from gpu4pyscf.lib import logger, utils
 from gpu4pyscf.pbc.tools import pbc as pbc_tools
