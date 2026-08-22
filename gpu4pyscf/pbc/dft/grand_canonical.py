@@ -30,9 +30,11 @@ from scipy.interpolate import PchipInterpolator
 from scipy.special import expit
 
 from pyscf import __config__, lib
+from pyscf.scf import chkfile
 from pyscf.scf.addons import _fermi_smearing_occ, _smearing_optimize
 
 from gpu4pyscf.lib import diis, logger
+from gpu4pyscf.scf import hf as mol_hf
 from gpu4pyscf.pbc.dft.grand_canonical_cg import fixed_mu_diis, nlcg
 from gpu4pyscf.pbc.dft.grand_canonical_potential import potential_scf
 
@@ -245,6 +247,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.verbose = getattr(mf, 'verbose', logger.NOTE)
         self.stdout = getattr(mf, 'stdout', None)
         self.max_memory = getattr(mf, 'max_memory', 0)
+        self.chkfile = getattr(mf, 'chkfile', None)
 
         self.converged = False
         self.cycles = 0
@@ -357,6 +360,12 @@ class GrandCanonicalKRKS(lib.StreamObject):
             raise ValueError('min_damp may not exceed 1')
         return self
 
+    def dump_chk(self, envs):
+        if self.chkfile:
+            self.mf.chkfile = self.chkfile
+            self.mf.dump_chk(envs)
+        return self
+
     def build(self):
         if self._built:
             return self
@@ -384,6 +393,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
             raise ValueError('kpts must have shape (nkpts,3)')
         self.nkpts = len(self.kpts)
         self.weight = 1. / self.nkpts
+
+        self.mf.chkfile = self.chkfile
 
         if hasattr(self.mf, 'build'):
             self.mf.build()
@@ -656,7 +667,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             damp *= self.diis_expansion
         return min(1.0, max(self.min_damp, damp)), ratio
 
-    def fixed_n_subproblem(self, fixed_n_calc, tolerance, target_mu=None):
+    def fixed_n_subproblem(self, fixed_n_calc, tolerance, target_mu=None, dump_chk=False):
         fixed_n_calc.converged = False
         fixed_n_calc.message = 'maximum fixed-N cycles reached'
         original_tolerance = tolerance
@@ -705,6 +716,16 @@ class GrandCanonicalKRKS(lib.StreamObject):
                 step,
                 ratio,
             )
+
+            if dump_chk and self.chkfile:
+                mo_coeff = [x.dot(c) for x, c in zip(self.x_ao2orth, trial.coeff)]
+                self.dump_chk({
+                    'e_tot': trial.e_tot,
+                    'mo_coeff': _stack_or_list(mo_coeff),
+                    'mo_occ': _stack_or_list([2.*x for x in trial.occ]),
+                    'mo_energy': _stack_or_list(trial.eig),
+                })
+
             if callable(self.callback):
                 self.callback({
                     'solver': self,
@@ -1364,7 +1385,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.mf.scf_summary.update(self.scf_summary)
         return self.e_tot
 
-    def kernel(self, dm0=None, h=None, initial_nelec=None):
+    def kernel(self, dm0=None, h=None, initial_nelec=None, dump_chk=True):
         self.build()
         self.dump_flags()
         self.converged = False
@@ -1373,6 +1394,10 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.nfev = 0
         self.refinements = 0
         self.message = ''
+
+        if dump_chk and self.chkfile:
+            chkfile.save_mol(self.cell, self.chkfile)
+
         if h is None:
             h, initial_nelec = self._initial_h(dm0)
         if initial_nelec is None:
@@ -1383,7 +1408,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             cycle_data, converged = self._kernel_fixed_mu(h, initial_nelec)
         else:
             fixed_n_calc = self.start_fixed_n_calc(h, self.nelec)
-            self.fixed_n_subproblem(fixed_n_calc, self.conv_tol)
+            self.fixed_n_subproblem(fixed_n_calc, self.conv_tol, dump_chk=dump_chk)
             self.message = fixed_n_calc.message
             cycle_data, converged = fixed_n_calc.cycle_data, fixed_n_calc.converged
         logger.info(self, '%s; total Fock evaluations = %d',
