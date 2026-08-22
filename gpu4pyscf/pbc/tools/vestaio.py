@@ -47,9 +47,9 @@ def write_vesta_pgrid(cell, mesh, filepath, data):
     if nvox > np.iinfo(np.int32).max:
         raise ValueError('number of voxels exceeds the VESTA int32 limit')
 
-    values = cp.asnumpy(data.ravel(order='F').astype(cp.float32))
-
-    assert values.size == nvox, 'data size does not match mesh dimensions'
+    assert data.size == nvox, 'data size does not match mesh dimensions'
+    values = cp.asnumpy(
+        data.reshape(mesh_tuple).ravel(order='F').astype(cp.float32))
 
     # VESTA records a first, then b, then c. This is Fortran order for an
     # array whose axes are (a, b, c), whereas PySCF flattens that array in C
