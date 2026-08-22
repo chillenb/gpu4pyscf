@@ -534,6 +534,10 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
                 field = pbc_tools.ifft(field.reshape(-1), mesh).real / weight
             write_vesta_pgrid(
                 cell, mesh, f'{ni.dump_vesta_prefix}_{name}.pgrid', field)
+        # write electron density
+        rho_r = pbc_tools.ifft(rho_g.reshape(-1), mesh).real.reshape(*mesh) / weight
+        write_vesta_pgrid(
+            cell, mesh, f'{ni.dump_vesta_prefix}_rho.pgrid', rho_r)
 
     ni.pot_guess = lpbe_res['pot_guess']
     vcorr_g = lpbe_res['vcorr_g']
