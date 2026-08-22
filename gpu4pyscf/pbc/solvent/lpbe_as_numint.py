@@ -22,6 +22,7 @@ from gpu4pyscf.pbc.gto.cell import get_Gv_weights
 from gpu4pyscf.pbc.df.fft_jk import _format_dms, _format_jks
 from gpu4pyscf.lib import logger, utils
 from gpu4pyscf.pbc.tools import pbc as pbc_tools
+from gpu4pyscf.pbc.tools.vestaio import write_vesta_pgrid
 from gpu4pyscf.lib.cupy_helper import batched_vec_norm2, contract, tag_array
 
 import gpu4pyscf.pbc.dft.multigrid as multigrid_v1
@@ -454,7 +455,8 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
 
 
 def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
-           kpts=None, kpts_band=None, with_j=True, verbose=None):
+           kpts=None, kpts_band=None, with_j=True, verbose=None,
+           dump_vesta_prefix=None):
     '''Compute the XC energy and RKS XC matrix at sampled k-points.
     multigrid version of function pbc.dft.numint.nr_rks.
 
@@ -468,6 +470,8 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
             A list of arbitrary "band" k-points at which to evalute the matrix.
         with_j : bool
             Whether to add the Coulomb matrix into the XC matrix.
+        dump_vesta_prefix : str or path-like, optional
+            Prefix for writing LPBE scalar fields in VESTA ``.pgrid`` format.
 
     Returns:
         exc : XC energy
@@ -522,6 +526,16 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
     lpbe_res = lpbe_inner(
         ni, rho_sf, coulomb_kernel_on_g_mesh, Gv,
         options=ni.options, pot_guess=ni.pot_guess)
+
+    if dump_vesta_prefix is not None:
+        for name, field in lpbe_res.items():
+            if getattr(field, 'ndim', 0) == 0 or field.size != ngrids:
+                continue
+            if name in ('vcorr_g', 'pot_guess'):
+                field = pbc_tools.ifft(field.reshape(-1), mesh).real / weight
+            write_vesta_pgrid(
+                cell, mesh, f'{dump_vesta_prefix}_{name}.pgrid', field)
+
     ni.pot_guess = lpbe_res['pot_guess']
     vcorr_g = lpbe_res['vcorr_g']
     Ecorr = float(cp.real(
