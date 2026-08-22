@@ -612,6 +612,7 @@ class LPBEMultiGridNumInt(MultiGridNumInt):
         if cell is not None:
             self.mesh = cell.mesh
         self.vpplocG = None
+        self.pseudocore_densityG = None
         self.pot_guess = None
         self._lpbe_mesh = None
         return self
