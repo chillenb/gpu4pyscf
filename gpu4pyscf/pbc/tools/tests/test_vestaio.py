@@ -4,20 +4,22 @@ import numpy as np
 import pytest
 
 from pyscf.lib import param
+import pyscf
 
 from gpu4pyscf.pbc.tools.vestaio import write_vesta_pgrid
 
 
-class _Cell:
-    def __init__(self, lattice_vectors):
-        self._lattice_vectors = np.asarray(lattice_vectors)
-
-    def lattice_vectors(self):
-        return self._lattice_vectors
-
 
 def test_write_vesta_pgrid_header_and_data_order(tmp_path):
-    cell = _Cell(np.diag([2.0, 3.0, 4.0]) / param.BOHR)
+    cell = pyscf.M(
+        atom = '''
+        O   0.000    0.    0.1174
+        H   1.757    0.    0.4696
+        H   0.757    0.    0.4696
+        ''',
+        a=np.eye(3)*7.,
+        basis=('ccpvdz', [[3, [.5, 1]]]),
+    )
     mesh = (2, 2, 2)
     data = np.arange(8.0).reshape(mesh)
     filepath = tmp_path / 'field.pgrid'
@@ -40,14 +42,30 @@ def test_write_vesta_pgrid_header_and_data_order(tmp_path):
 
 
 def test_write_vesta_pgrid_rejects_incompatible_data(tmp_path):
-    cell = _Cell(np.eye(3))
+    cell = pyscf.M(
+        atom = '''
+        O   0.000    0.    0.1174
+        H   1.757    0.    0.4696
+        H   0.757    0.    0.4696
+        ''',
+        a=np.eye(3)*7.,
+        basis=('ccpvdz', [[3, [.5, 1]]]),
+    )
     with pytest.raises(ValueError, match='mesh requires 8'):
         write_vesta_pgrid(cell, (2, 2, 2), tmp_path / 'field.pgrid',
                           np.zeros(7))
 
 
 def test_write_vesta_pgrid_rejects_complex_data(tmp_path):
-    cell = _Cell(np.eye(3))
+    cell = pyscf.M(
+        atom = '''
+        O   0.000    0.    0.1174
+        H   1.757    0.    0.4696
+        H   0.757    0.    0.4696
+        ''',
+        a=np.eye(3)*7.,
+        basis=('ccpvdz', [[3, [.5, 1]]]),
+    )
     with pytest.raises(ValueError, match='must be real'):
         write_vesta_pgrid(cell, (1, 1, 1), tmp_path / 'field.pgrid',
                           np.asarray([1.0j]))
