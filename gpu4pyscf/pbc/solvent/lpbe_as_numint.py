@@ -234,7 +234,7 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
     nuc_charge_by_integration = cp.sum(pseudo_nucdensityR) * vol / ngrids
     qsol = nelec_by_integration - nuc_charge_by_integration
 
-    pseudocore_densityG = pseudocore_density(cell, mesh)
+    pseudocore_densityG = ni.get_pseudocore_density()
     pseudocore_densityR = pbc_tools.ifft(pseudocore_densityG.reshape(-1), mesh).real.reshape(*mesh) / weight
 
     RangePush("shape_function")
@@ -603,6 +603,7 @@ class LPBEMultiGridNumInt(MultiGridNumInt):
         super().__init__(cell)
         self.options = options
         self.vpplocG = None
+        self.pseudocore_densityG = None
         self.pot_guess = None
         self._lpbe_mesh = None
 
@@ -623,6 +624,14 @@ class LPBEMultiGridNumInt(MultiGridNumInt):
             self.pot_guess = None
             self._lpbe_mesh = mesh
         return self.vpplocG
+
+    def get_pseudocore_density(self):
+        mesh = tuple(self.mesh)
+        if self.pseudocore_densityG is None or self._lpbe_mesh != mesh:
+            pseudocore_densityG = pseudocore_density(self.cell, self.mesh)
+            self.pseudocore_densityG = pseudocore_densityG
+            self._lpbe_mesh = mesh
+        return self.pseudocore_densityG
 
     def local_potential_to_ao(self, vlocal_g, kpts=None, hermi=1):
         """Convert one scalar reciprocal-space local potential to AO blocks.
