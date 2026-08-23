@@ -788,7 +788,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         margin = min(self.root_nelec_tol, 0.25 * self.capacity)
         return min(self.capacity - margin, max(margin, proposal))
 
-    def _kernel_fixed_mu(self, h, current_n, seed_samples=None):
+    def _kernel_fixed_mu(self, h, current_n, seed_samples=None, dump_chk=False):
         samples = list(seed_samples or ())
         margin = min(self.root_nelec_tol, 0.25 * self.capacity)
         current_n = min(self.capacity - margin, max(margin, current_n))
@@ -824,7 +824,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             else:
                 fixed_n_calc = pending
                 pending = None
-            self.fixed_n_subproblem(fixed_n_calc, tolerance, target_mu=self.mu)
+            self.fixed_n_subproblem(fixed_n_calc, tolerance, target_mu=self.mu, dump_chk=dump_chk)
             cycle_data = fixed_n_calc.cycle_data
             if not fixed_n_calc.converged:
                 if best is None:
@@ -868,7 +868,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             )
 
             if abs(error) <= self.diis_max_dmu:
-                return self.fixed_mu_diis_inner(h=cycle_data.h)
+                return self.fixed_mu_diis_inner(h=cycle_data.h, dump_chk=dump_chk)
 
 
             # root_ready = abs(error) <= self.conv_tol_mu
@@ -1411,7 +1411,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         if self.nelec is None:
             logger.info(self, 'Initial density electron number = %.12g',
                         initial_nelec)
-            cycle_data, converged = self._kernel_fixed_mu(h, initial_nelec)
+            cycle_data, converged = self._kernel_fixed_mu(h, initial_nelec, dump_chk=dump_chk)
         else:
             fixed_n_calc = self.start_fixed_n_calc(h, self.nelec)
             self.fixed_n_subproblem(fixed_n_calc, self.conv_tol, dump_chk=dump_chk)
