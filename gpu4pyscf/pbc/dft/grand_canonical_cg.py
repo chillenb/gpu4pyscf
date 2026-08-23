@@ -665,8 +665,8 @@ def fixed_mu_diis_inner(self, dm0=None, h=None, dump_chk=True):
             self.dump_chk({
                 'e_tot': state.e_tot,
                 'mo_coeff': mo_coeff,
-                'mo_occ': [ cp.asnumpy(2.*x) for x in state.occ],
-                'mo_energy': cp.asnumpy(state.eig),
+                'mo_occ': [cp.asnumpy(2.*x) for x in state.occ],
+                'mo_energy': [cp.asnumpy(x) for x in state.eig],
             })
 
     converged = state.residual_rms <= self.conv_tol
