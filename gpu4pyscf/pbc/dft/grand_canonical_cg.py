@@ -627,7 +627,7 @@ def fixed_mu_diis(self, dm0=None, h=None):
         if self._cycle_data is not None:
             h = self._cycle_data.h
         else:
-            h = self._initial_h(dm0)
+            h, _ = self._initial_h(dm0)
 
     state = self.calculate_cycle(h, mu=self.mu)
 
@@ -637,8 +637,10 @@ def fixed_mu_diis(self, dm0=None, h=None):
     for unused_cycle in range(self.max_cycle):
         if state.residual_rms <= self.conv_tol:
             break
+
         fock = self.diis_pack(state.fock)
         error = self.diis_pack(state.residual, weight_errors=False)
+
         target = self.diis_unpack(adiis.update(fock, xerr=error), state.fock)
         target = self._sanitize_h(target)
 

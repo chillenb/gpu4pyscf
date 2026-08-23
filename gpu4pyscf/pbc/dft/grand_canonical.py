@@ -194,7 +194,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
     tighten_mu_threshold = getattr(
         __config__, 'pbc_dft_grand_canonical_tighten_mu_threshold', 1e-3)
     diis_space = getattr(__config__, 'pbc_dft_grand_canonical_diis_space', 6)
-    damp = getattr(__config__, 'pbc_dft_grand_canonical_damp', 0.125)
+    damp = getattr(__config__, 'pbc_dft_grand_canonical_damp', 1.0)
     diis_trust_expand = getattr(__config__, 'pbc_dft_grand_canonical_diis_trust_expand', 0.75)
     diis_expansion = getattr(__config__, 'pbc_dft_grand_canonical_diis_expansion', 2.0)
     diis_expand_reduction = getattr(__config__, 'pbc_dft_grand_canonical_diis_expand_reduction', 2e-2)
@@ -228,7 +228,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
         if sigma <= 0:
             raise ValueError('sigma must be positive')
         if nelec is None and mu is None:
-            raise TypeError('mu is required unless nelec is specified')
+            nelec = mf.cell.tot_electrons(1)
+            logger.info(self, "Setting nelec to %f by default." % nelec)
         if nelec is not None and mu is not None:
             raise TypeError('mu and nelec select different ensembles')
         if nelec is not None:
@@ -669,6 +670,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         fixed_n_calc.converged = False
         fixed_n_calc.message = 'maximum fixed-N cycles reached'
         original_tolerance = tolerance
+
         while fixed_n_calc.cycles < self.max_cycle:
             cycle_data = fixed_n_calc.cycle_data
             if (target_mu is not None and
@@ -681,7 +683,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
                 fixed_n_calc.message = 'converged fixed-N residual'
                 break
             fock = self.diis_pack(cycle_data.fock)
-            residual = self.diis_pack(cycle_data.residual, weight_errors=True)
+            residual = self.diis_pack(cycle_data.residual)
+
             try:
                 target = self.diis_unpack(fixed_n_calc.diis.update(fock, xerr=residual), cycle_data.fock)
                 target = self._sanitize_h(target)
