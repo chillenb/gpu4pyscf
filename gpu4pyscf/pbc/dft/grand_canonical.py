@@ -179,9 +179,9 @@ class GrandCanonicalKRKS(lib.StreamObject):
     max_cycle = getattr(__config__, 'pbc_dft_grand_canonical_max_cycle', 100)
     max_outer_cycle = getattr(__config__, 'pbc_dft_grand_canonical_max_outer_cycle', 16)
     conv_tol = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol', 1e-8)
-    conv_tol_coarse = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_coarse', 4e-6)
+    conv_tol_coarse = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_coarse', 1e-6)
     conv_tol_mu = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_mu', 1e-6)
-    diis_max_dmu = getattr(__config__, 'pbc_dft_grand_canonical_diis_max_dmu',2e-3)
+    diis_max_dmu = getattr(__config__, 'pbc_dft_grand_canonical_diis_max_dmu', 5e-4)
     nlcg_initial_step = getattr(
         __config__, 'pbc_dft_grand_canonical_nlcg_initial_step', 1.0)
     nlcg_max_line_search_evaluations = getattr(
@@ -194,9 +194,9 @@ class GrandCanonicalKRKS(lib.StreamObject):
         __config__,
         'pbc_dft_grand_canonical_nlcg_line_search_slope_atol', None)
     tighten_mu_threshold = getattr(
-        __config__, 'pbc_dft_grand_canonical_tighten_mu_threshold', 1e-4)
-    diis_space = getattr(__config__, 'pbc_dft_grand_canonical_diis_space', 12)
-    damp = getattr(__config__, 'pbc_dft_grand_canonical_damp', 0.8)
+        __config__, 'pbc_dft_grand_canonical_tighten_mu_threshold', 1e-3)
+    diis_space = getattr(__config__, 'pbc_dft_grand_canonical_diis_space', 6)
+    damp = getattr(__config__, 'pbc_dft_grand_canonical_damp', 1.0)
     diis_trust_expand = getattr(__config__, 'pbc_dft_grand_canonical_diis_trust_expand', 0.75)
     diis_expansion = getattr(__config__, 'pbc_dft_grand_canonical_diis_expansion', 2.0)
     diis_expand_reduction = getattr(__config__, 'pbc_dft_grand_canonical_diis_expand_reduction', 2e-2)
@@ -721,12 +721,12 @@ class GrandCanonicalKRKS(lib.StreamObject):
             )
 
             if dump_chk and self.chkfile:
-                mo_coeff = [x.dot(c) for x, c in zip(self.x_ao2orth, trial.coeff)]
+                mo_coeff = [x.dot(c).get() for x, c in zip(self.x_ao2orth, trial.coeff)]
                 self.dump_chk({
                     'e_tot': trial.e_tot,
-                    'mo_coeff': _stack_or_list(mo_coeff),
-                    'mo_occ': _stack_or_list([2.*x for x in trial.occ]),
-                    'mo_energy': _stack_or_list(trial.eig),
+                    'mo_coeff': mo_coeff,
+                    'mo_occ': [cp.asnumpy(2.*x) for x in trial.occ],
+                    'mo_energy': [cp.asnumpy(x) for x in trial.eig],
                 })
 
             if callable(self.callback):
