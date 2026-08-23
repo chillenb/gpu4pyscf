@@ -422,7 +422,7 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
 
     vcorr_r = vion_r + vdiel_r + vcav_r
 
-    # vcorr_g = solvation_potentialG + pbc_tools.fft(vcorr_r.reshape(-1), mesh).reshape(-1) * weight
+    vcorr_g = solvation_potentialG + pbc_tools.fft(vcorr_r.reshape(-1), mesh).reshape(-1) * weight
 
     surf_area = cp.sum( (-Sprime * grad_abs_r).reshape(-1) ) * vol / ngrids
     Ecav = cav_tension * surf_area
@@ -446,7 +446,7 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
         'vcav_r': vcav_r,
         'vdiel_r': vdiel_r,
         'vion_r': vion_r,
-        # 'vcorr_g': vcorr_g,
+        'vcorr_g': vcorr_g,
         'pseudocore_densityR': pseudocore_densityR,
     }
 
