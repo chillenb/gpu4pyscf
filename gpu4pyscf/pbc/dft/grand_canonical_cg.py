@@ -614,7 +614,8 @@ def nlcg(self, dm0=None, h=None):
     return self._finalize(state, converged)
 
 
-def fixed_mu_diis(self, dm0=None, h=None):
+
+def fixed_mu_diis_inner(self, dm0=None, h=None):
     self.build()
     self.converged = False
     self.cycles = 0
@@ -662,4 +663,9 @@ def fixed_mu_diis(self, dm0=None, h=None):
     converged = state.residual_rms <= self.conv_tol
     self.message = ('converged fixed-mu gradient DIIS' if converged else
                     'maximum fixed-mu DIIS cycles reached')
+    return state, converged
+
+
+def fixed_mu_diis(self, dm0=None, h=None):
+    state, converged = self.fixed_mu_diis_inner(dm0=dm0, h=h)
     return self._finalize(state, converged)
