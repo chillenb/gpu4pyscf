@@ -664,13 +664,9 @@ def fixed_mu_diis_inner(self, dm0=None, h=None, dump_chk=True):
             mo_coeff = [x.dot(c) for x, c in zip(self.x_ao2orth, state.coeff)]
             self.dump_chk({
                 'e_tot': state.e_tot,
-                'mo_coeff': mo_coeff,
-                'mo_occ': [2.*x for x in state.occ],
-                'mo_energy': state.eig,
-                'free_energy': state.free_energy,
-                'grand_potential': state.grand_potential,
-                'mu': state.mu,
-                'nelec': state.nelec,
+                'mo_coeff': cp.asnumpy(mo_coeff),
+                'mo_occ': [ cp.asnumpy(2.*x) for x in state.occ],
+                'mo_energy': cp.asnumpy(state.eig),
             })
 
     converged = state.residual_rms <= self.conv_tol
