@@ -186,7 +186,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         __config__, 'pbc_dft_grand_canonical_nlcg_initial_step', 1.0)
     nlcg_max_line_search_evaluations = getattr(
         __config__,
-        'pbc_dft_grand_canonical_nlcg_max_line_search_evaluations', 20)
+        'pbc_dft_grand_canonical_nlcg_max_line_search_evaluations', 6)
     nlcg_line_search_alpha_rtol = getattr(
         __config__,
         'pbc_dft_grand_canonical_nlcg_line_search_alpha_rtol', None)
