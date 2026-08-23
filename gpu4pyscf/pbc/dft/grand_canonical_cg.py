@@ -615,7 +615,7 @@ def nlcg(self, dm0=None, h=None):
 
 
 
-def fixed_mu_diis_inner(self, dm0=None, h=None):
+def fixed_mu_diis_inner(self, dm0=None, h=None, dump_chk=True):
     self.build()
     self.converged = False
     self.cycles = 0
@@ -660,6 +660,19 @@ def fixed_mu_diis_inner(self, dm0=None, h=None):
             self.cycles, state.grand_potential, state.residual_rms,
             state.nelec)
 
+        if dump_chk and self.chkfile:
+            mo_coeff = [x.dot(c) for x, c in zip(self.x_ao2orth, state.coeff)]
+            self.dump_chk({
+                'e_tot': state.e_tot,
+                'mo_coeff': mo_coeff,
+                'mo_occ': [2.*x for x in state.occ],
+                'mo_energy': state.eig,
+                'free_energy': state.free_energy,
+                'grand_potential': state.grand_potential,
+                'mu': state.mu,
+                'nelec': state.nelec,
+            })
+
     converged = state.residual_rms <= self.conv_tol
     self.message = ('converged fixed-mu gradient DIIS' if converged else
                     'maximum fixed-mu DIIS cycles reached')
@@ -667,5 +680,5 @@ def fixed_mu_diis_inner(self, dm0=None, h=None):
 
 
 def fixed_mu_diis(self, dm0=None, h=None):
-    state, converged = self.fixed_mu_diis_inner(dm0=dm0, h=h)
+    state, converged = self.fixed_mu_diis_inner(dm0=dm0, h=h, dump_chk=True)
     return self._finalize(state, converged)
