@@ -179,9 +179,9 @@ class GrandCanonicalKRKS(lib.StreamObject):
     max_cycle = getattr(__config__, 'pbc_dft_grand_canonical_max_cycle', 100)
     max_outer_cycle = getattr(__config__, 'pbc_dft_grand_canonical_max_outer_cycle', 16)
     conv_tol = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol', 1e-8)
-    conv_tol_coarse = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_coarse', 1e-6)
+    conv_tol_coarse = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_coarse', 4e-6)
     conv_tol_mu = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_mu', 1e-6)
-    diis_max_dmu = getattr(__config__, 'pbc_dft_grand_canonical_diis_max_dmu', 5e-4)
+    diis_max_dmu = getattr(__config__, 'pbc_dft_grand_canonical_diis_max_dmu',2e-3)
     nlcg_initial_step = getattr(
         __config__, 'pbc_dft_grand_canonical_nlcg_initial_step', 1.0)
     nlcg_max_line_search_evaluations = getattr(
@@ -194,9 +194,9 @@ class GrandCanonicalKRKS(lib.StreamObject):
         __config__,
         'pbc_dft_grand_canonical_nlcg_line_search_slope_atol', None)
     tighten_mu_threshold = getattr(
-        __config__, 'pbc_dft_grand_canonical_tighten_mu_threshold', 1e-3)
-    diis_space = getattr(__config__, 'pbc_dft_grand_canonical_diis_space', 6)
-    damp = getattr(__config__, 'pbc_dft_grand_canonical_damp', 1.0)
+        __config__, 'pbc_dft_grand_canonical_tighten_mu_threshold', 1e-4)
+    diis_space = getattr(__config__, 'pbc_dft_grand_canonical_diis_space', 12)
+    damp = getattr(__config__, 'pbc_dft_grand_canonical_damp', 0.8)
     diis_trust_expand = getattr(__config__, 'pbc_dft_grand_canonical_diis_trust_expand', 0.75)
     diis_expansion = getattr(__config__, 'pbc_dft_grand_canonical_diis_expansion', 2.0)
     diis_expand_reduction = getattr(__config__, 'pbc_dft_grand_canonical_diis_expand_reduction', 2e-2)
