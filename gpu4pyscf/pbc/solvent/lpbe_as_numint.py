@@ -445,6 +445,7 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
         'cavity_r': S,
         'eps_r': eps_r_field,
         'mass_r': S * ebkappa2,
+        'pseudocore_densityR': pseudocore_densityR,
     }
 
     RangePop()
