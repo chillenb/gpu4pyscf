@@ -35,7 +35,7 @@ from pyscf.scf.addons import _fermi_smearing_occ, _smearing_optimize
 
 from gpu4pyscf.lib import diis, logger
 from gpu4pyscf.scf import hf as mol_hf
-from gpu4pyscf.pbc.dft.grand_canonical_cg import fixed_mu_diis, nlcg
+from gpu4pyscf.pbc.dft.grand_canonical_cg import fixed_mu_diis, fixed_mu_diis_inner, nlcg
 
 
 __all__ = ['GrandCanonicalKRKS']
@@ -174,12 +174,14 @@ class GrandCanonicalKRKS(lib.StreamObject):
 
     nlcg = nlcg
     fixed_mu_diis = fixed_mu_diis
+    fixed_mu_diis_inner = fixed_mu_diis_inner
 
     max_cycle = getattr(__config__, 'pbc_dft_grand_canonical_max_cycle', 100)
     max_outer_cycle = getattr(__config__, 'pbc_dft_grand_canonical_max_outer_cycle', 16)
     conv_tol = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol', 1e-8)
     conv_tol_coarse = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_coarse', 1e-6)
     conv_tol_mu = getattr(__config__, 'pbc_dft_grand_canonical_conv_tol_mu', 1e-6)
+    diis_max_dmu = getattr(__config__, 'pbc_dft_grand_canonical_diis_max_dmu', 5e-4)
     nlcg_initial_step = getattr(
         __config__, 'pbc_dft_grand_canonical_nlcg_initial_step', 1.0)
     nlcg_max_line_search_evaluations = getattr(
@@ -865,19 +867,22 @@ class GrandCanonicalKRKS(lib.StreamObject):
                 cycle_data.residual_rms,
             )
 
-            root_ready = abs(error) <= self.conv_tol_mu
-            if root_ready and cycle_data.residual_rms > self.conv_tol:
-                h = self._copy(cycle_data.h)
-                pending = fixed_n_calc
-                continue
-            if root_ready:
-                self.message = 'converged fixed-mu secant search'
-                return cycle_data, True
+            if abs(error) <= self.diis_max_dmu:
+                return self.fixed_mu_diis_inner(h=cycle_data.h)
 
-            if bracket is not None:
-                if abs(bracket[1].nelec - bracket[0].nelec) <= self.root_nelec_tol:
-                    self.message = 'fixed-mu electron-number bracket stagnated'
-                    break
+
+            # root_ready = abs(error) <= self.conv_tol_mu
+            # if root_ready and cycle_data.residual_rms > self.conv_tol:
+            #     h = self._copy(cycle_data.h)
+            #     pending = fixed_n_calc
+            #     continue
+            # if root_ready:
+            #     self.message = 'converged fixed-mu secant search'
+            #     return cycle_data, True
+
+            if bracket is not None and abs(bracket[1].nelec - bracket[0].nelec) <= self.root_nelec_tol:
+                self.message = 'fixed-mu electron-number bracket stagnated'
+                break
 
             proposal = self.secant_proposal(samples, cycle_data.h)
             if abs(proposal - current_n) <= 1e-14 * max(1.0, abs(current_n)):
