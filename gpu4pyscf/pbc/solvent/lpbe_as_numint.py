@@ -422,7 +422,7 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
 
     vcorr_r = vion_r + vdiel_r + vcav_r
 
-    vcorr_g = solvation_potentialG + pbc_tools.fft(vcorr_r.reshape(-1), mesh).reshape(-1) * weight
+    # vcorr_g = solvation_potentialG + pbc_tools.fft(vcorr_r.reshape(-1), mesh).reshape(-1) * weight
 
     surf_area = cp.sum( (-Sprime * grad_abs_r).reshape(-1) ) * vol / ngrids
     Ecav = cav_tension * surf_area
@@ -436,15 +436,17 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
     log.debug(f"Ediel: {Ediel:.3e} Hartree ({Ediel*nist.HARTREE2EV:.3e} eV)")
 
     results = {
-        'vcorr_g': vcorr_g,
         'Eion': Eion,
         'Ediel': Ediel,
         'Ecav': Ecav,
         'E_coul_corr': E_coul_corr,
         'pot_guess': solution_phi_G,
         'cavity_r': S,
-        'eps_r': eps_r_field,
-        'mass_r': S * ebkappa2,
+        'solvation_potentialR': solvation_potentialR,
+        'vcav_r': vcav_r,
+        'vdiel_r': vdiel_r,
+        'vion_r': vion_r,
+        # 'vcorr_g': vcorr_g,
         'pseudocore_densityR': pseudocore_densityR,
     }
 
@@ -588,29 +590,31 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
     if with_j:
         xc_for_fock[0] += coulomb_on_g_mesh + vcorr_g
 
-    # Reciprocal GGA differentiation can leave imaginary values on Nyquist
-    # planes.  The existing AO conversion projects through ``ifft(...).real``;
-    # expose that same physical real scalar field, in normalized G space, so
-    # potential mixing starts from an exactly Hermitian representation.
-    vlocal_g = pbc_tools.fft(
-        pbc_tools.ifft(xc_for_fock[0], mesh).real.reshape(-1), mesh)
-    grid_result = LPBEGridResult(
-        vlocal_g=vlocal_g.reshape(-1).copy(),
-        rho_g=rho_g,
-        cavity_r=lpbe_res['cavity_r'].copy(),
-        eps_r=lpbe_res['eps_r'].copy(),
-        lpbe_mass_r=lpbe_res['mass_r'].copy(),
-        lpbe_pot_guess=lpbe_res['pot_guess'].copy(),
-    )
+    # # Reciprocal GGA differentiation can leave imaginary values on Nyquist
+    # # planes.  The existing AO conversion projects through ``ifft(...).real``;
+    # # expose that same physical real scalar field, in normalized G space, so
+    # # potential mixing starts from an exactly Hermitian representation.
+    # vlocal_g = pbc_tools.fft(
+    #     pbc_tools.ifft(xc_for_fock[0], mesh).real.reshape(-1), mesh)
+    # grid_result = LPBEGridResult(
+    #     vlocal_g=vlocal_g.reshape(-1).copy(),
+    #     rho_g=rho_g,
+    #     cavity_r=lpbe_res['cavity_r'].copy(),
+    #     eps_r=lpbe_res['eps_r'].copy(),
+    #     lpbe_mass_r=lpbe_res['mass_r'].copy(),
+    #     lpbe_pot_guess=lpbe_res['pot_guess'].copy(),
+    # )
 
     kpts_band, input_band = _format_kpts_band(kpts_band, kpts), kpts_band
     RangePush("convert_xc_on_g_mesh_to_fock")
     veff = convert_xc_on_g_mesh_to_fock(ni, xc_for_fock, hermi, kpts_band, with_tau = (xc_type == "MGGA"))
     RangePop()
     veff = _format_jks(veff, dm_kpts, input_band, kpts)
-    veff = tag_array(
-        veff, ecoul=coulomb_energy, exc=xc_energy_sum,
-        lpbe_grid=grid_result)
+    # veff = tag_array(
+    #     veff, ecoul=coulomb_energy, exc=xc_energy_sum,
+    #     lpbe_grid=grid_result)
+    veff = tag_array(veff, ecoul=coulomb_energy, exc=xc_energy_sum)
+
     t0 = log.timer("xc", *t0)
     RangePop()
     return n_electrons, xc_energy_sum, veff
