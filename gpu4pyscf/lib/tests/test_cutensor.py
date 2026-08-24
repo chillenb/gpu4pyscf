@@ -13,10 +13,14 @@
 # limitations under the License.
 
 import unittest
+from unittest import mock
+
 import numpy
 import cupy
 from gpu4pyscf.lib.cupy_helper import contract
-from gpu4pyscf.lib.cutensor import contraction_trinary
+from gpu4pyscf.lib import cutensor as cutensor_module
+from gpu4pyscf.lib.cutensor import contract_trinary, contraction_trinary
+
 
 class KnownValues(unittest.TestCase):
     def test_contract(self):
@@ -82,6 +86,45 @@ class KnownValues(unittest.TestCase):
             alpha=1.25, beta=-.5, out=out)
         assert result is out
         assert cupy.linalg.norm(expected - result) < 1e-10
+
+    def test_contract_trinary_conjugation_with_output(self):
+        a = cupy.random.rand(5, 7) + 1j * cupy.random.rand(5, 7)
+        b = cupy.random.rand(7, 6) + 1j * cupy.random.rand(7, 6)
+        c = cupy.random.rand(6, 4) + 1j * cupy.random.rand(6, 4)
+        out = cupy.random.rand(5, 4) + 1j * cupy.random.rand(5, 4)
+        expected = (1.25 * cupy.einsum(
+            'ab,bc,cd->ad', a.conj(), b.conj(), c.conj()) - .5 * out)
+        result = contract_trinary(
+            'ab,bc,cd->ad', a, b, c,
+            alpha=1.25, beta=-.5, out=out,
+            conj_a=True, conj_b=True, conj_c=True)
+        assert result is out
+        assert cupy.linalg.norm(expected - result) < 1e-10
+
+    def test_contract_trinary_real_conjugation_is_identity(self):
+        a = cupy.random.rand(5, 7)
+        b = cupy.random.rand(7, 6)
+        c = cupy.random.rand(6, 4)
+        expected = cupy.einsum('ab,bc,cd->ad', a, b, c)
+        result = contract_trinary(
+            'ab,bc,cd->ad', a, b, c,
+            conj_a=True, conj_b=True, conj_c=True)
+        assert cupy.linalg.norm(expected - result) < 1e-10
+
+    def test_contract_trinary_conjugation_fallback(self):
+        a = cupy.random.rand(5, 7) + 1j * cupy.random.rand(5, 7)
+        b = cupy.random.rand(7, 6) + 1j * cupy.random.rand(7, 6)
+        c = cupy.random.rand(6, 4) + 1j * cupy.random.rand(6, 4)
+        expected = cupy.einsum(
+            'ab,bc,cd->ad', a.conj(), b, c.conj())
+        with mock.patch.object(cutensor_module, 'contract_engine', 'cupy'), \
+             mock.patch.object(
+                 cutensor_module, 'einsum', cupy.einsum, create=True):
+            result = contract_trinary(
+                'ab,bc,cd->ad', a, b, c,
+                conj_a=True, conj_c=True)
+        assert cupy.linalg.norm(expected - result) < 1e-10
+
 
 if __name__ == "__main__":
     print("Full tests for cutensor module")
