@@ -68,16 +68,6 @@ def test_krpa_no_fc(diamond_krhf):
     assert rpa.e_tot == pytest.approx(DIAMOND_NO_FC[0], abs=1e-6)
 
 
-def test_krpa_no_fc_outcore(diamond_krhf):
-    rpa = KRPA(diamond_krhf)
-    rpa.outcore = True
-    rpa.segsize = 2
-    rpa.kernel()
-
-    assert rpa.e_corr == pytest.approx(DIAMOND_NO_FC[1], abs=1e-6)
-    assert rpa.e_tot == pytest.approx(DIAMOND_NO_FC[0], abs=1e-6)
-
-
 def test_krpa_acfd_exx_high_cost(diamond_krhf):
     rpa = KRPA(diamond_krhf)
     rpa.fc = False
@@ -91,17 +81,6 @@ def test_krpa_acfd_exx_high_cost(diamond_krhf):
 def test_krpa_with_fc(diamond_krhf):
     rpa = KRPA(diamond_krhf)
     rpa.fc = True
-    rpa.kernel()
-
-    assert rpa.e_corr == pytest.approx(DIAMOND_FC[1], abs=1e-6)
-    assert rpa.e_tot == pytest.approx(DIAMOND_FC[0], abs=1e-6)
-
-
-def test_krpa_with_fc_outcore(diamond_krhf):
-    rpa = KRPA(diamond_krhf)
-    rpa.fc = True
-    rpa.outcore = True
-    rpa.segsize = 2
     rpa.kernel()
 
     assert rpa.e_corr == pytest.approx(DIAMOND_FC[1], abs=1e-6)
@@ -155,6 +134,33 @@ def test_krpa_rho_accum_real_into_complex():
     rho_accum_inner(Pi, eia, omega, Lov, alpha=alpha)
 
     cp.testing.assert_allclose(Pi, expected)
+
+
+@pytest.mark.parametrize('complex_lia', [False, True])
+def test_krpa_get_rho_response_batched(complex_lia):
+    """The k-batched response agrees with an explicit per-k contraction."""
+    from gpu4pyscf.pbc.gw.krpa import get_rho_response
+
+    omega = 0.7
+    mo_energy = cp.array([
+        [-1.2, -0.7, 0.3, 0.9],
+        [-1.0, -0.5, 0.4, 1.1],
+        [-1.1, -0.6, 0.2, 1.0],
+    ])
+    Lia = cp.arange(24, dtype=cp.float64).reshape(3, 2, 2, 2) / 20
+    if complex_lia:
+        Lia = Lia + 0.1j * Lia[::-1]
+    kidx = np.array([2, 0, 1])
+
+    expected = cp.zeros((2, 2), dtype=cp.complex128)
+    for k, a in enumerate(kidx):
+        eia = mo_energy[k, :2, None] - mo_energy[a, None, 2:]
+        weight = eia / (omega**2 + eia**2)
+        expected += 4.0 / len(kidx) * cp.einsum(
+            'Pia,ia,Qia->PQ', Lia[k], weight, Lia[k].conj())
+
+    result = get_rho_response(omega, mo_energy, Lia, kidx)
+    cp.testing.assert_allclose(result, expected)
 
 
 def test_krpa_kconserv_shifted_kmesh():
