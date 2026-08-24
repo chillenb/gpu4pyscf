@@ -53,6 +53,19 @@ def _to_float(value):
     return float(value)
 
 
+def _contract_accumulate(pattern, a, b, out, alpha=1.0):
+    """Accumulate a binary contraction without an output-sized temporary."""
+    dtype = np.result_type(a.dtype, b.dtype)
+    if dtype == out.dtype:
+        target = out
+    elif out.dtype.kind == 'c' and dtype == out.real.dtype:
+        target = out.real
+    else:
+        out += alpha * lib.contract(pattern, a, b)
+        return
+    lib.contract(pattern, a, b, alpha=alpha, beta=1.0, out=target)
+
+
 def get_frozen_mask(rpa):
     """Return CPU boolean masks for the active orbitals at each k-point."""
     masks = [np.ones(x.shape[-1], dtype=bool) for x in rpa._scf.mo_occ]
@@ -363,8 +376,9 @@ def get_rho_response_head(omega, mo_energy, qij):
     for k in range(nkpts):
         eia = mo_energy[k, :nocc, None] - mo_energy[k, None, nocc:]
         weight = eia / (omega**2 + eia**2)
-        Pi_00 += 4.0 / nkpts * cp.einsum(
-            'ia,ia->', weight, qij[k].conj() * qij[k])
+        _contract_accumulate(
+            'ia,ia->', weight, qij[k].conj() * qij[k], Pi_00,
+            alpha=4.0 / nkpts)
     return Pi_00
 
 
@@ -378,7 +392,8 @@ def get_rho_response_wing(omega, mo_energy, Lia, qij):
     for k in range(nkpts):
         eia = mo_energy[k, :nocc, None] - mo_energy[k, None, nocc:]
         eia_q = eia * qij[k].conj() / (omega**2 + eia**2)
-        Pi += 4.0 / nkpts * cp.einsum('Pia,ia->P', Lia[k], eia_q)
+        _contract_accumulate(
+            'Pia,ia->P', Lia[k], eia_q, Pi, alpha=4.0 / nkpts)
     return Pi
 
 
@@ -411,7 +426,8 @@ def get_qij(rpa, q, mo_energy, mo_coeff, uniform_grids=False):
             ao = ao_ks[k, 0]
             ao_grad = ao_ks[k, 1:4]
             aow = ao.conj() * weights[:, None]
-            ao_ao_grad[k] += lib.contract('gm,xgn->xmn', aow, ao_grad)
+            _contract_accumulate(
+                'gm,xgn->xmn', aow, ao_grad, ao_ao_grad[k])
 
     q = cp.asarray(q)
     qij = cp.empty((rpa.nkpts, nocc, nvir), dtype=cp.complex128)
@@ -518,7 +534,8 @@ def rho_accum_inner(Pi, eia, omega, Lov, alpha=0.0, fia=None):
     else:
         eia = eia * fia / (omega**2 + eia**2)
     Pia = Lov * eia
-    Pi += alpha * lib.contract('Pia,Qia->PQ', Pia, Lov.conj())
+    _contract_accumulate(
+        'Pia,Qia->PQ', Pia, Lov.conj(), Pi, alpha=alpha)
 
     return
 
@@ -545,7 +562,8 @@ def rho_wing_accum_inner(Pi_P0, eia, omega, Lov, qov, alpha=0.0):
     eia = cp.asarray(eia)
     qov = cp.asarray(qov)
     eia_q = eia * qov.conj() / (omega**2 + eia**2)
-    Pi_P0 += alpha * cp.einsum('Pia,ia->P', Lov, eia_q)
+    _contract_accumulate(
+        'Pia,ia->P', Lov, eia_q, Pi_P0, alpha=alpha)
 
     return
 

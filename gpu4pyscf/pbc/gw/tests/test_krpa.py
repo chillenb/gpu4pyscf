@@ -139,6 +139,24 @@ def test_krpa_get_rho_response_metal_all_fractional():
     cp.testing.assert_allclose(result, expected)
 
 
+def test_krpa_rho_accum_real_into_complex():
+    """A real response contribution accumulates through the complex real view."""
+    from gpu4pyscf.pbc.gw.krpa import rho_accum_inner
+
+    omega = 0.7
+    alpha = 1.3
+    eia = cp.array([[-1.0, -1.8], [-0.6, -1.4]])
+    Lov = cp.arange(8, dtype=cp.float64).reshape(2, 2, 2) / 20
+    Pi = cp.full((2, 2), 2j, dtype=cp.complex128)
+
+    weight = eia / (omega**2 + eia**2)
+    expected = Pi + alpha * cp.einsum(
+        'Pia,ia,Qia->PQ', Lov, weight, Lov)
+    rho_accum_inner(Pi, eia, omega, Lov, alpha=alpha)
+
+    cp.testing.assert_allclose(Pi, expected)
+
+
 def test_krpa_kconserv_shifted_kmesh():
     """The RPA transfer table is invariant under a rigid k-mesh shift."""
     from gpu4pyscf.pbc.gw.krpa import get_kconserv_ria_efficient
