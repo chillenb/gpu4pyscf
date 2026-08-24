@@ -153,12 +153,14 @@ def _transfer_layout(mydf, desired_kidx):
     raise RuntimeError('RPA momentum transfer was not found in the GDF tensor')
 
 
-def _transform_cderi(rpa, desired_kidx, mo_left, mo_right):
+def _transform_cderi(rpa, desired_kidx, mo_left, mo_right,
+                     batch_kpts=False):
     """Transform one momentum-transfer sector from AO to selected MO blocks.
 
-    Returns a list of ``(metric_sign, Lij_by_kpoint)`` entries.  Positive and
-    negative metric sectors are kept separate until they are assembled into the
-    signed auxiliary response.
+    Returns a list of ``(metric_sign, Lij)`` entries.  In batched mode, each
+    ``Lij`` is a dense k-major array; otherwise it is a list of potentially
+    ragged per-k-point arrays.  Positive and negative metric sectors are kept
+    separate until they are assembled into the signed auxiliary response.
     """
     mydf = _validate_df(rpa)
     kp, use_conjugate = _transfer_layout(mydf, desired_kidx)
@@ -174,6 +176,20 @@ def _transform_cderi(rpa, desired_kidx, mo_left, mo_right):
     )
     mo_left = [x.astype(dtype, copy=False) for x in mo_left]
     mo_right = [x.astype(dtype, copy=False) for x in mo_right]
+    if batch_kpts:
+        nleft = {x.shape[1] for x in mo_left}
+        nright = {mo_right[desired_kidx[i]].shape[1]
+                  for i in range(nkpts)}
+        if len(nleft) != 1 or len(nright) != 1:
+            raise ValueError('Batched KRPA transformation requires uniform '
+                             'orbital dimensions')
+        nleft = nleft.pop()
+        nright = nright.pop()
+        mo_left_batch = cp.stack(mo_left)
+        mo_left_conj = mo_left_batch.conj()
+        mo_right_batch = cp.stack([
+            mo_right[desired_kidx[i]] for i in range(nkpts)])
+        desired_kidx_gpu = cp.asarray(desired_kidx)
 
     naux_pos = mydf._cderi[kp].shape[0]
     sector_sizes = [(1, naux_pos)]
@@ -183,17 +199,33 @@ def _transform_cderi(rpa, desired_kidx, mo_left, mo_right):
 
     transformed = {}
     for sign, naux in sector_sizes:
-        transformed[sign] = [
-            cp.empty((naux, mo_left[i].shape[1],
-                      mo_right[desired_kidx[i]].shape[1]), dtype=dtype)
-            for i in range(nkpts)
-        ]
+        if batch_kpts:
+            transformed[sign] = cp.empty(
+                (nkpts, naux, nleft, nright), dtype=dtype)
+        else:
+            transformed[sign] = [
+                cp.empty((naux, mo_left[i].shape[1],
+                          mo_right[desired_kidx[i]].shape[1]), dtype=dtype)
+                for i in range(nkpts)
+            ]
 
-    bytes_per_aux = max(
-        nkpts * nao * nao * np.dtype(np.complex128).itemsize * 2, 1)
+    if batch_kpts:
+        # Two dense AO buffers are needed by GDF unpacking.  Account for the
+        # batched AO-MO intermediate and a conjugated transfer buffer as well.
+        bytes_per_aux = nkpts * (
+            3 * nao * nao + nao * nright) * np.dtype(dtype).itemsize
+    else:
+        bytes_per_aux = (
+            nkpts * nao * nao * np.dtype(np.complex128).itemsize * 2)
+    bytes_per_aux = max(bytes_per_aux, 1)
     blksize = int(lib.get_avail_mem() * 0.15 // bytes_per_aux)
     blksize = max(1, min(blksize, mydf.blockdim, naux_pos))
     logger.debug1(rpa, 'KRPA GDF transfer %d block size %d', kp, blksize)
+    if batch_kpts:
+        workspace_aux = max(
+            [blksize] + [naux for sign, naux in sector_sizes if sign < 0])
+        mo_buf = cp.empty(
+            (nkpts, workspace_aux, nao, nright), dtype=dtype)
 
     for p0, p1 in pyscf_lib.prange(0, naux_pos, blksize):
         aux_iter = iter(((kp, p0, p1),))
@@ -203,18 +235,33 @@ def _transform_cderi(rpa, desired_kidx, mo_left, mo_right):
                 q0, q1 = p0, p1
             else:
                 q0, q1 = 0, Lpq.shape[1]
-            for i in range(nkpts):
-                j = int(desired_kidx[i])
+            if batch_kpts:
                 if use_conjugate:
-                    Lpq_i = Lpq[j].conj().transpose(0, 2, 1)
+                    Lpq_batch = Lpq[desired_kidx_gpu].conj().transpose(
+                        0, 1, 3, 2)
                 else:
-                    Lpq_i = Lpq[i]
-                Lpq_i = Lpq_i.astype(dtype, copy=False)
-                if mo_left[i].shape[1] == 0 or mo_right[j].shape[1] == 0:
-                    continue
-                buf = lib.contract('Lpq,qj->Lpj', Lpq_i, mo_right[j])
-                lib.contract('pi,Lpj->Lij', mo_left[i].conj(), buf,
-                             out=transformed[sign][i][q0:q1])
+                    Lpq_batch = Lpq
+                Lpq_batch = Lpq_batch.astype(dtype, copy=False)
+                buf = mo_buf[:, :Lpq.shape[1]]
+                lib.contract(
+                    'kLpq,kqj->kLpj', Lpq_batch, mo_right_batch, out=buf)
+                lib.contract(
+                    'kpi,kLpj->kLij', mo_left_conj, buf,
+                    out=transformed[sign][:, q0:q1])
+            else:
+                for i in range(nkpts):
+                    j = int(desired_kidx[i])
+                    if use_conjugate:
+                        Lpq_i = Lpq[j].conj().transpose(0, 2, 1)
+                    else:
+                        Lpq_i = Lpq[i]
+                    Lpq_i = Lpq_i.astype(dtype, copy=False)
+                    if (mo_left[i].shape[1] == 0 or
+                            mo_right[j].shape[1] == 0):
+                        continue
+                    buf = lib.contract('Lpq,qj->Lpj', Lpq_i, mo_right[j])
+                    lib.contract('pi,Lpj->Lij', mo_left[i].conj(), buf,
+                                 out=transformed[sign][i][q0:q1])
             Lpq = None
 
     return [(sign, transformed[sign]) for sign, _ in sector_sizes]
@@ -223,6 +270,17 @@ def _transform_cderi(rpa, desired_kidx, mo_left, mo_right):
 def _stack_metric_sectors(sectors):
     if not sectors:
         raise RuntimeError('No density-fitting auxiliary functions were generated')
+    batched = isinstance(sectors[0][1], cp.ndarray)
+    if batched:
+        signs = cp.concatenate([
+            cp.full(blocks.shape[1], sign, dtype=cp.float64)
+            for sign, blocks in sectors
+        ])
+        blocks = [sector[1] for sector in sectors]
+        Lij = (blocks[0] if len(blocks) == 1 else
+               cp.concatenate(blocks, axis=1))
+        return Lij, signs
+
     nkpts = len(sectors[0][1])
     signs = cp.concatenate([
         cp.full(blocks[0].shape[0], sign, dtype=cp.float64)
@@ -231,7 +289,8 @@ def _stack_metric_sectors(sectors):
     Lij = []
     for k in range(nkpts):
         blocks = [sector[1][k] for sector in sectors]
-        Lij.append(blocks[0] if len(blocks) == 1 else cp.concatenate(blocks, axis=0))
+        Lij.append(blocks[0] if len(blocks) == 1 else
+                   cp.concatenate(blocks, axis=0))
     return Lij, signs
 
 
@@ -298,16 +357,8 @@ def kernel(rpa, mo_energy, mo_coeff, nw=None, with_e_hf=None):
     freqs, wts = rpa.get_grids(nw=nw, mo_energy=mo_energy)
 
     # Compute RPA correlation energy
-    if rpa.outcore:
-        if is_metal:
-            e_corr = get_rpa_ecorr_outcore_metal(
-                rpa, freqs, wts, mo_energy, mo_coeff, mo_occ)
-        else:
-            e_corr = get_rpa_ecorr_outcore(
-                rpa, freqs, wts, mo_energy, mo_coeff)
-    else:
-        e_corr = get_rpa_ecorr(
-            rpa, freqs, wts, mo_energy, mo_coeff, mo_occ)
+    e_corr = get_rpa_ecorr(
+        rpa, freqs, wts, mo_energy, mo_coeff, mo_occ)
 
     # Compute total energy
     e_tot = float(e_hf + e_corr)
@@ -359,11 +410,14 @@ def get_rho_response(omega, mo_energy, Lia, kidx):
     mo_energy = cp.asarray(mo_energy)
     nkpts, naux = Lia.shape[:2]
     nocc = Lia.shape[2]
+    kidx = cp.asarray(kidx)
+    eia = (mo_energy[:, :nocc, None] -
+           mo_energy[kidx, None, nocc:])
+    weight = eia / (omega**2 + eia**2)
+    Pia = Lia * weight[:, None]
     Pi = cp.zeros((naux, naux), dtype=cp.complex128)
-    for i in range(nkpts):
-        a = int(kidx[i])
-        eia = mo_energy[i, :nocc, None] - mo_energy[a, None, nocc:]
-        rho_accum_inner(Pi, eia, omega, Lia[i], alpha=4.0 / nkpts)
+    _contract_accumulate(
+        'kPia,kQia->PQ', Pia, Lia.conj(), Pi, alpha=4.0 / nkpts)
     return Pi
 
 
@@ -372,13 +426,13 @@ def get_rho_response_head(omega, mo_energy, qij):
     mo_energy = cp.asarray(mo_energy)
     qij = cp.asarray(qij)
     nkpts, nocc = qij.shape[:2]
+    eia = (mo_energy[:, :nocc, None] -
+           mo_energy[:, None, nocc:])
+    weight = eia / (omega**2 + eia**2)
     Pi_00 = cp.zeros((), dtype=cp.complex128)
-    for k in range(nkpts):
-        eia = mo_energy[k, :nocc, None] - mo_energy[k, None, nocc:]
-        weight = eia / (omega**2 + eia**2)
-        _contract_accumulate(
-            'ia,ia->', weight, qij[k].conj() * qij[k], Pi_00,
-            alpha=4.0 / nkpts)
+    _contract_accumulate(
+        'kia,kia->', weight, qij.conj() * qij, Pi_00,
+        alpha=4.0 / nkpts)
     return Pi_00
 
 
@@ -388,12 +442,12 @@ def get_rho_response_wing(omega, mo_energy, Lia, qij):
     mo_energy = cp.asarray(mo_energy)
     qij = cp.asarray(qij)
     nkpts, naux, nocc, _ = Lia.shape
+    eia = (mo_energy[:, :nocc, None] -
+           mo_energy[:, None, nocc:])
+    eia_q = eia * qij.conj() / (omega**2 + eia**2)
     Pi = cp.zeros(naux, dtype=cp.complex128)
-    for k in range(nkpts):
-        eia = mo_energy[k, :nocc, None] - mo_energy[k, None, nocc:]
-        eia_q = eia * qij[k].conj() / (omega**2 + eia**2)
-        _contract_accumulate(
-            'Pia,ia->P', Lia[k], eia_q, Pi, alpha=4.0 / nkpts)
+    _contract_accumulate(
+        'kPia,kia->P', Lia, eia_q, Pi, alpha=4.0 / nkpts)
     return Pi
 
 
@@ -405,8 +459,6 @@ def get_qij(rpa, q, mo_energy, mo_coeff, uniform_grids=False):
 
     cell = rpa.mol
     nocc = rpa.nocc
-    nmo = rpa.nmo
-    nvir = nmo - nocc
     mo_energy = cp.asarray(mo_energy)
     mo_coeff = cp.asarray(mo_coeff)
 
@@ -422,23 +474,21 @@ def get_qij(rpa, q, mo_energy, mo_coeff, uniform_grids=False):
                           dtype=cp.complex128)
     for ao_ks, weights, _ in ni.block_loop(
             cell, grids, deriv=1, kpts=rpa.kpts):
-        for k in range(rpa.nkpts):
-            ao = ao_ks[k, 0]
-            ao_grad = ao_ks[k, 1:4]
-            aow = ao.conj() * weights[:, None]
-            _contract_accumulate(
-                'gm,xgn->xmn', aow, ao_grad, ao_ao_grad[k])
+        ao = ao_ks[:, 0]
+        ao_grad = ao_ks[:, 1:4]
+        aow = ao.conj() * weights[None, :, None]
+        _contract_accumulate(
+            'kgm,kxgn->kxmn', aow, ao_grad, ao_ao_grad)
 
     q = cp.asarray(q)
-    qij = cp.empty((rpa.nkpts, nocc, nvir), dtype=cp.complex128)
-    for k in range(rpa.nkpts):
-        q_ao = -1j * cp.einsum('x,xmn->mn', q, ao_ao_grad[k])
-        q_mo = cp.einsum(
-            'pi,pq,qj->ij', mo_coeff[k, :, :nocc].conj(), q_ao,
-            mo_coeff[k, :, nocc:])
-        enm = 1.0 / (mo_energy[k, nocc:, None] -
-                     mo_energy[k, None, :nocc])
-        qij[k] = enm.T * q_mo / np.sqrt(cell.vol)
+    q_ao = -1j * lib.contract('x,kxmn->kmn', q, ao_ao_grad)
+    q_mo_buf = lib.contract(
+        'kpi,kpq->kiq', mo_coeff[:, :, :nocc].conj(), q_ao)
+    q_mo = lib.contract(
+        'kiq,kqj->kij', q_mo_buf, mo_coeff[:, :, nocc:])
+    enm = 1.0 / (mo_energy[:, nocc:, None] -
+                 mo_energy[:, None, :nocc])
+    qij = enm.transpose(0, 2, 1) * q_mo / np.sqrt(cell.vol)
     return qij
 
 
@@ -540,34 +590,6 @@ def rho_accum_inner(Pi, eia, omega, Lov, alpha=0.0, fia=None):
     return
 
 
-def rho_wing_accum_inner(Pi_P0, eia, omega, Lov, qov, alpha=0.0):
-    """Accumulate the finite-size-correction wing response for one OV slice.
-
-    Parameters
-    ----------
-    Pi_P0 : complex 1d array
-        finite-size correction to density-density response function, will be overwritten
-    eia : double 2d array
-        occupied-virtual orbital energy difference
-    omega : double
-        frequency
-    Lov : complex 3d array
-        occupied-virtual block of three-center density-fitting matrix in MO
-    qov : complex 2d array
-        virtual-occupied correction
-    alpha : float, optional
-        prefactor, by default 0.0
-    """
-    Lov = cp.asarray(Lov)
-    eia = cp.asarray(eia)
-    qov = cp.asarray(qov)
-    eia_q = eia * qov.conj() / (omega**2 + eia**2)
-    _contract_accumulate(
-        'Pia,ia->P', Lov, eia_q, Pi_P0, alpha=alpha)
-
-    return
-
-
 def get_rpa_ecorr(rpa, freqs, wts, mo_energy=None, mo_coeff=None,
                   mo_occ=None):
     """Compute RPA correlation energy.
@@ -617,18 +639,17 @@ def get_rpa_ecorr(rpa, freqs, wts, mo_energy=None, mo_coeff=None,
                 mo_left.append(mo_coeff[k, :, :nocc_k + nfrac_k])
                 mo_right.append(mo_coeff[k, :, nocc_k:])
         else:
-            mo_left = [mo_coeff[k, :, :nocc] for k in range(nkpts)]
-            mo_right = [mo_coeff[k, :, nocc:] for k in range(nkpts)]
+            mo_left = mo_coeff[:, :, :nocc]
+            mo_right = mo_coeff[:, :, nocc:]
 
-        sectors = _transform_cderi(rpa, kidx, mo_left, mo_right)
-        Lij_by_k, signs = _stack_metric_sectors(sectors)
-        if not is_metal:
-            Lij = cp.stack(Lij_by_k)
+        sectors = _transform_cderi(
+            rpa, kidx, mo_left, mo_right, batch_kpts=not is_metal)
+        Lij, signs = _stack_metric_sectors(sectors)
 
         for w, omega in enumerate(freqs):
             if is_metal:
                 Pi_unsigned = get_rho_response_metal(
-                    omega, mo_energy, mo_occ, Lij_by_k, kidx)
+                    omega, mo_energy, mo_occ, Lij, kidx)
             else:
                 Pi_unsigned = get_rho_response(
                     omega, mo_energy, Lij, kidx)
@@ -653,192 +674,6 @@ def get_rpa_ecorr(rpa, freqs, wts, mo_energy=None, mo_coeff=None,
             else:
                 e_corr += get_rpa_ecorr_w(
                     _apply_metric(Pi_unsigned, signs), wts[w])
-
-    e_corr = e_corr.real / (2.0 * np.pi * nkpts)
-    return _to_float(e_corr)
-
-
-def get_rpa_ecorr_outcore(rpa, freqs, wts, mo_energy=None,
-                          mo_coeff=None):
-    """Low-memory routine to compute RPA correlation energy.
-
-    Parameters
-    ----------
-    rpa : KRPA
-        rpa object
-    freqs : double 1d array
-        frequency grid
-    wts : double 1d array
-        weight of grids
-
-    Returns
-    -------
-    e_corr : double
-        correlation energy
-    """
-    if rpa.segsize <= 0:
-        raise ValueError('KRPA segsize must be positive')
-    if mo_coeff is None:
-        mo_coeff = _mo_frozen(rpa, rpa._scf.mo_coeff)
-    if mo_energy is None:
-        mo_energy = _mo_energy_frozen(rpa, rpa._scf.mo_energy)
-    mo_coeff = cp.asarray(mo_coeff)
-    mo_energy = cp.asarray(mo_energy)
-
-    nocc = rpa.nocc
-    nkpts = rpa.nkpts
-    nw = len(freqs)
-    kconserv_table = get_kconserv_ria_efficient(rpa.mol, rpa.kpts)
-    if rpa.fc:
-        qij, q_abs, nq_pts = rpa.get_q_mesh(mo_energy, mo_coeff)
-
-    e_corr = cp.zeros((), dtype=cp.complex128)
-    for kL in range(nkpts):
-        kidx = kconserv_table[kL]
-        Pi = Pi_P0 = signs = None
-        for orb_start in range(0, nocc, rpa.segsize):
-            orb_end = min(orb_start + rpa.segsize, nocc)
-            mo_left = [mo_coeff[k, :, orb_start:orb_end]
-                       for k in range(nkpts)]
-            mo_right = [mo_coeff[k, :, nocc:] for k in range(nkpts)]
-            sectors = _transform_cderi(rpa, kidx, mo_left, mo_right)
-            Lij_by_k, signs_iter = _stack_metric_sectors(sectors)
-            if signs is None:
-                signs = signs_iter
-                naux = len(signs)
-                Pi = cp.zeros((nw, naux, naux), dtype=cp.complex128)
-                if kL == 0 and rpa.fc:
-                    Pi_P0 = cp.zeros((nq_pts, nw, naux),
-                                     dtype=cp.complex128)
-            elif not bool(cp.array_equal(signs, signs_iter).item()):
-                raise RuntimeError('Inconsistent GDF metric between orbital segments')
-
-            for i in range(nkpts):
-                j = int(kidx[i])
-                Lij_slice = Lij_by_k[i]
-                eia = (mo_energy[i, orb_start:orb_end, None] -
-                       mo_energy[j, None, nocc:])
-                for w, omega in enumerate(freqs):
-                    rho_accum_inner(Pi[w], eia, omega, Lij_slice,
-                                    alpha=4.0 / nkpts)
-                    if kL == 0 and rpa.fc:
-                        for iq in range(nq_pts):
-                            rho_wing_accum_inner(
-                                Pi_P0[iq, w], eia, omega, Lij_slice,
-                                qij[iq, i, orb_start:orb_end],
-                                alpha=4.0 / nkpts)
-
-        for w, omega in enumerate(freqs):
-            if kL == 0 and rpa.fc:
-                for iq in range(nq_pts):
-                    qnorm = np.linalg.norm(q_abs[iq])
-                    Pi_00 = (4.0 * np.pi / qnorm**2 *
-                             get_rho_response_head(omega, mo_energy, qij[iq]))
-                    Pi_P0_iq = (np.sqrt(4.0 * np.pi) / qnorm *
-                                Pi_P0[iq, w])
-                    Pi_fc = cp.zeros((len(signs) + 1, len(signs) + 1),
-                                     dtype=cp.complex128)
-                    Pi_fc[0, 0] = Pi_00
-                    Pi_fc[0, 1:] = Pi_P0_iq.conj()
-                    Pi_fc[1:, 0] = Pi_P0_iq
-                    Pi_fc[1:, 1:] = Pi[w]
-                    signs_fc = cp.concatenate((cp.ones(1), signs))
-                    e_corr += get_rpa_ecorr_w(
-                        _apply_metric(Pi_fc, signs_fc), wts[w])
-            else:
-                e_corr += get_rpa_ecorr_w(
-                    _apply_metric(Pi[w], signs), wts[w])
-
-    e_corr = e_corr.real / (2.0 * np.pi * nkpts)
-    return _to_float(e_corr)
-
-
-def get_rpa_ecorr_outcore_metal(rpa, freqs, wts, mo_energy=None,
-                                mo_coeff=None, mo_occ=None):
-    """Low-memory routine to compute RPA correlation energy for metals.
-
-    Parameters
-    ----------
-    rpa : KRPA
-        rpa object
-    freqs : double 1d array
-        frequency grid
-    wts : double 1d array
-        weight of grids
-
-    Returns
-    -------
-    e_corr : double
-        correlation energy
-    """
-    if rpa.segsize <= 0:
-        raise ValueError('KRPA segsize must be positive')
-    if mo_coeff is None:
-        mo_coeff = _mo_frozen(rpa, rpa._scf.mo_coeff)
-    if mo_energy is None:
-        mo_energy = _mo_energy_frozen(rpa, rpa._scf.mo_energy)
-    if mo_occ is None:
-        mo_occ = _mo_occ_frozen(rpa, rpa._scf.mo_occ)
-    mo_coeff = cp.asarray(mo_coeff)
-    mo_energy = cp.asarray(mo_energy)
-    mo_occ = cp.asarray(mo_occ)
-
-    nkpts = rpa.nkpts
-    nw = len(freqs)
-    orbital_info = []
-    for k in range(nkpts):
-        idx_occ, idx_frac, _ = get_idx_metal(mo_occ[k])
-        orbital_info.append((len(idx_occ), len(idx_frac)))
-    max_left = max(nocc + nfrac for nocc, nfrac in orbital_info)
-    kconserv_table = get_kconserv_ria_efficient(rpa.mol, rpa.kpts)
-
-    e_corr = cp.zeros((), dtype=cp.complex128)
-    for kL in range(nkpts):
-        kidx = kconserv_table[kL]
-        Pi = signs = None
-        for orb_start in range(0, max_left, rpa.segsize):
-            mo_left = []
-            mo_right = []
-            for k in range(nkpts):
-                nocc_k, nfrac_k = orbital_info[k]
-                orb_end_k = min(orb_start + rpa.segsize,
-                                nocc_k + nfrac_k)
-                mo_left.append(mo_coeff[k, :, orb_start:orb_end_k])
-                mo_right.append(mo_coeff[k, :, nocc_k:])
-
-            sectors = _transform_cderi(rpa, kidx, mo_left, mo_right)
-            Lij_by_k, signs_iter = _stack_metric_sectors(sectors)
-            if signs is None:
-                signs = signs_iter
-                Pi = cp.zeros((nw, len(signs), len(signs)),
-                              dtype=cp.complex128)
-            elif not bool(cp.array_equal(signs, signs_iter).item()):
-                raise RuntimeError('Inconsistent GDF metric between orbital segments')
-
-            for i in range(nkpts):
-                j = int(kidx[i])
-                nocc_i, nfrac_i = orbital_info[i]
-                nocc_j, nfrac_j = orbital_info[j]
-                orb_end = min(orb_start + rpa.segsize, nocc_i + nfrac_i)
-                if orb_end <= orb_start:
-                    continue
-                eia = (mo_energy[i, orb_start:orb_end, None] -
-                       mo_energy[j, None, nocc_j:])
-                fia = (mo_occ[i, orb_start:orb_end, None] -
-                       mo_occ[j, None, nocc_j:]) / 2.0
-                if nfrac_j:
-                    if orb_start >= nocc_i:
-                        fia[:, :nfrac_j] *= 0.5
-                    elif orb_end > nocc_i:
-                        fia[nocc_i - orb_start:, :nfrac_j] *= 0.5
-                for w, omega in enumerate(freqs):
-                    rho_accum_inner(
-                        Pi[w], eia, omega, Lij_by_k[i],
-                        alpha=4.0 / nkpts, fia=fia)
-
-        for w in range(nw):
-            e_corr += get_rpa_ecorr_w(
-                _apply_metric(Pi[w], signs), wts[w])
 
     e_corr = e_corr.real / (2.0 * np.pi * nkpts)
     return _to_float(e_corr)
@@ -898,18 +733,25 @@ def get_rpa_exx(rpa, acfd=False, correction_only=False):
             nocc_by_k.append(len(idx_occ) + len(idx_frac))
         else:
             nocc_by_k.append(int(cp.count_nonzero(mo_occ[k]).item()))
-    mo_occ_coeff = [mo_coeff[k, :, :nocc_by_k[k]] for k in range(nkpts)]
+    if is_metal:
+        mo_occ_coeff = [
+            mo_coeff[k, :, :nocc_by_k[k]] for k in range(nkpts)]
+    else:
+        if len(set(nocc_by_k)) != 1:
+            raise ValueError('Insulating KRPA requires uniform occupations')
+        mo_occ_coeff = mo_coeff[:, :, :nocc_by_k[0]]
 
     ex = cp.zeros((), dtype=cp.complex128)
     for kL in range(nkpts):
         kidx = kconserv_table[kL]
         sectors = _transform_cderi(
-            rpa, kidx, mo_occ_coeff, mo_occ_coeff)
-        Lij_by_k, signs = _stack_metric_sectors(sectors)
-        for km in range(nkpts):
-            kn = int(kidx[km])
-            Lij = Lij_by_k[km]
-            if is_metal:
+            rpa, kidx, mo_occ_coeff, mo_occ_coeff,
+            batch_kpts=not is_metal)
+        Lij, signs = _stack_metric_sectors(sectors)
+        if is_metal:
+            for km in range(nkpts):
+                kn = int(kidx[km])
+                Lij_k = Lij[km]
                 nocc_i = nocc_by_k[km]
                 nocc_j = nocc_by_k[kn]
                 occ_i = mo_occ[km, :nocc_i, None]
@@ -920,11 +762,12 @@ def get_rpa_exx(rpa, acfd=False, correction_only=False):
                         occ_weight -= occ_i * occ_j / 4.0
                 else:
                     occ_weight = occ_i * occ_j / 4.0
-                Lij_weighted = Lij * occ_weight[None]
+                Lij_weighted = Lij_k * occ_weight[None]
                 ex -= cp.einsum(
-                    'Lij,Lij,L->', Lij_weighted.conj(), Lij, signs)
-            else:
-                ex -= cp.einsum('Lij,Lij,L->', Lij.conj(), Lij, signs)
+                    'Lij,Lij,L->', Lij_weighted.conj(), Lij_k, signs)
+        else:
+            ex -= cp.einsum(
+                'kLij,kLij,L->', Lij.conj(), Lij, signs)
 
     ex = ex.real / nkpts**2
 
@@ -971,8 +814,8 @@ def get_kconserv_ria_efficient(cell, kpts, tol=1e-12):
 
 class KRPA(pyscf_lib.StreamObject):
     _keys = {
-        'mol', '_scf', 'max_memory', 'frozen', 'grids_alg', 'outcore',
-        'segsize', 'fc', 'fc_grid', 'acfd_exx', '_nocc', '_nmo', 'kpts',
+        'mol', '_scf', 'max_memory', 'frozen', 'grids_alg', 'fc', 'fc_grid',
+        'acfd_exx', '_nocc', '_nmo', 'kpts',
         'nkpts', 'mo_energy', 'mo_coeff', 'mo_occ', 'e_corr', 'e_hf',
         'e_tot', 'with_df',
     }
@@ -991,8 +834,6 @@ class KRPA(pyscf_lib.StreamObject):
         # options
         self.frozen = frozen  # frozen orbital options
         self.grids_alg = 'legendre'  # algorithm to generate grids
-        self.outcore = False  # low-memory routine
-        self.segsize = 50  # number of orbitals in one segment for outcore
         self.fc = False  # finite-size correction
         self.fc_grid = False  # grids for finite-size correction
         self.acfd_exx = False  # calculate ACFD exchange energy
@@ -1029,9 +870,6 @@ class KRPA(pyscf_lib.StreamObject):
         if self.frozen is not None:
             log.info(f'frozen orbitals = {str(self.frozen)}')
         log.info('grid type = %s', self.grids_alg)
-        log.info('outcore mode = %s', self.outcore)
-        if self.outcore is True:
-            log.info('outcore segment size = %d', self.segsize)
         log.info('RPA finite size corrections = %s', self.fc)
         log.info('ACFD exchange energy = %s', self.acfd_exx)
         log.info('')
