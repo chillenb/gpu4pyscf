@@ -22,6 +22,11 @@ from gpu4pyscf.pbc import df, scf
 from gpu4pyscf.pbc.gw.krpa import KRPA
 
 
+# GPU GDF uses a different auxiliary-metric factorization from PySCF RSGDF.
+DIAMOND_NO_FC = (-10.694342003057113, -0.18527462954683174)
+DIAMOND_FC = (-10.716296661695937, -0.20722928818566372)
+
+
 @pytest.fixture(scope='module')
 def diamond_krhf():
     cell = gto.Cell()
@@ -59,8 +64,8 @@ def test_krpa_no_fc(diamond_krhf):
     rpa.fc = False
     rpa.kernel()
 
-    assert rpa.e_corr == pytest.approx(-0.1852772037535004, abs=1e-6)
-    assert rpa.e_tot == pytest.approx(-10.694392044197565, abs=1e-6)
+    assert rpa.e_corr == pytest.approx(DIAMOND_NO_FC[1], abs=1e-6)
+    assert rpa.e_tot == pytest.approx(DIAMOND_NO_FC[0], abs=1e-6)
 
 
 def test_krpa_no_fc_outcore(diamond_krhf):
@@ -69,8 +74,8 @@ def test_krpa_no_fc_outcore(diamond_krhf):
     rpa.segsize = 2
     rpa.kernel()
 
-    assert rpa.e_corr == pytest.approx(-0.1852772037535004, abs=1e-6)
-    assert rpa.e_tot == pytest.approx(-10.694392044197565, abs=1e-6)
+    assert rpa.e_corr == pytest.approx(DIAMOND_NO_FC[1], abs=1e-6)
+    assert rpa.e_tot == pytest.approx(DIAMOND_NO_FC[0], abs=1e-6)
 
 
 def test_krpa_acfd_exx_high_cost(diamond_krhf):
@@ -79,8 +84,8 @@ def test_krpa_acfd_exx_high_cost(diamond_krhf):
     rpa.acfd_exx = True
     rpa.kernel()
 
-    assert rpa.e_corr == pytest.approx(-0.18527720400362488, abs=1e-6)
-    assert rpa.e_tot == pytest.approx(-10.694392045437178, abs=1e-6)
+    assert rpa.e_corr == pytest.approx(DIAMOND_NO_FC[1], abs=1e-6)
+    assert rpa.e_tot == pytest.approx(DIAMOND_NO_FC[0], abs=1e-6)
 
 
 def test_krpa_with_fc(diamond_krhf):
@@ -88,8 +93,8 @@ def test_krpa_with_fc(diamond_krhf):
     rpa.fc = True
     rpa.kernel()
 
-    assert rpa.e_corr == pytest.approx(-0.20723389722097715, abs=1e-6)
-    assert rpa.e_tot == pytest.approx(-10.716348738655793, abs=1e-6)
+    assert rpa.e_corr == pytest.approx(DIAMOND_FC[1], abs=1e-6)
+    assert rpa.e_tot == pytest.approx(DIAMOND_FC[0], abs=1e-6)
 
 
 def test_krpa_with_fc_outcore(diamond_krhf):
@@ -99,8 +104,8 @@ def test_krpa_with_fc_outcore(diamond_krhf):
     rpa.segsize = 2
     rpa.kernel()
 
-    assert rpa.e_corr == pytest.approx(-0.20723389722097715, abs=1e-6)
-    assert rpa.e_tot == pytest.approx(-10.716348738655793, abs=1e-6)
+    assert rpa.e_corr == pytest.approx(DIAMOND_FC[1], abs=1e-6)
+    assert rpa.e_tot == pytest.approx(DIAMOND_FC[0], abs=1e-6)
 
 
 def test_krpa_get_idx_metal():
