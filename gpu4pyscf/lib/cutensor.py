@@ -23,6 +23,7 @@ try:
     from cupyx import cutensor
     from cupy_backends.cuda.libs import cutensor as cutensor_backend
     ALGO_DEFAULT = cutensor_backend.ALGO_DEFAULT
+    OP_CONJ = cutensor_backend.OP_CONJ
     OP_IDENTITY = cutensor_backend.OP_IDENTITY
     JIT_MODE_NONE = cutensor_backend.JIT_MODE_NONE
     WORKSPACE_RECOMMENDED = cutensor_backend.WORKSPACE_MIN
@@ -54,6 +55,7 @@ except (ImportError, AttributeError, OSError):
     cutensor = None
     _libcutensor = None
     ALGO_DEFAULT = None
+    OP_CONJ = None
     OP_IDENTITY = None
     JIT_MODE_NONE = None
     WORKSPACE_RECOMMENDED = None
@@ -350,11 +352,28 @@ else:
         return contraction(pattern, a, b, alpha, beta, out=out)
 
 
-def contract_trinary(pattern, a, b, c, alpha=1.0, beta=0.0, out=None):
-    """Einsum-style wrapper for a three-operand tensor contraction."""
+def contract_trinary(pattern, a, b, c, alpha=1.0, beta=0.0, out=None, *,
+                     conj_a=False, conj_b=False, conj_c=False):
+    """Einsum-style wrapper for a three-operand tensor contraction.
+
+    Complex operands can be conjugated without a temporary when cuTENSOR is
+    available. Einsum fallbacks explicitly conjugate the requested operands.
+    """
+    conjugate = (conj_a, conj_b, conj_c)
+    operands = (a, b, c)
     if contract_engine is not None or _libcutensor is None:
         fallback = einsum if contract_engine is not None else cupy.einsum
+        operands = tuple(
+            operand.conj()
+            if flag and np.dtype(operand.dtype).kind == 'c' else operand
+            for operand, flag in zip(operands, conjugate))
+        a, b, c = operands
         return _contract_trinary_einsum(
             pattern, a, b, c, alpha, beta, out=out, einsum=fallback)
+    ops = tuple(
+        OP_CONJ if flag and np.dtype(operand.dtype).kind == 'c'
+        else OP_IDENTITY
+        for operand, flag in zip(operands, conjugate))
     return contraction_trinary(
-        pattern, a, b, c, alpha, beta, out=out)
+        pattern, a, b, c, alpha, beta, out=out,
+        op_a=ops[0], op_b=ops[1], op_c=ops[2])
