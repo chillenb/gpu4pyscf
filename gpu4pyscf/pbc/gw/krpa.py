@@ -67,7 +67,8 @@ def _contract_accumulate(pattern, a, b, out, alpha=1.0):
     lib.contract(pattern, a, b, alpha=alpha, beta=1.0, out=target)
 
 
-def _contract_accumulate_trinary(pattern, a, b, c, out, alpha=1.0):
+def _contract_accumulate_trinary(
+        pattern, a, b, c, out, alpha=1.0, conj_a=False):
     """Accumulate a trinary contraction without an output-sized temporary."""
     dtype = np.result_type(a.dtype, b.dtype, c.dtype)
     if dtype == out.dtype:
@@ -75,10 +76,12 @@ def _contract_accumulate_trinary(pattern, a, b, c, out, alpha=1.0):
     elif out.dtype.kind == 'c' and dtype == out.real.dtype:
         target = out.real
     else:
-        out += alpha * contract_trinary(pattern, a, b, c)
+        out += alpha * contract_trinary(
+            pattern, a, b, c, conj_a=conj_a)
         return
     contract_trinary(
-        pattern, a, b, c, alpha=alpha, beta=1.0, out=target)
+        pattern, a, b, c, alpha=alpha, beta=1.0, out=target,
+        conj_a=conj_a)
 
 
 def get_frozen_mask(rpa):
@@ -431,8 +434,8 @@ def get_rho_response(omega, mo_energy, Lia, kidx):
     weight = eia / (omega**2 + eia**2)
     Pi = cp.zeros((naux, naux), dtype=cp.complex128)
     _contract_accumulate_trinary(
-        'kPia,kia,kQia->PQ', Lia, weight, Lia.conj(), Pi,
-        alpha=4.0 / nkpts)
+        'kQia,kPia,kia->PQ', Lia, Lia, weight, Pi,
+        alpha=4.0 / nkpts, conj_a=True)
     return Pi
 
 
@@ -599,7 +602,8 @@ def rho_accum_inner(Pi, eia, omega, Lov, alpha=0.0, fia=None):
     else:
         weight = eia * fia / (omega**2 + eia**2)
     _contract_accumulate_trinary(
-        'Pia,ia,Qia->PQ', Lov, weight, Lov.conj(), Pi, alpha=alpha)
+        'Qia,Pia,ia->PQ', Lov, Lov, weight, Pi,
+        alpha=alpha, conj_a=True)
 
     return
 
