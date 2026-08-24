@@ -42,7 +42,6 @@ from pyscf.pbc.tools import k2gamma
 
 from gpu4pyscf.lib import cupy_helper as lib
 from gpu4pyscf.lib import logger, utils
-from gpu4pyscf.lib.cutensor import contract_trinary
 from gpu4pyscf.pbc.df.df import GDF
 from gpu4pyscf.pbc.dft import gen_grid, numint
 from gpu4pyscf.pbc.lib.kpts_helper import kk_adapted_iter
@@ -65,23 +64,6 @@ def _contract_accumulate(pattern, a, b, out, alpha=1.0):
         out += alpha * lib.contract(pattern, a, b)
         return
     lib.contract(pattern, a, b, alpha=alpha, beta=1.0, out=target)
-
-
-def _contract_accumulate_trinary(
-        pattern, a, b, c, out, alpha=1.0, conj_a=False):
-    """Accumulate a trinary contraction without an output-sized temporary."""
-    dtype = np.result_type(a.dtype, b.dtype, c.dtype)
-    if dtype == out.dtype:
-        target = out
-    elif out.dtype.kind == 'c' and dtype == out.real.dtype:
-        target = out.real
-    else:
-        out += alpha * contract_trinary(
-            pattern, a, b, c, conj_a=conj_a)
-        return
-    contract_trinary(
-        pattern, a, b, c, alpha=alpha, beta=1.0, out=target,
-        conj_a=conj_a)
 
 
 def get_frozen_mask(rpa):
@@ -432,10 +414,10 @@ def get_rho_response(omega, mo_energy, Lia, kidx):
     eia = (mo_energy[:, :nocc, None] -
            mo_energy[kidx, None, nocc:])
     weight = eia / (omega**2 + eia**2)
+    Pia = Lia * weight[:, None]
     Pi = cp.zeros((naux, naux), dtype=cp.complex128)
-    _contract_accumulate_trinary(
-        'kQia,kPia,kia->PQ', Lia, Lia, weight, Pi,
-        alpha=4.0 / nkpts, conj_a=True)
+    _contract_accumulate(
+        'kPia,kQia->PQ', Pia, Lia.conj(), Pi, alpha=4.0 / nkpts)
     return Pi
 
 
@@ -598,12 +580,12 @@ def rho_accum_inner(Pi, eia, omega, Lov, alpha=0.0, fia=None):
     Lov = cp.asarray(Lov)
     eia = cp.asarray(eia)
     if fia is None:
-        weight = eia / (omega**2 + eia**2)
+        eia = eia / (omega**2 + eia**2)
     else:
-        weight = eia * fia / (omega**2 + eia**2)
-    _contract_accumulate_trinary(
-        'Qia,Pia,ia->PQ', Lov, Lov, weight, Pi,
-        alpha=alpha, conj_a=True)
+        eia = eia * fia / (omega**2 + eia**2)
+    Pia = Lov * eia
+    _contract_accumulate(
+        'Pia,Qia->PQ', Pia, Lov.conj(), Pi, alpha=alpha)
 
     return
 
