@@ -16,6 +16,7 @@ import unittest
 import numpy
 import cupy
 from gpu4pyscf.lib.cupy_helper import contract
+from gpu4pyscf.lib.cutensor import contraction_trinary
 
 class KnownValues(unittest.TestCase):
     def test_contract(self):
@@ -60,6 +61,27 @@ class KnownValues(unittest.TestCase):
     def test_zero_strides(self):
         a = cupy.ones((3, 3))
         assert contract('ij,ji->', a[0,:,None], a[0,None,:]) == 3
+
+    def test_contraction_trinary(self):
+        a = cupy.random.rand(5, 7).astype(cupy.float32)
+        b = cupy.random.rand(7, 6).astype(cupy.float32)
+        c = cupy.random.rand(6, 4).astype(cupy.float32)
+        expected = cupy.einsum('ab,bc,cd->ad', a, b, c)
+        result = contraction_trinary(
+            'ab,bc,cd->ad', a, b, c, alpha=1.0, beta=0.0)
+        assert cupy.linalg.norm(expected - result) < 1e-5
+
+    def test_contraction_trinary_with_output(self):
+        a = cupy.random.rand(5, 7)
+        b = cupy.random.rand(7, 6)
+        c = cupy.random.rand(6, 4)
+        out = cupy.random.rand(5, 4)
+        expected = 1.25 * cupy.einsum('ab,bc,cd->ad', a, b, c) - .5 * out
+        result = contraction_trinary(
+            'ab,bc,cd->ad', a, b, c,
+            alpha=1.25, beta=-.5, out=out)
+        assert result is out
+        assert cupy.linalg.norm(expected - result) < 1e-10
 
 if __name__ == "__main__":
     print("Full tests for cutensor module")
