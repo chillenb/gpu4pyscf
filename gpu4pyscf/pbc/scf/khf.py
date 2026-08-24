@@ -725,16 +725,16 @@ class KRHF(KSCF):
         # FIXME: consider the fractional num_electron or not? This maybe
         # relate to the charged system.
         nelectron = float(self.cell.tot_electrons(nkpts))
-        if abs(ne - nelectron) > 0.01*nkpts:
-            logger.debug(self, 'Big error detected in the electron number '
-                         'of initial guess density matrix (Ne/cell = %g)!\n'
-                         '  This can cause huge error in Fock matrix and '
-                         'lead to instability in SCF for low-dimensional '
-                         'systems.\n  DM is normalized wrt the number '
-                         'of electrons %s', ne/nkpts, nelectron/nkpts)
-            dm *= nelectron / ne
-            if hasattr(dm, 'mo_coeff'):
-                dm.mo_occ *= nelectron / ne
+        # if abs(ne - nelectron) > 0.01*nkpts:
+        #     logger.debug(self, 'Big error detected in the electron number '
+        #                  'of initial guess density matrix (Ne/cell = %g)!\n'
+        #                  '  This can cause huge error in Fock matrix and '
+        #                  'lead to instability in SCF for low-dimensional '
+        #                  'systems.\n  DM is normalized wrt the number '
+        #                  'of electrons %s', ne/nkpts, nelectron/nkpts)
+        #     dm *= nelectron / ne
+        #     if hasattr(dm, 'mo_coeff'):
+        #         dm.mo_occ *= nelectron / ne
         return dm
 
     def density_fit(self, auxbasis=None, with_df=None):
