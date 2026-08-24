@@ -154,6 +154,13 @@ def _transform_cderi(rpa, desired_kidx, mo_left, mo_right):
     desired_kidx = np.asarray(desired_kidx, dtype=int)
     mo_left = [cp.asarray(x) for x in mo_left]
     mo_right = [cp.asarray(x) for x in mo_right]
+    dtype = cp.result_type(
+        mydf._cderi[kp].dtype,
+        *(x.dtype for x in mo_left),
+        *(x.dtype for x in mo_right),
+    )
+    mo_left = [x.astype(dtype, copy=False) for x in mo_left]
+    mo_right = [x.astype(dtype, copy=False) for x in mo_right]
 
     naux_pos = mydf._cderi[kp].shape[0]
     sector_sizes = [(1, naux_pos)]
@@ -165,7 +172,7 @@ def _transform_cderi(rpa, desired_kidx, mo_left, mo_right):
     for sign, naux in sector_sizes:
         transformed[sign] = [
             cp.empty((naux, mo_left[i].shape[1],
-                      mo_right[desired_kidx[i]].shape[1]), dtype=cp.complex128)
+                      mo_right[desired_kidx[i]].shape[1]), dtype=dtype)
             for i in range(nkpts)
         ]
 
@@ -189,6 +196,7 @@ def _transform_cderi(rpa, desired_kidx, mo_left, mo_right):
                     Lpq_i = Lpq[j].conj().transpose(0, 2, 1)
                 else:
                     Lpq_i = Lpq[i]
+                Lpq_i = Lpq_i.astype(dtype, copy=False)
                 if mo_left[i].shape[1] == 0 or mo_right[j].shape[1] == 0:
                     continue
                 buf = contract('Lpq,qj->Lpj', Lpq_i, mo_right[j])
@@ -255,7 +263,8 @@ def kernel(rpa, mo_energy, mo_coeff, nw=None, with_e_hf=None):
             dm = rpa._scf.make_rdm1()
             e_1e = cp.einsum('kij,kji->', dm, rpa._scf.get_hcore()).real / rpa.nkpts
             e_j = (cp.einsum('kij,kji->', dm,
-                              rpa._scf.get_j(rpa.mol, dm)).real *
+                              rpa._scf.get_j(
+                                  rpa.mol, dm, kpts=rpa.kpts)).real *
                    (0.5 / rpa.nkpts))
             e_x = get_rpa_exx(rpa, acfd=rpa.acfd_exx, correction_only=False)
             e_nuc = _to_float(rpa._scf.energy_nuc())

@@ -54,7 +54,6 @@ def diamond_krhf():
     cell.stdout.close()
 
 
-@pytest.mark.slow
 def test_krpa_no_fc(diamond_krhf):
     rpa = KRPA(diamond_krhf)
     rpa.fc = False
@@ -64,7 +63,6 @@ def test_krpa_no_fc(diamond_krhf):
     assert rpa.e_tot == pytest.approx(-10.694392044197565, abs=1e-6)
 
 
-@pytest.mark.slow
 def test_krpa_no_fc_outcore(diamond_krhf):
     rpa = KRPA(diamond_krhf)
     rpa.outcore = True
@@ -75,7 +73,6 @@ def test_krpa_no_fc_outcore(diamond_krhf):
     assert rpa.e_tot == pytest.approx(-10.694392044197565, abs=1e-6)
 
 
-@pytest.mark.slow
 def test_krpa_acfd_exx_high_cost(diamond_krhf):
     rpa = KRPA(diamond_krhf)
     rpa.fc = False
@@ -86,7 +83,6 @@ def test_krpa_acfd_exx_high_cost(diamond_krhf):
     assert rpa.e_tot == pytest.approx(-10.694392045437178, abs=1e-6)
 
 
-@pytest.mark.slow
 def test_krpa_with_fc(diamond_krhf):
     rpa = KRPA(diamond_krhf)
     rpa.fc = True
@@ -96,7 +92,6 @@ def test_krpa_with_fc(diamond_krhf):
     assert rpa.e_tot == pytest.approx(-10.716348738655793, abs=1e-6)
 
 
-@pytest.mark.slow
 def test_krpa_with_fc_outcore(diamond_krhf):
     rpa = KRPA(diamond_krhf)
     rpa.fc = True
@@ -191,7 +186,6 @@ def water_krhf():
     cell.stdout.close()
 
 
-@pytest.mark.slow
 def test_krpa_exx_with_frozen(water_krhf):
     """KRPA exchange agrees with the GPU mean-field exchange matrix."""
     from gpu4pyscf.pbc.gw.krpa import get_rpa_exx
@@ -206,7 +200,7 @@ def test_krpa_exx_with_frozen(water_krhf):
         rpa = KRPA(kmf, frozen=0)
         mf = rpa._scf
         dm = mf.make_rdm1()
-        vk = mf.get_k(mf.cell, dm)
+        vk = mf.get_k(mf.cell, dm, kpts=mf.kpts)
         e_x_ref = _as_float(
             cp.einsum('kij,kji->', vk, dm).real *
             (-0.25 / len(mf.kpts)))
