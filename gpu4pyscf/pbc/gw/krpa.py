@@ -33,15 +33,15 @@ import time
 import cupy as cp
 import numpy as np
 
-from pyscf import lib
+from pyscf import lib as pyscf_lib
 from pyscf.gw.utils.ac_grid import _get_scaled_legendre_roots
 from pyscf.lib import temporary_env
 from pyscf.pbc import tools
 from pyscf.pbc.lib.kpts import KPoints
 from pyscf.pbc.tools import k2gamma
 
+from gpu4pyscf.lib import cupy_helper as lib
 from gpu4pyscf.lib import logger, utils
-from gpu4pyscf.lib.cupy_helper import contract, get_avail_mem
 from gpu4pyscf.pbc.df.df import GDF
 from gpu4pyscf.pbc.dft import gen_grid, numint
 from gpu4pyscf.pbc.lib.kpts_helper import kk_adapted_iter
@@ -178,11 +178,11 @@ def _transform_cderi(rpa, desired_kidx, mo_left, mo_right):
 
     bytes_per_aux = max(
         nkpts * nao * nao * np.dtype(np.complex128).itemsize * 2, 1)
-    blksize = int(get_avail_mem() * 0.15 // bytes_per_aux)
+    blksize = int(lib.get_avail_mem() * 0.15 // bytes_per_aux)
     blksize = max(1, min(blksize, mydf.blockdim, naux_pos))
     logger.debug1(rpa, 'KRPA GDF transfer %d block size %d', kp, blksize)
 
-    for p0, p1 in lib.prange(0, naux_pos, blksize):
+    for p0, p1 in pyscf_lib.prange(0, naux_pos, blksize):
         aux_iter = iter(((kp, p0, p1),))
         for _, Lpq, sign in mydf.loop(
                 blksize, kpts=rpa.kpts, aux_iter=aux_iter):
@@ -199,9 +199,9 @@ def _transform_cderi(rpa, desired_kidx, mo_left, mo_right):
                 Lpq_i = Lpq_i.astype(dtype, copy=False)
                 if mo_left[i].shape[1] == 0 or mo_right[j].shape[1] == 0:
                     continue
-                buf = contract('Lpq,qj->Lpj', Lpq_i, mo_right[j])
-                contract('pi,Lpj->Lij', mo_left[i].conj(), buf,
-                         out=transformed[sign][i][q0:q1])
+                buf = lib.contract('Lpq,qj->Lpj', Lpq_i, mo_right[j])
+                lib.contract('pi,Lpj->Lij', mo_left[i].conj(), buf,
+                             out=transformed[sign][i][q0:q1])
             Lpq = None
 
     return [(sign, transformed[sign]) for sign, _ in sector_sizes]
@@ -261,10 +261,11 @@ def kernel(rpa, mo_energy, mo_coeff, nw=None, with_e_hf=None):
     if with_e_hf is None:
         with temporary_env(rpa.with_df, verbose=0), temporary_env(rpa.mol, verbose=0):
             dm = rpa._scf.make_rdm1()
-            e_1e = cp.einsum('kij,kji->', dm, rpa._scf.get_hcore()).real / rpa.nkpts
-            e_j = (cp.einsum('kij,kji->', dm,
-                              rpa._scf.get_j(
-                                  rpa.mol, dm, kpts=rpa.kpts)).real *
+            e_1e = (lib.contract(
+                'kij,kji->', dm, rpa._scf.get_hcore()).real / rpa.nkpts)
+            e_j = (lib.contract(
+                'kij,kji->', dm,
+                rpa._scf.get_j(rpa.mol, dm, kpts=rpa.kpts)).real *
                    (0.5 / rpa.nkpts))
             e_x = get_rpa_exx(rpa, acfd=rpa.acfd_exx, correction_only=False)
             e_nuc = _to_float(rpa._scf.energy_nuc())
@@ -372,13 +373,12 @@ def get_rho_response_wing(omega, mo_energy, Lia, qij):
     Lia = cp.asarray(Lia)
     mo_energy = cp.asarray(mo_energy)
     qij = cp.asarray(qij)
-    nkpts, naux, nocc, nvir = Lia.shape
+    nkpts, naux, nocc, _ = Lia.shape
     Pi = cp.zeros(naux, dtype=cp.complex128)
     for k in range(nkpts):
         eia = mo_energy[k, :nocc, None] - mo_energy[k, None, nocc:]
         eia_q = eia * qij[k].conj() / (omega**2 + eia**2)
-        Pi += (4.0 / nkpts *
-               Lia[k].reshape(naux, nocc * nvir).dot(eia_q.ravel()))
+        Pi += 4.0 / nkpts * cp.einsum('Pia,ia->P', Lia[k], eia_q)
     return Pi
 
 
@@ -411,14 +411,15 @@ def get_qij(rpa, q, mo_energy, mo_coeff, uniform_grids=False):
             ao = ao_ks[k, 0]
             ao_grad = ao_ks[k, 1:4]
             aow = ao.conj() * weights[:, None]
-            ao_ao_grad[k] += contract('gm,xgn->xmn', aow, ao_grad)
+            ao_ao_grad[k] += lib.contract('gm,xgn->xmn', aow, ao_grad)
 
     q = cp.asarray(q)
     qij = cp.empty((rpa.nkpts, nocc, nvir), dtype=cp.complex128)
     for k in range(rpa.nkpts):
         q_ao = -1j * cp.einsum('x,xmn->mn', q, ao_ao_grad[k])
-        q_mo = mo_coeff[k, :, :nocc].conj().T.dot(q_ao)
-        q_mo = q_mo.dot(mo_coeff[k, :, nocc:])
+        q_mo = cp.einsum(
+            'pi,pq,qj->ij', mo_coeff[k, :, :nocc].conj(), q_ao,
+            mo_coeff[k, :, nocc:])
         enm = 1.0 / (mo_energy[k, nocc:, None] -
                      mo_energy[k, None, :nocc])
         qij[k] = enm.T * q_mo / np.sqrt(cell.vol)
@@ -512,15 +513,12 @@ def rho_accum_inner(Pi, eia, omega, Lov, alpha=0.0, fia=None):
     """
     Lov = cp.asarray(Lov)
     eia = cp.asarray(eia)
-    naux, nocc, nvir = Lov.shape
-
     if fia is None:
         eia = eia / (omega**2 + eia**2)
     else:
         eia = eia * fia / (omega**2 + eia**2)
-    Lov_2d = Lov.reshape(naux, nocc * nvir)
-    Pia = (Lov * eia).reshape(naux, nocc * nvir)
-    Pi += alpha * Pia.dot(Lov_2d.conj().T)
+    Pia = Lov * eia
+    Pi += alpha * lib.contract('Pia,Qia->PQ', Pia, Lov.conj())
 
     return
 
@@ -546,9 +544,8 @@ def rho_wing_accum_inner(Pi_P0, eia, omega, Lov, qov, alpha=0.0):
     Lov = cp.asarray(Lov)
     eia = cp.asarray(eia)
     qov = cp.asarray(qov)
-    naux, nocc, nvir = Lov.shape
     eia_q = eia * qov.conj() / (omega**2 + eia**2)
-    Pi_P0 += alpha * Lov.reshape(naux, nocc * nvir).dot(eia_q.ravel())
+    Pi_P0 += alpha * cp.einsum('Pia,ia->P', Lov, eia_q)
 
     return
 
@@ -954,7 +951,7 @@ def get_kconserv_ria_efficient(cell, kpts, tol=1e-12):
     return kconserv
 
 
-class KRPA(lib.StreamObject):
+class KRPA(pyscf_lib.StreamObject):
     _keys = {
         'mol', '_scf', 'max_memory', 'frozen', 'grids_alg', 'outcore',
         'segsize', 'fc', 'fc_grid', 'acfd_exx', '_nocc', '_nmo', 'kpts',
