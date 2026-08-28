@@ -435,6 +435,57 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
     log.debug(f"Eion: {Eion:.3e} Hartree ({Eion*nist.HARTREE2EV:.3e} eV)")
     log.debug(f"Ediel: {Ediel:.3e} Hartree ({Ediel*nist.HARTREE2EV:.3e} eV)")
 
+    if ni.chkfile is not None:
+        z = np.arange(mesh[2]) * cell.lattice_vectors(unit='A')[2, 2] / mesh[2]
+        solution_phi_z = solution_phi_R.reshape(mesh).mean(axis=(0, 1))
+        solvation_potential_z = solvation_potentialR.reshape(mesh).mean(axis=(0, 1))
+        vac_coulomb_potential_z = vac_coulomb_potentialR.reshape(mesh).mean(axis=(0, 1))
+        vcorr_z = vcorr_r.reshape(mesh).mean(axis=(0, 1))
+        rho_z = rhoR.reshape(mesh).mean(axis=(0, 1))
+        pseudo_nucdensity_z = pseudo_nucdensityR.reshape(mesh).mean(axis=(0, 1))
+        vion_z = vion_r.reshape(mesh).mean(axis=(0, 1))
+        vdiel_z = vdiel_r.reshape(mesh).mean(axis=(0, 1))
+        vcav_z = vcav_r.reshape(mesh).mean(axis=(0, 1))
+        rho_ion_R = solution_phi_R * S * (ebkappa2 / (4*np.pi))
+        rhoion_z = rho_ion_R.reshape(mesh).mean(axis=(0, 1))
+        rhodiel_z = diel_bound_charge_density_R.reshape(mesh).mean(axis=(0, 1))
+        S_z = S.reshape(mesh).mean(axis=(0, 1))
+        Sprime_z = Sprime.reshape(mesh).mean(axis=(0, 1))
+        Sphi_z = (solution_phi_R * S).reshape(mesh).mean(axis=(0, 1))
+
+        solution_phi_z = solution_phi_z.get()
+        solvation_potential_z = solvation_potential_z.get()
+        vac_coulomb_potential_z = vac_coulomb_potential_z.get()
+        vcorr_z = vcorr_z.get()
+        rho_z = rho_z.get()
+        pseudo_nucdensity_z = pseudo_nucdensity_z.get()
+        vion_z = vion_z.get()
+        vdiel_z = vdiel_z.get()
+        vcav_z = vcav_z.get()
+        rhoion_z = rhoion_z.get()
+        rhodiel_z = rhodiel_z.get()
+        S_z = S_z.get()
+        Sprime_z = Sprime_z.get()
+        Sphi_z = Sphi_z.get()
+
+        np.savez(ni.chkfile,
+            z=z,
+            solution_phi_z=solution_phi_z,
+            solvation_potential_z=solvation_potential_z,
+            vac_coulomb_potential_z=vac_coulomb_potential_z,
+            vcorr_z=vcorr_z.real,
+            vion_z=vion_z.real,
+            vdiel_z=vdiel_z,
+            vcav_z=vcav_z,
+            rhoion_z=rhoion_z,
+            rhodiel_z=rhodiel_z,
+            S_z=S_z,
+            Sprime_z=Sprime_z,
+            rho_z=rho_z,
+            sphi_z=Sphi_z,
+            pseudo_nucdensity_z=pseudo_nucdensity_z,
+        )
+
     results = {
         'Eion': Eion,
         'Ediel': Ediel,
@@ -628,6 +679,7 @@ class LPBEMultiGridNumInt(MultiGridNumInt):
         self.pseudocore_densityG = None
         self.pot_guess = None
         self._lpbe_mesh = None
+        self.chkfile = None
         self.dump_vesta_prefix = options.get('dump_vesta_prefix', None)
 
     def reset(self, cell=None):

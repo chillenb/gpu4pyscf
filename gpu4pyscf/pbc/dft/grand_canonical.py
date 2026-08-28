@@ -822,7 +822,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             else:
                 fixed_n_calc = pending
                 pending = None
-            self.fixed_n_subproblem(fixed_n_calc, tolerance, target_mu=self.mu, dump_chk=dump_chk)
+            self.fixed_n_subproblem(fixed_n_calc, tolerance, target_mu=self.mu, dump_chk=False)
             cycle_data = fixed_n_calc.cycle_data
             if not fixed_n_calc.converged:
                 if best is None:
