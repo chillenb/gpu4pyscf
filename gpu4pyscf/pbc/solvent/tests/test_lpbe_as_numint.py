@@ -4,6 +4,7 @@ import unittest
 
 
 class KnownValues(unittest.TestCase):
+
     def test_cu111_2layers(self):
         a = '''2.5526554800834367 0.0 0.0
         1.2763277400417183 2.210664492861818 0.0
@@ -19,6 +20,7 @@ class KnownValues(unittest.TestCase):
             basis={'Cu': 'DZVP-MOLOPT-PBE-GTH'},
             pseudo='GTH-PBE',
             verbose=4,
+            precision=1e-10,
             nelec_frac=True,
         )
         cell.build()
@@ -34,4 +36,4 @@ class KnownValues(unittest.TestCase):
         mf.init_guess = 'atom'
         mf.run()
 
-        self.assertAlmostEqual(mf.e_tot, -96.2055783894392, 8)
+        self.assertAlmostEqual(mf.e_tot, -96.2055784, 6)

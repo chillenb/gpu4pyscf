@@ -1,6 +1,4 @@
 import ctypes
-
-
 import numpy as np
 import cupy as cp
 import cupyx
@@ -22,14 +20,25 @@ from gpu4pyscf.pbc.gto.cell import get_Gv_weights
 from gpu4pyscf.pbc.df.fft_jk import _format_dms, _format_jks
 from gpu4pyscf.lib import logger, utils
 from gpu4pyscf.pbc.tools import pbc as pbc_tools
+from gpu4pyscf.pbc.tools import k2gamma
 from gpu4pyscf.pbc.tools.vestaio import write_vesta_pgrid
 from gpu4pyscf.lib.cupy_helper import batched_vec_norm2, contract, tag_array
+from gpu4pyscf.lib.cupy_helper import (
+    contract, transpose_sum, ndarray, asarray, tag_array, load_library, absmax,
+    get_avail_mem, vec_dot)
+
+import gpu4pyscf.pbc.dft.multigrid_v3 as multigrid_v3
+from gpu4pyscf.pbc.dft.multigrid_v3 import MultiGridNumInt
+from gpu4pyscf.pbc.dft.multigrid_v3 import fft_in_place, ifft_in_place, _apply_Gv_1j, _xc_var_length, _get_coulomb_in_place
+from gpu4pyscf.pbc.dft.multigrid_v3 import _wannier_transform_dm, _get_Gv_bases, _eval_density, _density_to_real_space
+from gpu4pyscf.pbc.dft.multigrid_v3 import _inverse_wannier_transform_fock, _vxc_to_reciprocal_space, _eval_xc_mat, _contract_Gv_1j
+
+from gpu4pyscf.__config__ import props as gpu_specs
 
 import gpu4pyscf.pbc.dft.multigrid as multigrid_v1
-import gpu4pyscf.pbc.dft.multigrid_v2 as multigrid_v2
-from gpu4pyscf.pbc.dft.multigrid_v2 import MultiGridNumInt
-from gpu4pyscf.pbc.dft.multigrid_v2 import fft_in_place, ifft_in_place, evaluate_density_on_g_mesh, convert_xc_on_g_mesh_to_fock
 
+
+_kernel_registery = {}
 
 class LPBEGridResult:
     """Persistent reciprocal/real-space data from one LPBE NumInt call.
@@ -97,15 +106,15 @@ def debye_length_au(ionic_strength, temperature, eps_r=1.0):
                    (2 * ionic_strength))
 
 
-def gradient_recip(F, Gv, out=None):
+def gradient_recip(F, Gx, Gy, Gz, out=None):
     """Compute the gradient of a function in reciprocal space.
 
     Parameters
     ----------
     F : ndarray
         The function values in reciprocal space.
-    Gv : ndarray
-        The reciprocal lattice vectors.
+    Gx, Gy, Gz : ndarray
+        The reciprocal lattice vectors in each direction.
 
     Returns
     -------
@@ -115,20 +124,21 @@ def gradient_recip(F, Gv, out=None):
     if out is None:
         grad_F = cp.empty((3,) + F.shape, dtype=np.complex128)
     else:
+        assert out.shape == (3,) + F.shape
         grad_F = out
-    for i in range(3):
-        grad_F[i, ...] = 1j * Gv[..., i] * F
+    for n in range(3):
+        _apply_Gv_1j(F, Gx[n], Gy[n], Gz[n], out=grad_F[n])
     return grad_F
 
-def divergence_recip(Fv, Gv, out=None):
+def divergence_recip(Fv, Gx, Gy, Gz, out=None):
     """Compute the divergence of a vector function in reciprocal space.
 
     Parameters
     ----------
     Fv : ndarray
         The vector function values in reciprocal space.
-    Gv : ndarray
-        The reciprocal lattice vectors.
+    Gx, Gy, Gz : ndarray
+        The reciprocal lattice vectors in each direction.
 
     Returns
     -------
@@ -141,8 +151,106 @@ def divergence_recip(Fv, Gv, out=None):
         div_F = out
         div_F.fill(0.0)
     for i in range(3):
-        div_F += 1j * Gv[..., i] * Fv[i, ...]
+        _contract_Gv_1j(div_F, Fv[i], Gx[i], Gy[i], Gz[i])
+    # Above function does div_F += -1j * Gv[..., i] * Fv[i, ...]
+    # we want +1j.
+    div_F *= -1.0
     return div_F
+
+def _precond_yukawa_or_coul(rhoG, Gv_bases, eps_r=1.0, ebkappa2=0.0, out=None):
+    '''
+    Computes
+    out = 4*pi*rhoG / (eps_r * |G|^2 + ebkappa2) if ebkappa2 != 0, else
+    out = 4*pi*rhoG / (eps_r * |G|^2)
+    '''
+    fn_name = 'precond_yukawa_or_coul'
+    if fn_name not in _kernel_registery:
+        kernel_code = ('''\
+extern "C" __global__
+void ''' + fn_name + r'''(double2* __restrict__ out, double2* __restrict__ rhoG,
+    double *Gx, double *Gy, double *Gz, long long nx, long long ny, long long nz,
+    double eps_r, double ebkappa2) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    size_t nyz = ny * nz;
+    size_t ng = nx * nyz;
+    for (size_t g = idx; g < ng; g += stride) {
+        int ix = g / nyz;
+        int iyz = g - nyz * ix;
+        int iy = iyz / nz;
+        int iz = iyz - nz * iy;
+        double GG = 0;
+        for (int n = 0; n < 3; ++n) {
+            double Gv = Gx[n*nx+ix] + Gy[n*ny+iy] + Gz[n*nz+iz];
+            GG += Gv * Gv;
+        }
+        double2 coul = {0.0, 0.0};
+        double2 rho = rhoG[g];
+
+
+        if (ebkappa2 != 0.0) {
+            double fac = 12.566370614359172 / (eps_r * GG + ebkappa2);
+            coul = {fac * rho.x, fac * rho.y};
+        } else if (GG != 0) {
+            double fac = 12.566370614359172 / (eps_r * GG);
+            coul = {fac * rho.x, fac * rho.y};
+        }
+
+        out[g] = coul;
+    }
+}''')
+        _kernel_registery[fn_name] = cp.RawKernel(kernel_code, fn_name)
+
+    kernel = _kernel_registery[fn_name]
+    nx, ny, nz = [x.shape[1] for x in Gv_bases]
+    ng = nx * ny * nz
+    assert rhoG.size == ng
+    out = ndarray(rhoG.shape, buffer=out, dtype=np.complex128)
+    workers = gpu_specs['multiProcessorCount']
+    kernel((workers*2,), (1024,), (out, rhoG, Gv_bases[0], Gv_bases[1], Gv_bases[2], nx, ny, nz, float(eps_r), float(ebkappa2)))
+    return out
+
+def _lapl_scale(phiG, Gv_bases, alpha=1.0, out=None):
+    '''
+    Computes
+    out = - alpha * |G|^2 * phiG / (4 * pi)
+    '''
+    fn_name = 'lapl_scale'
+    if fn_name not in _kernel_registery:
+        kernel_code = ('''\
+extern "C" __global__
+void ''' + fn_name + r'''(double2* __restrict__ out, double2* __restrict__ phiG,
+    double *Gx, double *Gy, double *Gz, long long nx, long long ny, long long nz,
+    double alpha) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    size_t nyz = ny * nz;
+    size_t ng = nx * nyz;
+    for (size_t g = idx; g < ng; g += stride) {
+        int ix = g / nyz;
+        int iyz = g - nyz * ix;
+        int iy = iyz / nz;
+        int iz = iyz - nz * iy;
+        double GG = 0;
+        for (int n = 0; n < 3; ++n) {
+            double Gv = Gx[n*nx+ix] + Gy[n*ny+iy] + Gz[n*nz+iz];
+            GG += Gv * Gv;
+        }
+        double2 phi = phiG[g];
+        double fac = GG * (-1.0 * alpha / 12.566370614359172);
+        out[g] = {phi.x * fac, phi.y * fac};
+    }
+}''')
+        _kernel_registery[fn_name] = cp.RawKernel(kernel_code, fn_name)
+
+    kernel = _kernel_registery[fn_name]
+    nx, ny, nz = [x.shape[1] for x in Gv_bases]
+    ng = nx * ny * nz
+    assert phiG.size == ng
+    out = ndarray(phiG.shape, buffer=out, dtype=np.complex128)
+    workers = gpu_specs['multiProcessorCount']
+    kernel((workers*2,), (1024,), (out, phiG, Gv_bases[0], Gv_bases[1], Gv_bases[2], nx, ny, nz, float(alpha)))
+    return out
 
 
 def pseudocore_density(cell, mesh):
@@ -185,7 +293,7 @@ def pseudocore_density(cell, mesh):
 
 
 
-def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
+def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
 
     RangePush("lpbe_inner")
 
@@ -204,7 +312,12 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
     ionic_strength = options.get('ionic_strength', 1.0)
     debye_length = debye_length_au(molar_to_au(ionic_strength), temp_kelvin, eps_r=rel_permittivity)
 
+    Gv = pbc_tools.get_Gv(ni.cell, ni.mesh)
+
+    Gx, Gy, Gz = Gv_bases
+
     Gabs2 = cp.einsum('gi,gi->g', Gv, Gv)
+    del Gv
 
 
     if has_electrolyte:
@@ -221,7 +334,9 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
 
 
     vpplocG = ni.get_vpplocG()
-    pseudo_nucdensityG = Gabs2 * vpplocG * (-1.0 / (4*np.pi))
+    # pseudo_nucdensityG = Gabs2 * vpplocG * (-1.0 / (4*np.pi))
+    pseudo_nucdensityG = _lapl_scale(vpplocG, Gv_bases)
+
     charges = cell.atom_charges()
     tot_nuc_charge = np.sum(charges)
     pseudo_nucdensityG[0] = tot_nuc_charge
@@ -264,31 +379,36 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
     def make_aop(Skappa2):
         def Aop(phiG):
             # No scaling by weight of the intermediates is necessary thanks to linearity
-            grad_phiG = gradient_recip(phiG, Gv).reshape(3, *mesh)
-            grad_phiR = pbc_tools.ifft(grad_phiG.reshape(3, -1), mesh).reshape(3, *mesh)
+            grad_phiG = gradient_recip(phiG, Gx, Gy, Gz).reshape(3, *mesh)
+            grad_phiR = ifft_in_place(grad_phiG)
             eps_grad_phiR = eps_r_field * grad_phiR
-            eps_grad_phiG = pbc_tools.fft(eps_grad_phiR.reshape(3, -1), mesh)
-            div_eps_grad_phiG = divergence_recip(eps_grad_phiG.reshape(3, -1), Gv)
+            eps_grad_phiG = fft_in_place(eps_grad_phiR)
+            div_eps_grad_phiG = divergence_recip(eps_grad_phiG, Gx, Gy, Gz)
             phi_R = pbc_tools.ifft(phiG, mesh).reshape(*mesh)
             debye_term_real = Skappa2 * phi_R.reshape(*mesh)
-            debye_term_G = pbc_tools.fft(debye_term_real.reshape(-1), mesh)
+            debye_term_G = fft_in_place(debye_term_real)
             return -(div_eps_grad_phiG - debye_term_G).reshape(-1)
         return Aop
 
     mean_S = cp.mean(S.reshape(-1))
-    mean_eps_r = 1. + (rel_permittivity - 1.) * mean_S
-    mean_ebkappa2 = mean_S * ebkappa2
+    mean_eps_r = float(1. + (rel_permittivity - 1.) * mean_S)
+    mean_ebkappa2 = float(mean_S * ebkappa2)
 
-    if ebkappa2 == 0:
-        yukawa_kernel = coul_kernelG
-    else:
-        yukawa_kernel = 4.0 * np.pi / (mean_eps_r * Gabs2 + mean_ebkappa2)
+    # coul_kernelG = pbc_tools.get_coulG(cell, Gv=Gv)
+
+    # if ebkappa2 == 0:
+    #     yukawa_kernel = 4.0 * np.pi / coul_kernelG
+    # else:
+    #     yukawa_kernel = 4.0 * np.pi / (mean_eps_r * Gabs2 + mean_ebkappa2)
+
+
+
 
     # sqrt_yukawa_kernel = cp.sqrt(yukawa_kernel)
     # one_over_epsr = 1.0 / eps_r_field.reshape(-1)
 
     def Mprecond(phiG):
-        precond_phiG = yukawa_kernel * phiG
+        precond_phiG = _precond_yukawa_or_coul(phiG, Gv_bases, eps_r=mean_eps_r, ebkappa2=mean_ebkappa2)
         return precond_phiG.reshape(-1)
 
 
@@ -327,7 +447,8 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
 
     # compute solvation potential.
     solute_chargeG = pbc_tools.fft(solute_chargeR.reshape(-1), mesh).reshape(-1) * weight
-    vac_coulomb_potentialG = coul_kernelG * solute_chargeG
+    #vac_coulomb_potentialG = coul_kernelG * solute_chargeG
+    vac_coulomb_potentialG = _precond_yukawa_or_coul(solute_chargeG, Gv_bases, eps_r=1.0, ebkappa2=0.0)
 
     vac_coulomb_potentialG = vac_coulomb_potentialG.reshape(-1)
     
@@ -344,10 +465,10 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
 
     solvation_potentialG = pbc_tools.fft(solvation_potentialR.reshape(-1), mesh).reshape(-1) * weight
 
-    grad_solution_phiR = pbc_tools.ifft(gradient_recip(solution_phi_G, Gv), mesh).real / weight
+    grad_solution_phiR = pbc_tools.ifft(gradient_recip(solution_phi_G, Gx, Gy, Gz), mesh).real / weight
 
     S_grad_solution_phiR = S * grad_solution_phiR.reshape(3, *mesh)
-    div_S_grad_solution_phiG = divergence_recip( pbc_tools.fft(S_grad_solution_phiR.reshape(3, -1) * weight, mesh), Gv)
+    div_S_grad_solution_phiG = divergence_recip( pbc_tools.fft(S_grad_solution_phiR.reshape(3, -1) * weight, mesh), Gx, Gy, Gz)
     div_S_grad_solution_phiR = pbc_tools.ifft(div_S_grad_solution_phiG.reshape(-1), mesh).real / weight
     diel_bound_charge_density_R = div_S_grad_solution_phiR * ( (rel_permittivity - 1.) / (4*np.pi) )
     del S_grad_solution_phiR, div_S_grad_solution_phiG, div_S_grad_solution_phiR
@@ -396,7 +517,7 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
 
     # Cavitation potential.
 
-    grad_rho_r = pbc_tools.ifft(gradient_recip(rhoG, Gv), mesh).real.reshape(3, *mesh) / weight
+    grad_rho_r = pbc_tools.ifft(gradient_recip(rhoG, Gx, Gy, Gz), mesh).real.reshape(3, *mesh) / weight
 
     lap_rho_r = pbc_tools.ifft((-Gabs2 * rhoG).reshape(-1), mesh).real.reshape(*mesh) / weight
 
@@ -405,7 +526,10 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
 
     for i in range(3):
         for j in range(3):
-            hij_g = -(Gv[:, i] * Gv[:, j]) * rhoG
+            # hij_g = -(Gv[:, i] * Gv[:, j]) * rhoG
+            hij_g = _apply_Gv_1j(rhoG, Gx[i], Gy[i], Gz[i])
+            hij_g = _apply_Gv_1j(hij_g, Gx[j], Gy[j], Gz[j], out=hij_g)
+
             hij_r = pbc_tools.ifft(hij_g.reshape(-1), mesh).real.reshape(*mesh) / weight
             grad_hess_grad_r += grad_rho_r[i] * hij_r * grad_rho_r[j]
 
@@ -533,141 +657,98 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
             or list of veff if the input dm_kpts is a list of DMs
     '''
     RangePush("nr_rks_lpbe")
-    cell = ni.cell
     log = logger.new_logger(cell, verbose)
     t0 = log.init_timer()
-    xc_type = ni._xc_type(xc_code)
-    if ni.sorted_gaussian_pairs is None:
-        ni.build(xc_type)
+
+    xctype = ni._xc_type(xc_code)
+    nvar = _xc_var_length(xctype)
 
     if not with_j:
         raise ValueError("Why are you calling this function if you don't want electrostatics?")
 
-    if kpts is None:
-        kpts = np.zeros((1, 3))
-    else:
-        kpts = kpts.reshape(-1, 3)
-    dm_kpts = cp.asarray(dm_kpts, order="C")
-    dms = _format_dms(dm_kpts, kpts)
-    nset = dms.shape[0]
-    dms = None
-    assert nset == 1
+    dm_sc = _wannier_transform_dm(ni, dm_kpts, kpts, hermi, xctype)
+    assert len(dm_sc) == 1
+    dm_sc = dm_sc[0]
 
+    cell = ni.cell
     mesh = ni.mesh
     ngrids = np.prod(mesh)
+    vol = cell.vol
+    weight = vol / ngrids
+    Gv_bases = _get_Gv_bases(mesh, cell.reciprocal_vectors())
 
-    RangePush("evaluate_density_on_g_mesh")
-    density = evaluate_density_on_g_mesh(ni, dm_kpts, kpts, xc_type)
-    rho_sf = density[0, 0]
-    # ``ifft_in_place`` below reuses ``density`` storage, so retain the
-    # reciprocal density now for the persistent grid contract.
-    rho_g = rho_sf.copy()
-    RangePop()
+    rhoG, tauG = _eval_density(ni, dm_sc, with_tau=xctype=='MGGA')
+    n_electrons = float(rhoG[0,0,0].real.get())
 
-    Gv = pbc_tools.get_Gv(cell, mesh)
-    coulomb_kernel_on_g_mesh = pbc_tools.get_coulG(cell, Gv=Gv)
-    coulomb_on_g_mesh = rho_sf * coulomb_kernel_on_g_mesh
-    coulomb_energy = complex(rho_sf.conj().dot(coulomb_on_g_mesh).get())
-    coulomb_energy = (0.5 / cell.vol) * coulomb_energy
-    log.debug("Multigrid Coulomb energy %s", coulomb_energy)
-    t0 = log.timer("coulomb", *t0)
-    weight = cell.vol / ngrids
+    # dm_sc is represented in primitive bases (by sorted_cell). Its size can be
+    # much larger than the input dm_kpts. Release its memory if remaining memory
+    # is insufficient.
+    if (nvar+4)*ngrids*8 > get_avail_mem():
+        dm_sc = None
+
+    density = cp.empty((nvar, ngrids))
+    _density_to_real_space(rhoG, tauG, Gv_bases, xctype, out=density)
+    # *(1./weight) because rhoR is scaled by weight in _eval_density. If
+    # computing rhoR with IFFT, the weight factor is not needed.
+    density *= 1/weight
+
+    rho_sf = ndarray(ngrids, dtype=np.float64, buffer=tauG)
+    rho_sf[:] = density[0].real
+    t0 = log.timer_debug1("density", *t0)
+
+    # eval_xc_eff supports float64 only
+    xc_for_energy, xc_for_fock = ni.eval_xc_eff(
+        xc_code, density, deriv=1, xctype=xctype, spin=0, inplace=True)[:2]
+
+    xc_for_fock = xc_for_fock.reshape(nvar, *mesh)
+
+    xc_energy_sum = float(vec_dot(rho_sf, xc_for_energy).get()) * weight
+    xc_for_energy = density = rho_sf = None
+    log.debug("Multigrid exc %s  nelec %s", xc_energy_sum, n_electrons)
+    t0 = log.timer_debug1("eval_xc_eff", *t0)
+
 
 
     # LPBE
     ni.get_vpplocG()  # Invalidate the potential guess if the mesh changed.
     lpbe_res = lpbe_inner(
-        ni, rho_sf, coulomb_kernel_on_g_mesh, Gv,
+        ni, rhoG.reshape(-1), Gv_bases,
         options=ni.options, pot_guess=ni.pot_guess)
 
-    if ni.dump_vesta_prefix is not None:
-        for name, field in lpbe_res.items():
-            if getattr(field, 'ndim', 0) == 0 or field.size != ngrids:
-                continue
-            if name in ('vcorr_g', 'pot_guess'):
-                field = pbc_tools.ifft(field.reshape(-1), mesh).real / weight
-            write_vesta_pgrid(
-                cell, mesh, f'{ni.dump_vesta_prefix}_{name}.pgrid', field)
-        # write electron density
-        rho_r = pbc_tools.ifft(rho_g.reshape(-1), mesh).real.reshape(*mesh) / weight
-        write_vesta_pgrid(
-            cell, mesh, f'{ni.dump_vesta_prefix}_rho.pgrid', rho_r)
+    ecoul, coulomb_on_g_mesh = _get_coulomb_in_place(rhoG, Gv_bases)
+    ecoul = (.5 / vol) * float(ecoul.get())
+    log.debug('Multigrid Coulomb energy %s', ecoul)
 
     ni.pot_guess = lpbe_res['pot_guess']
     vcorr_g = lpbe_res['vcorr_g']
     Ecorr = float(cp.real(
         lpbe_res['E_coul_corr'] + lpbe_res['Ecav']).get())
-    coulomb_energy += Ecorr
 
-    density = ifft_in_place(density.reshape(-1, *mesh)).real.reshape(-1, ngrids)
-    n_electrons = float(density[0].sum().real.get())
-    density /= weight
+    ecoul += Ecorr
+    coulomb_on_g_mesh += vcorr_g.reshape(*mesh)
 
-    RangePush("eval_xc_eff")
-    # eval_xc_eff supports float64 only
-    density = cp.asarray(density, dtype=np.float64, order='C')
-    xc_for_energy, xc_for_fock = ni.eval_xc_eff(
-        xc_code, density, deriv=1, xctype=xc_type, spin=0
-    )[:2]
-    RangePop()
-
-    rho_sf = density[0].real
-    xc_energy_sum = float(rho_sf.dot(xc_for_energy.ravel()).get()) * weight
-
-    # To reduce the memory usage, we reuse the xc_for_fock name.
-    # Now xc_for_fock represents xc on G space
     xc_for_fock *= weight
-    xc_for_fock = fft_in_place(xc_for_fock.reshape(-1, *mesh)).reshape(-1, ngrids)
+    # Now xc_for_fock represents xc on G space
+    xc_for_fock = _vxc_to_reciprocal_space(
+        xc_for_fock, coulomb_on_g_mesh, Gv_bases, work=tauG)
+    coulomb_on_g_mesh = tauG = None
 
-    log.debug("Multigrid exc %s  nelec %s", xc_energy_sum, n_electrons)
-
-    if xc_type == "LDA" or xc_type == 'HF':
-        pass
-    elif xc_type == "GGA":
-        xc_for_fock = (
-            xc_for_fock[0] - contract("gp, pg -> p", xc_for_fock[1:4], Gv) * 1j
-        )
-        xc_for_fock = xc_for_fock.reshape((-1, ngrids))
-    elif xc_type == "MGGA":
-        xc_for_fock[0] -= contract("gp, pg -> p", xc_for_fock[1:4], Gv) * 1j
-        xc_for_fock = cp.concatenate([
-            xc_for_fock[0].reshape((-1, ngrids)),
-            xc_for_fock[4].reshape((-1, ngrids)),
-        ], axis = 0)
+    if kpts_band is None:
+        veff = _eval_xc_mat(ni, xc_for_fock, out=dm_sc)
+        veff = _inverse_wannier_transform_fock(ni, veff, kpts)
     else:
-        raise ValueError(f"Incorrect xc_type = {xc_type}")
+        kpts_band = kpts_band.reshape(-1, 3)
+        kmesh = k2gamma.kpts_to_kmesh(cell, kpts_band)
+        ni = ni.copy().reset().build(kmesh=kmesh, xctype=xctype)
+        # ni.build may alter the mesh. vxc was created with mesh different to
+        # this new mesh.
+        ni.mesh = mesh
+        veff = _eval_xc_mat(ni, xc_for_fock)
+        veff = _inverse_wannier_transform_fock(ni, veff, kpts_band)
 
-    # The LPBE potential should be considered as a correction to "J"
-    if with_j:
-        xc_for_fock[0] += coulomb_on_g_mesh + vcorr_g
-
-    # # Reciprocal GGA differentiation can leave imaginary values on Nyquist
-    # # planes.  The existing AO conversion projects through ``ifft(...).real``;
-    # # expose that same physical real scalar field, in normalized G space, so
-    # # potential mixing starts from an exactly Hermitian representation.
-    # vlocal_g = pbc_tools.fft(
-    #     pbc_tools.ifft(xc_for_fock[0], mesh).real.reshape(-1), mesh)
-    # grid_result = LPBEGridResult(
-    #     vlocal_g=vlocal_g.reshape(-1).copy(),
-    #     rho_g=rho_g,
-    #     cavity_r=lpbe_res['cavity_r'].copy(),
-    #     eps_r=lpbe_res['eps_r'].copy(),
-    #     lpbe_mass_r=lpbe_res['mass_r'].copy(),
-    #     lpbe_pot_guess=lpbe_res['pot_guess'].copy(),
-    # )
-
-    kpts_band, input_band = _format_kpts_band(kpts_band, kpts), kpts_band
-    RangePush("convert_xc_on_g_mesh_to_fock")
-    veff = convert_xc_on_g_mesh_to_fock(ni, xc_for_fock, hermi, kpts_band, with_tau = (xc_type == "MGGA"))
-    RangePop()
-    veff = _format_jks(veff, dm_kpts, input_band, kpts)
-    # veff = tag_array(
-    #     veff, ecoul=coulomb_energy, exc=xc_energy_sum,
-    #     lpbe_grid=grid_result)
-    veff = tag_array(veff, ecoul=coulomb_energy, exc=xc_energy_sum)
-
-    t0 = log.timer("xc", *t0)
-    RangePop()
+    veff = _format_jks(veff, dm_kpts, kpts_band, kpts)
+    veff = tag_array(veff, ecoul=ecoul, exc=xc_energy_sum)
+    t0 = log.timer_debug1("xc matrix", *t0)
     return n_electrons, xc_energy_sum, veff
 
 
