@@ -20,7 +20,6 @@ class KnownValues(unittest.TestCase):
             basis={'Cu': 'DZVP-MOLOPT-PBE-GTH'},
             pseudo='GTH-PBE',
             verbose=4,
-            precision=1e-9,
             nelec_frac=True,
         )
         cell.build()
@@ -34,8 +33,6 @@ class KnownValues(unittest.TestCase):
         )
         mf = mf.smearing(method='fermi', sigma=5e-3)
         mf.init_guess = 'atom'
-        mf.conv_tol = 1e-10
-        mf.conv_tol_grad = 1e-8
         mf.run()
 
         self.assertAlmostEqual(mf.e_tot, -96.2055784, 6)
