@@ -1,4 +1,3 @@
-import ctypes
 import numpy as np
 import cupy as cp
 import cupyx
@@ -7,27 +6,16 @@ from cupyx.scipy.sparse.linalg import LinearOperator, cg
 
 from cupy.cuda.nvtx import RangePush, RangePop
 
-import pyscf.pbc.gto as gto
-from pyscf import lib
 from pyscf.data import nist
-from pyscf.pbc.dft.multigrid import multigrid
 
-from pyscf.pbc.df.df_jk import _format_kpts_band
-from pyscf.pbc.gto.pseudo import pp_int
-from pyscf.pbc.lib.kpts_helper import is_gamma_point
-from gpu4pyscf.dft import numint
 from gpu4pyscf.pbc.gto.cell import get_Gv_weights
-from gpu4pyscf.pbc.df.fft_jk import _format_dms, _format_jks
-from gpu4pyscf.lib import logger, utils
+from gpu4pyscf.pbc.df.fft_jk import _format_jks
+from gpu4pyscf.lib import logger
 from gpu4pyscf.pbc.tools import pbc as pbc_tools
 from gpu4pyscf.pbc.tools import k2gamma
-from gpu4pyscf.pbc.tools.vestaio import write_vesta_pgrid
-from gpu4pyscf.lib.cupy_helper import batched_vec_norm2, contract, tag_array
-from gpu4pyscf.lib.cupy_helper import (
-    contract, transpose_sum, ndarray, asarray, tag_array, load_library, absmax,
-    get_avail_mem, vec_dot)
+from gpu4pyscf.lib.cupy_helper import batched_vec_norm2, tag_array
+from gpu4pyscf.lib.cupy_helper import ndarray, tag_array, get_avail_mem, vec_dot
 
-import gpu4pyscf.pbc.dft.multigrid_v3 as multigrid_v3
 from gpu4pyscf.pbc.dft.multigrid_v3 import MultiGridNumInt
 from gpu4pyscf.pbc.dft.multigrid_v3 import fft_in_place, ifft_in_place, _apply_Gv_1j, _xc_var_length, _get_coulomb_in_place
 from gpu4pyscf.pbc.dft.multigrid_v3 import _wannier_transform_dm, _get_Gv_bases, _eval_density, _density_to_real_space
@@ -38,7 +26,7 @@ from gpu4pyscf.__config__ import props as gpu_specs
 import gpu4pyscf.pbc.dft.multigrid as multigrid_v1
 
 
-_kernel_registery = {}
+_kernel_registry = {}
 
 class LPBEGridResult:
     """Persistent reciprocal/real-space data from one LPBE NumInt call.
@@ -180,7 +168,7 @@ def _precond_yukawa_or_coul(rhoG, Gv_bases, eps_r=1.0, ebkappa2=0.0, out=None):
     out = 4*pi*rhoG / (eps_r * |G|^2)
     '''
     fn_name = 'precond_yukawa_or_coul'
-    if fn_name not in _kernel_registery:
+    if fn_name not in _kernel_registry:
         kernel_code = ('''\
 extern "C" __global__
 void ''' + fn_name + r'''(double2* __restrict__ out, double2* __restrict__ rhoG,
@@ -215,9 +203,9 @@ void ''' + fn_name + r'''(double2* __restrict__ out, double2* __restrict__ rhoG,
         out[g] = coul;
     }
 }''')
-        _kernel_registery[fn_name] = cp.RawKernel(kernel_code, fn_name)
+        _kernel_registry[fn_name] = cp.RawKernel(kernel_code, fn_name)
 
-    kernel = _kernel_registery[fn_name]
+    kernel = _kernel_registry[fn_name]
     nx, ny, nz = [x.shape[1] for x in Gv_bases]
     ng = nx * ny * nz
     assert rhoG.size == ng
@@ -232,7 +220,7 @@ def _G2_scale(phiG, Gv_bases, alpha=1.0, out=None):
     out = alpha * |G|^2 * phiG
     '''
     fn_name = 'G2_scale'
-    if fn_name not in _kernel_registery:
+    if fn_name not in _kernel_registry:
         kernel_code = ('''\
 extern "C" __global__
 void ''' + fn_name + r'''(double2* __restrict__ out, double2* __restrict__ phiG,
@@ -257,9 +245,9 @@ void ''' + fn_name + r'''(double2* __restrict__ out, double2* __restrict__ phiG,
         out[g] = {phi.x * fac, phi.y * fac};
     }
 }''')
-        _kernel_registery[fn_name] = cp.RawKernel(kernel_code, fn_name)
+        _kernel_registry[fn_name] = cp.RawKernel(kernel_code, fn_name)
 
-    kernel = _kernel_registery[fn_name]
+    kernel = _kernel_registry[fn_name]
     nx, ny, nz = [x.shape[1] for x in Gv_bases]
     ng = nx * ny * nz
     assert phiG.size == ng
@@ -349,7 +337,7 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
     log = logger.new_logger(cell)
 
 
-    vpplocG = ni.get_vpplocG()
+    vpplocG = ni.vpplocG
     # pseudo_nucdensityG = Gabs2 * vpplocG * (-1.0 / (4*np.pi))
     pseudo_nucdensityG = _G2_scale(vpplocG, Gv_bases, alpha=-1.0/(4*np.pi))
 
@@ -366,7 +354,7 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
     nuc_charge_by_integration = cp.sum(pseudo_nucdensityR) * vol / ngrids
     qsol = nelec_by_integration - nuc_charge_by_integration
 
-    pseudocore_densityG = ni.get_pseudocore_density()
+    pseudocore_densityG = ni.pseudocore_densityG
     pseudocore_densityR = ifft_3d(pseudocore_densityG.reshape(*mesh)) / weight
 
     RangePush("shape_function")
@@ -392,23 +380,21 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
     # Div( eps_r * Grad(phi) ) - S phi / (debye_length^2) = -4*pi*solute_chargeR.
     # by preconditioned conjugate gradient.
     # Preconditioner = poisson.
-    def make_aop_ref(Skappa2):
-        def Aop(phiG):
-            # No scaling by weight of the intermediates is necessary thanks to linearity
-            phiG_3d = phiG.reshape(*mesh)
-            grad_phiG = gradient_recip(phiG_3d, Gx, Gy, Gz).reshape(3, *mesh)
-            grad_phiR = ifft_in_place(grad_phiG)
-            eps_grad_phiR = eps_r_field * grad_phiR
-            eps_grad_phiG = fft_in_place(eps_grad_phiR)
-            div_eps_grad_phiG = divergence_recip(eps_grad_phiG, Gx, Gy, Gz)
-            phi_R = pbc_tools.ifft(phiG, mesh).reshape(*mesh)
-            debye_term_real = Skappa2 * phi_R.reshape(*mesh)
-            debye_term_G = fft_in_place(debye_term_real)
-            return -(div_eps_grad_phiG - debye_term_G).reshape(-1)
-        return Aop
 
     def make_aop(Skappa2):
         def Aop(phiG):
+            # No scaling by weight of the intermediates is necessary thanks to linearity
+            # phiG_3d = phiG.reshape(*mesh)
+            # grad_phiG = gradient_recip(phiG_3d, Gx, Gy, Gz).reshape(3, *mesh)
+            # grad_phiR = ifft_in_place(grad_phiG)
+            # eps_grad_phiR = eps_r_field * grad_phiR
+            # eps_grad_phiG = fft_in_place(eps_grad_phiR)
+            # div_eps_grad_phiG = divergence_recip(eps_grad_phiG, Gx, Gy, Gz)
+            # phi_R = pbc_tools.ifft(phiG, mesh).reshape(*mesh)
+            # debye_term_real = Skappa2 * phi_R.reshape(*mesh)
+            # debye_term_G = fft_in_place(debye_term_real)
+            # return -(div_eps_grad_phiG - debye_term_G).reshape(-1)
+
             phiG_3d = phiG.reshape(*mesh)
             minus_div_eps_grad_phiG = cp.zeros(mesh, dtype=cp.complex128)
             buf = cp.zeros(mesh, dtype=cp.complex128)
@@ -430,19 +416,6 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
     mean_eps_r = float(1. + (rel_permittivity - 1.) * mean_S)
     mean_ebkappa2 = float(mean_S * ebkappa2)
 
-    # coul_kernelG = pbc_tools.get_coulG(cell, Gv=Gv)
-
-    # if ebkappa2 == 0:
-    #     yukawa_kernel = 4.0 * np.pi / coul_kernelG
-    # else:
-    #     yukawa_kernel = 4.0 * np.pi / (mean_eps_r * Gabs2 + mean_ebkappa2)
-
-
-
-
-    # sqrt_yukawa_kernel = cp.sqrt(yukawa_kernel)
-    # one_over_epsr = 1.0 / eps_r_field.reshape(-1)
-
     def Mprecond(phiG):
         precond_phiG = _precond_yukawa_or_coul(phiG, Gv_bases, eps_r=mean_eps_r, ebkappa2=mean_ebkappa2)
         return precond_phiG.reshape(-1)
@@ -460,6 +433,7 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
         niter += 1
 
     RangePush("lpbe_cg_solve")
+
     # Div( eps_r * Grad(phi) ) - S phi / (debye_length^2) = -4*pi*solute_chargeR.
     solution_phi_G, info = cg(A, rhs, M=M, x0=pot_guess, tol=tol, maxiter=400, callback=callback)
 
@@ -469,10 +443,6 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
         log.warn(f"Conjugate gradient did not converge: info={info}")
 
     log.debug(f"Number of CG iterations: {niter}")
-
-    t1 = log.timer("LPBE CG solve", *t0)
-
-    t2 = log.init_timer()
 
 
     RangePush("lpbe_postprocess")
@@ -757,8 +727,6 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
 
 
 
-    # LPBE
-    ni.get_vpplocG()  # Invalidate the potential guess if the mesh changed.
     lpbe_res = lpbe_inner(
         ni, rhoG.reshape(-1), Gv_bases,
         options=ni.options, pot_guess=ni.pot_guess)
@@ -821,46 +789,10 @@ class LPBEMultiGridNumInt(MultiGridNumInt):
         self._lpbe_mesh = None
         return self
 
-    def get_vpplocG(self):
-        mesh = tuple(self.mesh)
-        if self.vpplocG is None or self._lpbe_mesh != mesh:
-            vpplocG = multigrid_v1.eval_vpplocG(self.cell, self.mesh)
-            self.vpplocG = vpplocG
-            self.pot_guess = None
-            self._lpbe_mesh = mesh
-        return self.vpplocG
-
-    def get_pseudocore_density(self):
-        mesh = tuple(self.mesh)
-        if self.pseudocore_densityG is None or self._lpbe_mesh != mesh:
-            pseudocore_densityG = pseudocore_density(self.cell, self.mesh)
-            self.pseudocore_densityG = pseudocore_densityG
-            self._lpbe_mesh = mesh
-        return self.pseudocore_densityG
-
-    def local_potential_to_ao(self, vlocal_g, kpts=None, hermi=1):
-        """Convert one scalar reciprocal-space local potential to AO blocks.
-
-        Parameters follow :func:`convert_xc_on_g_mesh_to_fock`.  The returned
-        array always has shape ``(nkpts, nao, nao)``; unlike ``nr_rks`` it is
-        independent of the input density-matrix rank.
-        """
-        vlocal_g = cp.asarray(vlocal_g)
-        ngrids = int(np.prod(self.mesh))
-        if vlocal_g.size != ngrids:
-            raise ValueError(
-                'local potential has %d values; mesh requires %d' %
-                (vlocal_g.size, ngrids))
-        if not bool(cp.all(cp.isfinite(vlocal_g)).item()):
-            raise FloatingPointError('local potential contains nonfinite values')
-        if self.sorted_gaussian_pairs is None:
-            self.build('LDA')
-        if kpts is not None:
-            kpts = np.asarray(kpts).reshape(-1, 3)
-        matrices = convert_xc_on_g_mesh_to_fock(
-            self, vlocal_g.reshape(-1), hermi=hermi, kpts=kpts,
-            with_tau=False)
-        return matrices[0]
+    def build(self, *args, **kwargs):
+        super().build(*args, **kwargs)
+        self.vpplocG = multigrid_v1.eval_vpplocG(self.cell, self.mesh)
+        self.pseudocore_densityG = pseudocore_density(self.cell, self.mesh)
 
     nr_rks = nr_rks_lpbe
     nr_uks = NotImplemented
