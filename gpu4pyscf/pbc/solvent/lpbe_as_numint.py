@@ -121,6 +121,11 @@ def gradient_recip(F, Gx, Gy, Gz, out=None):
     ndarray
         The gradient of the function in reciprocal space.
     """
+    assert F.ndim == 3, "F must be a 3D array"
+    assert F.flags.c_contiguous, "F must be C-contiguous"
+    nx, ny, nz = Gx.shape[1], Gy.shape[1], Gz.shape[1]
+    assert F.shape == (nx, ny, nz), f"F.shape = {F.shape}, expected {(nx, ny, nz)}"
+    assert F.dtype == cp.complex128
     if out is None:
         grad_F = cp.empty((3,) + F.shape, dtype=np.complex128)
     else:
@@ -145,6 +150,11 @@ def divergence_recip(Fv, Gx, Gy, Gz, out=None):
     ndarray
         The divergence of the vector function in reciprocal space.
     """
+    assert Fv.ndim == 4, "Fv must be a 4D array"
+    assert Fv.flags.c_contiguous, "Fv must be C-contiguous"
+    nx, ny, nz = Gx.shape[1], Gy.shape[1], Gz.shape[1]
+    assert Fv.shape == (3, nx, ny, nz), f"Fv.shape = {Fv.shape}, expected {(3, nx, ny, nz)}"
+    assert Fv.dtype == cp.complex128
     if out is None:
         div_F = cp.zeros(Fv.shape[1:], dtype=np.complex128)
     else:
@@ -376,10 +386,11 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
     # Div( eps_r * Grad(phi) ) - S phi / (debye_length^2) = -4*pi*solute_chargeR.
     # by preconditioned conjugate gradient.
     # Preconditioner = poisson.
-    def make_aop(Skappa2):
+    def make_aop_ref(Skappa2):
         def Aop(phiG):
             # No scaling by weight of the intermediates is necessary thanks to linearity
-            grad_phiG = gradient_recip(phiG, Gx, Gy, Gz).reshape(3, *mesh)
+            phiG_3d = phiG.reshape(*mesh)
+            grad_phiG = gradient_recip(phiG_3d, Gx, Gy, Gz).reshape(3, *mesh)
             grad_phiR = ifft_in_place(grad_phiG)
             eps_grad_phiR = eps_r_field * grad_phiR
             eps_grad_phiG = fft_in_place(eps_grad_phiR)
@@ -388,6 +399,25 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
             debye_term_real = Skappa2 * phi_R.reshape(*mesh)
             debye_term_G = fft_in_place(debye_term_real)
             return -(div_eps_grad_phiG - debye_term_G).reshape(-1)
+        return Aop
+
+    def make_aop(Skappa2):
+        def Aop(phiG):
+            phiG_3d = phiG.reshape(*mesh)
+            minus_div_eps_grad_phiG = cp.zeros(mesh, dtype=cp.complex128)
+            buf = cp.zeros(mesh, dtype=cp.complex128)
+            for i in range(3):
+                _apply_Gv_1j(phiG_3d, Gx[i], Gy[i], Gz[i], buf)
+                ifft_in_place(buf)
+                buf *= eps_r_field
+                fft_in_place(buf)
+                _contract_Gv_1j(minus_div_eps_grad_phiG, buf, Gx[i], Gy[i], Gz[i])
+            buf[:, :, :] = phiG_3d
+            ifft_in_place(buf)
+            buf *= Skappa2
+            fft_in_place(buf)
+            buf += minus_div_eps_grad_phiG
+            return buf.reshape(-1)
         return Aop
 
     mean_S = cp.mean(S.reshape(-1))
@@ -414,8 +444,8 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
 
     t0 = log.init_timer()
 
-    A = LinearOperator((ngrids, ngrids), matvec=make_aop(S*ebkappa2))
-    M = LinearOperator((ngrids, ngrids), matvec=Mprecond)
+    A = LinearOperator((ngrids, ngrids), matvec=make_aop(S*ebkappa2), dtype=cp.complex128)
+    M = LinearOperator((ngrids, ngrids), matvec=Mprecond, dtype=cp.complex128)
     rhs = pbc_tools.fft(4*np.pi*solute_chargeR.reshape(-1), mesh) * weight
 
     niter = 0
@@ -465,10 +495,10 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
 
     solvation_potentialG = pbc_tools.fft(solvation_potentialR.reshape(-1), mesh).reshape(-1) * weight
 
-    grad_solution_phiR = pbc_tools.ifft(gradient_recip(solution_phi_G, Gx, Gy, Gz), mesh).real / weight
+    grad_solution_phiR = pbc_tools.ifft(gradient_recip(solution_phi_G.reshape(*mesh), Gx, Gy, Gz), mesh).real / weight
 
     S_grad_solution_phiR = S * grad_solution_phiR.reshape(3, *mesh)
-    div_S_grad_solution_phiG = divergence_recip( pbc_tools.fft(S_grad_solution_phiR.reshape(3, -1) * weight, mesh), Gx, Gy, Gz)
+    div_S_grad_solution_phiG = divergence_recip( pbc_tools.fft(S_grad_solution_phiR.reshape(3, -1) * weight, mesh).reshape(3, *mesh), Gx, Gy, Gz)
     div_S_grad_solution_phiR = pbc_tools.ifft(div_S_grad_solution_phiG.reshape(-1), mesh).real / weight
     diel_bound_charge_density_R = div_S_grad_solution_phiR * ( (rel_permittivity - 1.) / (4*np.pi) )
     del S_grad_solution_phiR, div_S_grad_solution_phiG, div_S_grad_solution_phiR
@@ -517,7 +547,7 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
 
     # Cavitation potential.
 
-    grad_rho_r = pbc_tools.ifft(gradient_recip(rhoG, Gx, Gy, Gz), mesh).real.reshape(3, *mesh) / weight
+    grad_rho_r = pbc_tools.ifft(gradient_recip(rhoG.reshape(*mesh), Gx, Gy, Gz), mesh).real.reshape(3, *mesh) / weight
 
     lap_rho_r = pbc_tools.ifft((-Gabs2 * rhoG).reshape(-1), mesh).real.reshape(*mesh) / weight
 
