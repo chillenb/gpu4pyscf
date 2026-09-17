@@ -167,6 +167,12 @@ def divergence_recip(Fv, Gx, Gy, Gz, out=None):
     div_F *= -1.0
     return div_F
 
+
+def fft_3d(x):
+    return fft.fftn(x.astype(cp.complex128), axes=(-3, -2, -1))
+def ifft_3d(x):
+    return fft.ifftn(x.astype(cp.complex128), axes=(-3, -2, -1))
+
 def _precond_yukawa_or_coul(rhoG, Gv_bases, eps_r=1.0, ebkappa2=0.0, out=None):
     '''
     Computes
@@ -220,12 +226,12 @@ void ''' + fn_name + r'''(double2* __restrict__ out, double2* __restrict__ rhoG,
     kernel((workers*2,), (1024,), (out, rhoG, Gv_bases[0], Gv_bases[1], Gv_bases[2], nx, ny, nz, float(eps_r), float(ebkappa2)))
     return out
 
-def _lapl_scale(phiG, Gv_bases, alpha=1.0, out=None):
+def _G2_scale(phiG, Gv_bases, alpha=1.0, out=None):
     '''
     Computes
-    out = - alpha * |G|^2 * phiG / (4 * pi)
+    out = alpha * |G|^2 * phiG
     '''
-    fn_name = 'lapl_scale'
+    fn_name = 'G2_scale'
     if fn_name not in _kernel_registery:
         kernel_code = ('''\
 extern "C" __global__
@@ -247,7 +253,7 @@ void ''' + fn_name + r'''(double2* __restrict__ out, double2* __restrict__ phiG,
             GG += Gv * Gv;
         }
         double2 phi = phiG[g];
-        double fac = GG * (-1.0 * alpha / 12.566370614359172);
+        double fac = GG * alpha;
         out[g] = {phi.x * fac, phi.y * fac};
     }
 }''')
@@ -345,14 +351,14 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
 
     vpplocG = ni.get_vpplocG()
     # pseudo_nucdensityG = Gabs2 * vpplocG * (-1.0 / (4*np.pi))
-    pseudo_nucdensityG = _lapl_scale(vpplocG, Gv_bases)
+    pseudo_nucdensityG = _G2_scale(vpplocG, Gv_bases, alpha=-1.0/(4*np.pi))
 
     charges = cell.atom_charges()
     tot_nuc_charge = np.sum(charges)
     pseudo_nucdensityG[0] = tot_nuc_charge
-    pseudo_nucdensityR = pbc_tools.ifft(pseudo_nucdensityG.reshape(-1), mesh).real.reshape(*mesh) / weight
+    pseudo_nucdensityR = ifft_3d(pseudo_nucdensityG.reshape(*mesh)) / weight
 
-    rhoR = pbc_tools.ifft(rhoG.reshape(-1), mesh).real.reshape(*mesh) / weight
+    rhoR = ifft_3d(rhoG.reshape(*mesh)) / weight
     # Charge sign convention is that electrons are positive.
     solute_chargeR = rhoR - pseudo_nucdensityR
 
@@ -361,7 +367,7 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
     qsol = nelec_by_integration - nuc_charge_by_integration
 
     pseudocore_densityG = ni.get_pseudocore_density()
-    pseudocore_densityR = pbc_tools.ifft(pseudocore_densityG.reshape(-1), mesh).real.reshape(*mesh) / weight
+    pseudocore_densityR = ifft_3d(pseudocore_densityG.reshape(*mesh)) / weight
 
     RangePush("shape_function")
     S, Sprime = shape_function(rhoR + pseudocore_densityR, cav_smear, cav_dens_cutoff)
@@ -446,7 +452,7 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
 
     A = LinearOperator((ngrids, ngrids), matvec=make_aop(S*ebkappa2), dtype=cp.complex128)
     M = LinearOperator((ngrids, ngrids), matvec=Mprecond, dtype=cp.complex128)
-    rhs = pbc_tools.fft(4*np.pi*solute_chargeR.reshape(-1), mesh) * weight
+    rhs = fft_3d(4*np.pi*solute_chargeR.reshape(*mesh)).reshape(-1) * weight
 
     niter = 0
     def callback(x):
@@ -470,13 +476,13 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
 
 
     RangePush("lpbe_postprocess")
-    solution_phi_R = pbc_tools.ifft(solution_phi_G.reshape(-1), mesh).real.reshape(*mesh) / weight
+    solution_phi_R = ifft_3d(solution_phi_G.reshape(*mesh)) / weight
 
     # rho_ion_R = solution_phi_R * S * (ebkappa2 / (4*np.pi))
 
 
     # compute solvation potential.
-    solute_chargeG = pbc_tools.fft(solute_chargeR.reshape(-1), mesh).reshape(-1) * weight
+    solute_chargeG = fft_3d(solute_chargeR.reshape(*mesh)).reshape(-1) * weight
     #vac_coulomb_potentialG = coul_kernelG * solute_chargeG
     vac_coulomb_potentialG = _precond_yukawa_or_coul(solute_chargeG, Gv_bases, eps_r=1.0, ebkappa2=0.0)
 
@@ -488,18 +494,22 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
 
     vac_coulomb_potentialG[0] += vpplocG.reshape(-1)[0]
 
-    vac_coulomb_potentialR = pbc_tools.ifft(vac_coulomb_potentialG.reshape(-1), mesh).real.reshape(*mesh) / weight
+    vac_coulomb_potentialR = ifft_3d(vac_coulomb_potentialG.reshape(*mesh)) / weight
 
 
     solvation_potentialR = solution_phi_R - vac_coulomb_potentialR
 
-    solvation_potentialG = pbc_tools.fft(solvation_potentialR.reshape(-1), mesh).reshape(-1) * weight
+    solvation_potentialG = fft_3d(solvation_potentialR.reshape(*mesh)).reshape(-1) * weight
 
-    grad_solution_phiR = pbc_tools.ifft(gradient_recip(solution_phi_G.reshape(*mesh), Gx, Gy, Gz), mesh).real / weight
+    grad_solution_phiG = gradient_recip(solution_phi_G.reshape(*mesh), Gx, Gy, Gz)
+    grad_solution_phiR = ifft_in_place(grad_solution_phiG).reshape(3, -1) / weight
 
     S_grad_solution_phiR = S * grad_solution_phiR.reshape(3, *mesh)
-    div_S_grad_solution_phiG = divergence_recip( pbc_tools.fft(S_grad_solution_phiR.reshape(3, -1) * weight, mesh).reshape(3, *mesh), Gx, Gy, Gz)
-    div_S_grad_solution_phiR = pbc_tools.ifft(div_S_grad_solution_phiG.reshape(-1), mesh).real / weight
+
+    S_grad_solution_phiG = fft_in_place(S_grad_solution_phiR)
+    div_S_grad_solution_phiG = divergence_recip(S_grad_solution_phiG, Gx, Gy, Gz).reshape(-1)
+
+    div_S_grad_solution_phiR = ifft_3d(div_S_grad_solution_phiG.reshape(*mesh)) / weight
     diel_bound_charge_density_R = div_S_grad_solution_phiR * ( (rel_permittivity - 1.) / (4*np.pi) )
     del S_grad_solution_phiR, div_S_grad_solution_phiG, div_S_grad_solution_phiR
 
@@ -530,7 +540,7 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
 
     # Vacuum alignment in z-direction. This is important when there is no electrolyte.
     rhoG_smoothed = rhoG * cp.exp(-100.0 * (Gabs2) * 0.5)
-    rhoR_smoothed = pbc_tools.ifft(rhoG_smoothed.reshape(-1), mesh).real.reshape(*mesh) * weight
+    rhoR_smoothed = ifft_in_place(rhoG_smoothed.reshape(*mesh)).real * weight
     rhoR_z = rhoR_smoothed.mean(axis=(0, 1))
     dens_min_idx = cp.argmin(rhoR_z)
     vacpot_at_zmin = vac_coulomb_potentialR.reshape(mesh).real.mean(axis=(0, 1))[dens_min_idx]
@@ -547,9 +557,14 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
 
     # Cavitation potential.
 
-    grad_rho_r = pbc_tools.ifft(gradient_recip(rhoG.reshape(*mesh), Gx, Gy, Gz), mesh).real.reshape(3, *mesh) / weight
+    # grad_rho_r = pbc_tools.ifft(gradient_recip(rhoG.reshape(*mesh), Gx, Gy, Gz), mesh).real.reshape(3, *mesh) / weight
 
-    lap_rho_r = pbc_tools.ifft((-Gabs2 * rhoG).reshape(-1), mesh).real.reshape(*mesh) / weight
+    # lap_rho_r = pbc_tools.ifft((-Gabs2 * rhoG).reshape(-1), mesh).real.reshape(*mesh) / weight
+
+    grad_rhoG = gradient_recip(rhoG.reshape(*mesh), Gx, Gy, Gz)
+    grad_rho_r = ifft_in_place(grad_rhoG).real.reshape(3, *mesh) / weight
+    lap_rhoG = _G2_scale(rhoG.reshape(*mesh), Gv_bases, alpha=-1.0)
+    lap_rho_r = ifft_in_place(lap_rhoG).real.reshape(*mesh) / weight
 
     # grad_hess_grad_r = (nabla rho)^t H(rho) (nabla rho)
     grad_hess_grad_r = cp.zeros(mesh, dtype=cp.float64)
@@ -560,7 +575,7 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
             hij_g = _apply_Gv_1j(rhoG, Gx[i], Gy[i], Gz[i])
             hij_g = _apply_Gv_1j(hij_g, Gx[j], Gy[j], Gz[j], out=hij_g)
 
-            hij_r = pbc_tools.ifft(hij_g.reshape(-1), mesh).real.reshape(*mesh) / weight
+            hij_r = ifft_in_place(hij_g.reshape(*mesh)).real / weight
             grad_hess_grad_r += grad_rho_r[i] * hij_r * grad_rho_r[j]
 
     grad_abs_r = cp.sqrt(cp.einsum('i...,i...->...', grad_rho_r, grad_rho_r))
@@ -571,6 +586,7 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
         - grad_hess_grad_r / (grad_abs_safe_r ** 3)
     )
     vcav_r = vcav_r.reshape(-1)
+    nvcav = cp.linalg.norm(vcav_r)
 
     del lap_rho_r, grad_hess_grad_r, grad_abs_safe_r, grad_rho_r, hij_g, hij_r
 
@@ -588,6 +604,8 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
     log.debug(f"Surface area: {surf_area:.3f} Bohr^2")
     log.debug(f"Eion: {Eion:.3e} Hartree ({Eion*nist.HARTREE2EV:.3e} eV)")
     log.debug(f"Ediel: {Ediel:.3e} Hartree ({Ediel*nist.HARTREE2EV:.3e} eV)")
+    log.debug(f"Norm of cavitation potential: {nvcav:.3e}")
+
 
     if ni.chkfile is not None:
         z = np.arange(mesh[2]) * cell.lattice_vectors(unit='A')[2, 2] / mesh[2]
