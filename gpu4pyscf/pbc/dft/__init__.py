@@ -24,6 +24,8 @@ from . import gks
 from . import kgks
 from . import krkspu
 from . import kukspu
+from . import simple_krks
+from .grand_canonical import GrandCanonicalKRKS
 from .rks import KohnShamDFT
 
 KRKS = krks.KRKS
@@ -31,6 +33,7 @@ KUKS = kuks.KUKS
 KGKS = kgks.KGKS
 KRKSpU = krkspu.KRKSpU
 KUKSpU = kukspu.KUKSpU
+SimpleKRKS = simple_krks.SimpleKRKS
 
 def GKS(cell, *args, **kwargs):
     '''Generalized KS at one k-point, or KGKS when kpts is supplied.'''
