@@ -127,6 +127,14 @@ class DIIS(object):
             value = value.get()
         self._buffer[key] = value
 
+    def clear(self):
+        self._buffer = {}
+        self._bookkeep = []
+        self._head = 0
+        self._H = None
+        self._xprev = None
+        self._err_vec_touched = False
+
     def push_err_vec(self, xerr):
         self._err_vec_touched = True
         if self._head >= self.space:
