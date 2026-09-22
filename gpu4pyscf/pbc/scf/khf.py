@@ -64,7 +64,7 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
         f_kpts = cp.asarray([asarray(pbchf.damping(f, f_prev, damp_factor))
                             for f,f_prev in zip(f_kpts,fock_last)])
     if diis and cycle >= diis_start_cycle:
-        f_kpts = diis.update(s_kpts, dm_kpts, f_kpts, mf, h1e_kpts, vhf_kpts, f_prev=fock_last)
+        f_kpts = diis.update(s_kpts, dm_kpts, f_kpts, mf, h1e_kpts, vhf_kpts, cycle=cycle, f_prev=fock_last)
 
     if level_shift_factor is None:
         level_shift_factor = mf.level_shift
@@ -728,16 +728,16 @@ class KRHF(KSCF):
         # FIXME: consider the fractional num_electron or not? This maybe
         # relate to the charged system.
         nelectron = float(self.cell.tot_electrons(nkpts))
-        if abs(ne - nelectron) > 0.01*nkpts:
-            logger.debug(self, 'Big error detected in the electron number '
-                         'of initial guess density matrix (Ne/cell = %g)!\n'
-                         '  This can cause huge error in Fock matrix and '
-                         'lead to instability in SCF for low-dimensional '
-                         'systems.\n  DM is normalized wrt the number '
-                         'of electrons %s', ne/nkpts, nelectron/nkpts)
-            dm *= nelectron / ne
-            if hasattr(dm, 'mo_coeff'):
-                dm.mo_occ *= nelectron / ne
+        # if abs(ne - nelectron) > 0.01*nkpts:
+        #     logger.debug(self, 'Big error detected in the electron number '
+        #                  'of initial guess density matrix (Ne/cell = %g)!\n'
+        #                  '  This can cause huge error in Fock matrix and '
+        #                  'lead to instability in SCF for low-dimensional '
+        #                  'systems.\n  DM is normalized wrt the number '
+        #                  'of electrons %s', ne/nkpts, nelectron/nkpts)
+        #     dm *= nelectron / ne
+        #     if hasattr(dm, 'mo_coeff'):
+        #         dm.mo_occ *= nelectron / ne
         return dm
 
     def density_fit(self, auxbasis=None, with_df=None):
