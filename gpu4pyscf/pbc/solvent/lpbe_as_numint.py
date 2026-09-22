@@ -2,7 +2,7 @@ import numpy as np
 import cupy as cp
 import cupyx
 import cupyx.scipy.fft as fft
-from cupyx.scipy.sparse.linalg import LinearOperator, cg
+from cupy import cublas
 
 from cupy.cuda.nvtx import RangePush, RangePop
 
@@ -256,6 +256,35 @@ void ''' + fn_name + r'''(double2* __restrict__ out, double2* __restrict__ phiG,
     kernel((workers*2,), (1024,), (out, phiG, Gv_bases[0], Gv_bases[1], Gv_bases[2], nx, ny, nz, float(alpha)))
     return out
 
+def _fma(alpha, a, beta, b, out=None):
+    '''
+    out = alpha * a + beta * b
+    '''
+    fn_name = 'simple_fma'
+    if fn_name not in _kernel_registry:
+        kernel_code = ('''\
+#include <cuComplex.h>
+
+extern "C" __global__
+void ''' + fn_name + r'''(cuDoubleComplex* __restrict__ out, cuDoubleComplex* __restrict__ a, cuDoubleComplex* __restrict__ b, cuDoubleComplex alpha, cuDoubleComplex beta, long long n) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (size_t g = idx; g < n; g += stride) {
+        cuDoubleComplex a_val = a[g];
+        cuDoubleComplex b_val = b[g];
+        out[g] = cuCadd(cuCmul(alpha, a_val), cuCmul(beta, b_val));
+    }
+}''')
+        _kernel_registry[fn_name] = cp.RawKernel(kernel_code, fn_name)
+
+    kernel = _kernel_registry[fn_name]
+    ng = a.size
+    assert b.size == ng
+    if out is None:
+        out = cp.empty_like(a)
+    workers = gpu_specs['multiProcessorCount']
+    kernel((workers*2,), (1024,), (out, a, b, complex(alpha), complex(beta), ng))
+    return out
 
 def pseudocore_density(cell, mesh):
     assert cell.dimension == 3
@@ -295,7 +324,121 @@ def pseudocore_density(cell, mesh):
         rhocoreG += pcharge * SI
     return rhocoreG
 
+def cg_opt(n, matvec, psolve, b, x0=None, tol=1e-5, maxiter=None, M=None, callback=None,
+       atol=None):
+    """Uses Conjugate Gradient iteration to solve ``Ax = b``.
+    Adapted from cupyx.scipy.sparse.linalg.cg.
 
+    Args:
+        n: int
+            The size of the linear system.
+        matvec: function
+            Function that computes the matrix-vector product ``Ax``.
+            matvec(x, out=None).
+        psolve: function
+            Function that computes the preconditioner solve ``Mx``,
+            where ``M`` approximates the inverse of ``A``.
+            psolve(x, out=None).
+        b (cupy.ndarray): Right hand side of the linear system with shape
+            ``(n,)``.
+        x0 (cupy.ndarray): Starting guess for the solution.
+        tol (float): Tolerance for convergence.
+        maxiter (int): Maximum number of iterations.
+        callback (function): User-specified function to call after each
+            iteration. It is called as ``callback(xk)``, where ``xk`` is the
+            current solution vector.
+        atol (float): Tolerance for convergence.
+
+    Returns:
+        tuple:
+            It returns ``x`` (cupy.ndarray) and ``info`` (int) where ``x`` is
+            the converged solution and ``info`` provides convergence
+            information.
+
+    """
+
+    # The CuPy license is reproduced below, to comply with copyright law.
+
+    # Copyright (c) 2015 Preferred Infrastructure, Inc.
+    # Copyright (c) 2015 Preferred Networks, Inc.
+
+    # Permission is hereby granted, free of charge, to any person obtaining a copy
+    # of this software and associated documentation files (the "Software"), to deal
+    # in the Software without restriction, including without limitation the rights
+    # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    # copies of the Software, and to permit persons to whom the Software is
+    # furnished to do so, subject to the following conditions:
+
+    # The above copyright notice and this permission notice shall be included in
+    # all copies or substantial portions of the Software.
+
+    # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    # AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+    # THE SOFTWARE.
+
+    x = x0
+    if x is None:
+        x = cp.zeros_like(b)
+
+    if maxiter is None:
+        maxiter = n * 10
+    if n == 0:
+        return cp.empty_like(b), 0
+    b_norm = cp.linalg.norm(b)
+    if b_norm == 0:
+        return b, 0
+    if atol is None:
+        atol = tol * float(b_norm)
+    else:
+        atol = max(float(atol), tol * float(b_norm))
+
+    r = cp.zeros_like(b)
+    matvec(x, out=r)
+    _fma(-1.0, r, 1.0, b, out=r)
+
+    # r = b - matvec(x)
+    iters = 0
+    rho = 0
+
+    q = None
+    z = None
+
+    buf = cp.zeros_like(b)
+    q = cp.empty_like(b)
+    z = cp.empty_like(b)
+
+    while iters < maxiter:
+        z = psolve(r, out=z)
+        rho1 = rho
+        rho = cublas.dotc(r, z)
+        if iters == 0:
+            p = cp.copy(z)
+        else:
+            beta = rho / rho1
+            _fma(beta, p, 1.0, z, out=p)
+            #p = z + beta * p
+        q = matvec(p, out=q, buf=buf)
+        alpha = rho / cublas.dotc(p, q)
+        _fma(alpha, p, 1.0, x, out=x)
+        #x += alpha * p
+        _fma(-alpha, q, 1.0, r, out=r)
+        #r -= alpha * q
+        iters += 1
+        if callback is not None:
+            callback(x)
+        resid = cublas.nrm2(r)
+        if resid <= atol:
+            break
+
+    info = 0
+    if iters == maxiter and not (resid <= atol):
+        info = iters
+
+    return x, info
 
 def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
 
@@ -382,7 +525,7 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
     # Preconditioner = poisson.
 
     def make_aop(Skappa2):
-        def Aop(phiG):
+        def Aop(phiG, out=None, buf=None):
             # No scaling by weight of the intermediates is necessary thanks to linearity
             # phiG_3d = phiG.reshape(*mesh)
             # grad_phiG = gradient_recip(phiG_3d, Gx, Gy, Gz).reshape(3, *mesh)
@@ -395,36 +538,47 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
             # debye_term_G = fft_in_place(debye_term_real)
             # return -(div_eps_grad_phiG - debye_term_G).reshape(-1)
 
+            RangePush("Aop")
             phiG_3d = phiG.reshape(*mesh)
-            minus_div_eps_grad_phiG = cp.zeros(mesh, dtype=cp.complex128)
-            buf = cp.zeros(mesh, dtype=cp.complex128)
+            if buf is None:
+                minus_div_eps_grad_phiG = cp.zeros(mesh, dtype=cp.complex128)
+            else:
+                minus_div_eps_grad_phiG = buf.reshape(*mesh)
+                minus_div_eps_grad_phiG.fill(0.0)
+
+            if out is None:
+                out = cp.zeros_like(minus_div_eps_grad_phiG)
+            out = out.reshape(*mesh)
             for i in range(3):
-                _apply_Gv_1j(phiG_3d, Gx[i], Gy[i], Gz[i], buf)
-                ifft_in_place(buf)
-                buf *= eps_r_field
-                fft_in_place(buf)
-                _contract_Gv_1j(minus_div_eps_grad_phiG, buf, Gx[i], Gy[i], Gz[i])
-            buf[:, :, :] = phiG_3d
-            ifft_in_place(buf)
-            buf *= Skappa2
-            fft_in_place(buf)
-            buf += minus_div_eps_grad_phiG
-            return buf.reshape(-1)
+                _apply_Gv_1j(phiG_3d, Gx[i], Gy[i], Gz[i], out)
+                ifft_in_place(out)
+                #out *= eps_r_field
+                cp.multiply(out, eps_r_field, out=out)
+                fft_in_place(out)
+                _contract_Gv_1j(minus_div_eps_grad_phiG, out, Gx[i], Gy[i], Gz[i])
+            out[:, :, :] = phiG_3d
+            ifft_in_place(out)
+            cp.multiply(out, Skappa2, out=out)
+            #out *= Skappa2
+            fft_in_place(out)
+            cp.add(out, minus_div_eps_grad_phiG, out=out)
+            #out += minus_div_eps_grad_phiG
+            RangePop()
+            return out.reshape(-1)
         return Aop
 
     mean_S = cp.mean(S.reshape(-1))
     mean_eps_r = float(1. + (rel_permittivity - 1.) * mean_S)
     mean_ebkappa2 = float(mean_S * ebkappa2)
 
-    def Mprecond(phiG):
-        precond_phiG = _precond_yukawa_or_coul(phiG, Gv_bases, eps_r=mean_eps_r, ebkappa2=mean_ebkappa2)
+    def Mprecond(phiG, out=None):
+        precond_phiG = _precond_yukawa_or_coul(phiG, Gv_bases, eps_r=mean_eps_r, ebkappa2=mean_ebkappa2, out=out)
         return precond_phiG.reshape(-1)
 
 
     t0 = log.init_timer()
+    RangePush("lpbe_cg_solve")
 
-    A = LinearOperator((ngrids, ngrids), matvec=make_aop(S*ebkappa2), dtype=cp.complex128)
-    M = LinearOperator((ngrids, ngrids), matvec=Mprecond, dtype=cp.complex128)
     rhs = fft_3d(4*np.pi*solute_chargeR.reshape(*mesh)).reshape(-1) * weight
 
     niter = 0
@@ -432,12 +586,13 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
         nonlocal niter
         niter += 1
 
-    RangePush("lpbe_cg_solve")
 
     # Div( eps_r * Grad(phi) ) - S phi / (debye_length^2) = -4*pi*solute_chargeR.
-    solution_phi_G, info = cg(A, rhs, M=M, x0=pot_guess, tol=tol, maxiter=400, callback=callback)
+    solution_phi_G, info = cg_opt(ngrids, make_aop(S*ebkappa2), Mprecond, rhs, x0=pot_guess, tol=tol, maxiter=400, callback=callback)
 
     RangePop()
+    t1 = log.timer("LPBE CG solve", *t0)
+
 
     if info != 0:
         log.warn(f"Conjugate gradient did not converge: info={info}")
@@ -765,6 +920,9 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
     veff = _format_jks(veff, dm_kpts, kpts_band, kpts)
     veff = tag_array(veff, ecoul=ecoul, exc=xc_energy_sum)
     t0 = log.timer_debug1("xc matrix", *t0)
+
+    RangePop()
+
     return n_electrons, xc_energy_sum, veff
 
 

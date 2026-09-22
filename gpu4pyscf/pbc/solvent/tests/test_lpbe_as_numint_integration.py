@@ -1,10 +1,11 @@
 import pyscf
 from gpu4pyscf.pbc.solvent.lpbe_as_numint import multigrid_lpbe
 import unittest
-
+import pytest
 
 class KnownValues(unittest.TestCase):
 
+    @pytest.mark.slow
     def test_cu111_2layers(self):
         a = '''2.5526554800834367 0.0 0.0
         1.2763277400417183 2.210664492861818 0.0
