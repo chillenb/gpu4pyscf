@@ -339,7 +339,7 @@ class RHF(hf.RHF):
         if damp_factor is not None:
             raise NotImplementedError('SCF damping')
         if diis is not None and cycle >= diis_start_cycle:
-            f = diis.update(s1e, dm, f)
+            f = diis.update(s1e, dm, f, self, h1e, vhf, cycle=cycle)
             cp.get_default_memory_pool().free_all_blocks()
 
         if level_shift_factor is None:

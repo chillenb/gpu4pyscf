@@ -75,7 +75,8 @@ class CDIIS(lib.diis.DIIS):
             self.clear()
 
         if abs(self.damp) < 1e-6 or f_prev is None or cycle >= self.ndamp_cycles:
-            logger.debug(self, 'DIIS damping factor %s, damping is inactive', self.damp)
+            if abs(self.damp) > 1e-6:
+                logger.debug(self, 'DIIS damping factor %s, damping is inactive', self.damp)
             xnew = lib.diis.DIIS.update(self, f_tril, xerr=errvec)
         else:
             logger.debug(self, 'DIIS damping factor %s, damping active', self.damp)

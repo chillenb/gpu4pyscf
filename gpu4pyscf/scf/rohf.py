@@ -176,7 +176,7 @@ class ROHF(hf.RHF):
         if damp_factor is not None:
             raise NotImplementedError('ROHF Fock-damping')
         if diis and cycle >= diis_start_cycle:
-            f = diis.update(s1e, dm_tot, f)
+            f = diis.update(s1e, dm_tot, f, self, h1e, vhf, cycle=cycle, f_prev=fock_last)
 
         if level_shift_factor is None:
             level_shift_factor = self.level_shift

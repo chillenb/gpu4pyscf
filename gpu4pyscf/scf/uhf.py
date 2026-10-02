@@ -92,7 +92,7 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
         f = cupy.asarray((asarray(damping(f[0], fock_last[0], dampa)),
                           asarray(damping(f[1], fock_last[1], dampb))))
     if diis and cycle >= diis_start_cycle:
-        f = diis.update(s1e, dm, f)
+        f = diis.update(s1e, dm, f, mf, h1e, vhf, cycle=cycle, f_prev=fock_last)
 
     if level_shift_factor is None:
         level_shift_factor = mf.level_shift

@@ -177,7 +177,7 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
     if damp_factor is not None and 0 <= cycle < diis_start_cycle-1 and fock_last is not None:
         f = damping(f, fock_last, damp_factor)
     if diis is not None and cycle >= diis_start_cycle:
-        f = diis.update(s1e, dm, f, mf, h1e, vhf, cycle=cycle, fock_last=fock_last)
+        f = diis.update(s1e, dm, f, mf, h1e, vhf, cycle=cycle, f_prev=fock_last)
 
     if level_shift_factor is None:
         level_shift_factor = mf.level_shift
@@ -285,7 +285,11 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, mf_diis, fock_last=fock_last)
         t1 = log.timer_debug1('DIIS', *t0)
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
+<<<<<<< Updated upstream
         if mf.damp is not None or mf.diis_damp is not None:
+=======
+        if mf.damp is not None or mf.diis_damp:
+>>>>>>> Stashed changes
             fock_last = fock
         fock = None
         t1 = log.timer_debug1('eig', *t1)
@@ -712,8 +716,8 @@ class SCF(pyscf_lib.StreamObject):
     diis_start_cycle    = hf_cpu.SCF.diis_start_cycle
     diis_file           = hf_cpu.SCF.diis_file
     diis_space_rollback = hf_cpu.SCF.diis_space_rollback
-    damp                = None
-    level_shift         = None
+    damp                = hf_cpu.SCF.damp
+    level_shift         = hf_cpu.SCF.level_shift
     direct_scf          = hf_cpu.SCF.direct_scf
     direct_scf_tol      = hf_cpu.SCF.direct_scf_tol
     conv_check          = hf_cpu.SCF.conv_check
@@ -721,7 +725,8 @@ class SCF(pyscf_lib.StreamObject):
 
     _keys = {
         'conv_tol', 'conv_tol_grad', 'conv_tol_cpscf', 'max_cycle', 'init_guess',
-        'sap_basis', 'DIIS', 'diis', 'diis_space', 'diis_damp', 'diis_start_cycle',
+        'sap_basis', 'DIIS', 'diis', 'diis_space', 'diis_damp', 
+        'diis_damp_cycles', 'diis_start_cycle',
         'diis_file', 'diis_space_rollback', 'damp', 'level_shift',
         'direct_scf', 'direct_scf_tol', 'conv_check', 'callback',
         'mol', 'chkfile', 'mo_energy', 'mo_coeff', 'mo_occ',
