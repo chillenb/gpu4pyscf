@@ -478,7 +478,7 @@ class CDFT_UKS(CDFTBaseMixin, dft.UKS):
             f = cp.asarray((asarray(damping(f[0], fock_last[0], dampa)),
                             asarray(damping(f[1], fock_last[1], dampb))))
         if diis and cycle >= diis_start_cycle:
-            f = diis.update(s1e, dm, f)
+            f = diis.update(s1e, dm, f, self, h1e, vhf, cycle=cycle, f_prev=fock_last)
 
         if level_shift_factor is None:
             level_shift_factor = self.level_shift
