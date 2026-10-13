@@ -286,11 +286,7 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, mf_diis, fock_last=fock_last)
         t1 = log.timer_debug1('DIIS', *t0)
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
-<<<<<<< Updated upstream
-        if mf.damp is not None or mf.diis_damp is not None:
-=======
         if mf.damp is not None or mf.diis_damp:
->>>>>>> Stashed changes
             fock_last = fock
         fock = None
         t1 = log.timer_debug1('eig', *t1)
