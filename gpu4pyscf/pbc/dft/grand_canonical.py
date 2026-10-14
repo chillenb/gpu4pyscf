@@ -1133,6 +1133,30 @@ class GrandCanonicalKRKS(lib.StreamObject):
             raise ValueError('N-scan mu must increase strictly with nelec')
         return unique
 
+    def _merge_mu_calibration(self, calibration, record):
+        '''Add a converged fixed-mu point to the mu(N) calibration.
+
+        A fixed-mu solution only determines N to roughly the residual
+        tolerance, so a point whose mu matches an existing calibration point
+        within conv_tol_mu is the same state; keep the better-converged one
+        instead of creating a near-duplicate that breaks strict monotonicity.
+        '''
+        merged = []
+        for old in calibration:
+            if abs(old['mu']-record['mu']) <= self.conv_tol_mu:
+                if old['residual_rms'] < record['residual_rms']:
+                    return calibration
+            else:
+                merged.append(old)
+        merged.append(record)
+        try:
+            return self._prepare_mu_calibration(merged)
+        except ValueError as err:
+            logger.warn(self, 'mu-scan point N = %.12g, mu = %.12g not added '
+                        'to the mu(N) calibration: %s',
+                        record['nelec'], record['mu'], err)
+            return calibration
+
     def _mu_scan_seed(self, calibration, target_mu):
         nelecs = np.asarray([x['nelec'] for x in calibration])
         mus = np.asarray([x['mu'] for x in calibration])
@@ -1327,14 +1351,13 @@ class GrandCanonicalKRKS(lib.StreamObject):
             last_cycle_data = cycle_data
             last_converged = converged
             if converged:
-                calibration = self._prepare_mu_calibration(
-                    calibration + [{
-                        'index': None,
-                        'nelec': cycle_data.nelec,
-                        'mu': cycle_data.mu,
-                        'converged': True,
-                        'residual_rms': cycle_data.residual_rms,
-                    }])
+                calibration = self._merge_mu_calibration(calibration, {
+                    'index': None,
+                    'nelec': cycle_data.nelec,
+                    'mu': cycle_data.mu,
+                    'converged': True,
+                    'residual_rms': cycle_data.residual_rms,
+                })
 
         self.nelec = None
         self.message = records[-1]['message']

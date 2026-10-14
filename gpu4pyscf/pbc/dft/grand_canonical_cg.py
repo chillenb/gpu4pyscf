@@ -616,12 +616,9 @@ def nlcg(self, dm0=None, h=None):
 
 
 def fixed_mu_diis_inner(self, dm0=None, h=None, dump_chk=True):
+    # Called from kernel() and mu_scan() after the fixed-N secant phase, so the
+    # cycle/evaluation counters must accumulate here rather than restart.
     self.build()
-    self.converged = False
-    self.cycles = 0
-    self.outer_cycles = 0
-    self.nfev = 0
-    self.refinements = 0
     self.message = ''
 
     if h is None:
@@ -635,7 +632,7 @@ def fixed_mu_diis_inner(self, dm0=None, h=None, dump_chk=True):
     adiis = diis.DIIS(self)
     adiis.space = self.diis_space
 
-    for unused_cycle in range(self.max_cycle):
+    for diis_cycle in range(1, self.max_cycle+1):
         if state.residual_rms <= self.conv_tol:
             break
 
@@ -657,7 +654,7 @@ def fixed_mu_diis_inner(self, dm0=None, h=None, dump_chk=True):
             self,
             'Fixed-mu DIIS cycle %d: grand potential = %f, residual = %e, '
             'nelec = %f',
-            self.cycles, state.grand_potential, state.residual_rms,
+            diis_cycle, state.grand_potential, state.residual_rms,
             state.nelec)
 
         if dump_chk and self.chkfile:
@@ -676,5 +673,10 @@ def fixed_mu_diis_inner(self, dm0=None, h=None, dump_chk=True):
 
 
 def fixed_mu_diis(self, dm0=None, h=None):
+    self.converged = False
+    self.cycles = 0
+    self.outer_cycles = 0
+    self.nfev = 0
+    self.refinements = 0
     state, converged = self.fixed_mu_diis_inner(dm0=dm0, h=h, dump_chk=True)
     return self._finalize(state, converged)
