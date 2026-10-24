@@ -658,13 +658,7 @@ def fixed_mu_diis_inner(self, dm0=None, h=None, dump_chk=True):
             state.nelec)
 
         if dump_chk and self.chkfile:
-            mo_coeff = [x.dot(c).get() for x, c in zip(self.x_ao2orth, state.coeff)]
-            self.dump_chk({
-                'e_tot': state.e_tot,
-                'mo_coeff': mo_coeff,
-                'mo_occ': [cp.asnumpy(2.*x) for x in state.occ],
-                'mo_energy': [cp.asnumpy(x) for x in state.eig],
-            })
+            self.dump_chk(self._chk_envs(state))
 
     converged = state.residual_rms <= self.conv_tol
     self.message = ('converged fixed-mu gradient DIIS' if converged else

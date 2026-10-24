@@ -41,8 +41,11 @@ from gpu4pyscf.pbc.dft.grand_canonical_cg import fixed_mu_diis, fixed_mu_diis_in
 __all__ = ['GrandCanonicalKRKS']
 
 
+# Relative to max|F| of the AO Fock matrix.
 _HERMITICITY_TOL = getattr(
     __config__, 'pbc_dft_grand_canonical_hermiticity_tol', 1e-10)
+# Absolute floor on max|X^H S X - 1|; raised to the rounding error of forming
+# X^H S X when the overlap matrix is badly conditioned (see build()).
 _ORTHOGONALITY_TOL = getattr(
     __config__, 'pbc_dft_grand_canonical_orthogonality_tol', 1e-9)
 
@@ -367,6 +370,27 @@ class GrandCanonicalKRKS(lib.StreamObject):
             self.mf.dump_chk(envs)
         return self
 
+    def _chk_envs(self, cycle_data):
+        '''Orbitals of cycle_data for dump_chk, padded to nao at every k-point
+        the way KSCF.eig pads k-points that dropped linearly dependent AOs:
+        zero coefficients, zero occupation, and a large orbital energy.'''
+        mo_coeff = [cp.asnumpy(x.dot(c))
+                    for x, c in zip(self.x_ao2orth, cycle_data.coeff)]
+        coeff = np.zeros((self.nkpts, self.nao, self.nao),
+                         dtype=np.result_type(*mo_coeff))
+        energy = np.empty((self.nkpts, self.nao))
+        occ = np.zeros((self.nkpts, self.nao))
+        for k, (c, e, q) in enumerate(zip(mo_coeff, cycle_data.eig,
+                                          cycle_data.occ)):
+            e = cp.asnumpy(e)
+            nmo = e.size
+            coeff[k, :, :nmo] = c
+            energy[k, :nmo] = e
+            energy[k, nmo:] = abs(e.max()) * 2 + 1e5
+            occ[k, :nmo] = cp.asnumpy(2.*q)
+        return {'e_tot': cycle_data.e_tot, 'mo_coeff': coeff,
+                'mo_occ': occ, 'mo_energy': energy}
+
     def build(self):
         if self._built:
             return self
@@ -413,6 +437,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.nao = self.s_ao[0].shape[0]
         self.north = []
         self.identity = []
+        worst = 0.
         for k, (s, h, x) in enumerate(zip(
                 self.s_ao, self.hcore_ao, self.x_ao2orth)):
             if s.shape != (self.nao, self.nao) or h.shape != s.shape:
@@ -421,10 +446,21 @@ class GrandCanonicalKRKS(lib.StreamObject):
                 raise ValueError('invalid orthogonalizer at k-point %d' % k)
             error = cp.max(cp.abs(
                 x.conj().T.dot(s).dot(x) - cp.eye(x.shape[1]))).item()
-            if error > _ORTHOGONALITY_TOL:
-                raise ValueError('X^H S X is not identity at k-point %d' % k)
+            # Rounding in X^H S X is up to about nao*eps*||S||*||X||^2, where
+            # ||S||*||X||^2 is cond(S) on the retained space (~1e6 for Cu and
+            # Au slabs).  A wrong X gives errors of order one.
+            cond = (cp.linalg.eigvalsh(s)[-1] *
+                    cp.linalg.eigvalsh(x.conj().T.dot(x))[-1]).item()
+            tol = max(_ORTHOGONALITY_TOL,
+                      self.nao * np.finfo(float).eps * cond)
+            if error > tol:
+                raise ValueError(
+                    'X^H S X is not identity at k-point %d: max error %.3g, '
+                    'tolerance %.3g, cond(S) %.3g' % (k, error, tol, cond))
+            worst = max(worst, error / tol)
             self.north.append(x.shape[1])
             self.identity.append(cp.eye(x.shape[1], dtype=x.dtype))
+        logger.debug(self, 'max |X^H S X - 1| / tolerance = %.3g', worst)
         self.ndof = self.weight * sum(n*n for n in self.north)
         self.capacity = 2. * self.weight * sum(self.north)
         if self.nelec is not None and not 0 < self.nelec < self.capacity:
@@ -480,12 +516,20 @@ class GrandCanonicalKRKS(lib.StreamObject):
     def _to_orth(self, matrices):
         matrices = coerce_to_list_of_matrices(matrices, 'AO matrices')
         out = []
+        worst = 0.
         for k, (a, x) in enumerate(zip(matrices, self.x_ao2orth)):
+            # X^H A X is Hermitian whenever A is, so test A itself.  Testing
+            # X^H A X would amplify rounding by ||X||^2 = 1/min eig(S).
+            error = cp.max(cp.abs(a - a.conj().T)).item()
+            scale = max(1.0, cp.max(cp.abs(a)).item())
+            if error > _HERMITICITY_TOL * scale:
+                raise FloatingPointError(
+                    'Fock matrix at k-point %d is not Hermitian: '
+                    'max |F - F^H| = %.3g, max |F| = %.3g' % (k, error, scale))
+            worst = max(worst, error / scale)
             value = x.conj().T.dot(a).dot(x)
-            error = cp.linalg.norm(value - value.conj().T).item() / value.shape[0]
-            if error > _HERMITICITY_TOL:
-                raise FloatingPointError('Fock matrix at k-point %d is not Hermitian' % k)
             out.append(0.5 * (value + value.conj().T))
+        logger.debug1(self, 'max |F - F^H| / max |F| = %.3g', worst)
         return out
 
     def _fock_from_veff(self, dm, veff):
@@ -718,13 +762,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             )
 
             if dump_chk and self.chkfile:
-                mo_coeff = [x.dot(c).get() for x, c in zip(self.x_ao2orth, trial.coeff)]
-                self.dump_chk({
-                    'e_tot': trial.e_tot,
-                    'mo_coeff': mo_coeff,
-                    'mo_occ': [cp.asnumpy(2.*x) for x in trial.occ],
-                    'mo_energy': [cp.asnumpy(x) for x in trial.eig],
-                })
+                self.dump_chk(self._chk_envs(trial))
 
             if callable(self.callback):
                 self.callback({
