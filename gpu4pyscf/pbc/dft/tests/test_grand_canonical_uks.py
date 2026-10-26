@@ -50,7 +50,6 @@ def setUpModule():
         atom='H 0 0 0',
         basis='gth-dzv',
         pseudo='gth-pade',
-        mesh=[13, 13, 13],
         spin=0,
     )
     hlat_kpts = hlat.make_kpts([2, 2, 2])
@@ -109,18 +108,29 @@ class KnownValues(unittest.TestCase):
         def compare(**kwargs):
             mf_r = _lpbe(slab.KRKS(xc='pbe', kpts=slab_kpts).to_gpu())
             mf_u = _lpbe(slab.KUKS(xc='pbe', kpts=slab_kpts).to_gpu())
-            mf_r.init_guess = mf_u.init_guess = 'minao'
-            sr = GrandCanonicalKRKS(mf_r, sigma=1e-2, **kwargs).run()
+            # KRHF.get_init_guess does not renormalize its guess (~11 e instead
+            # of 8 in this small cell), which derails a fixed-mu KRKS run.  Start
+            # both from the same atom guess scaled to the neutral electron count.
+            dm0 = mf_r.get_init_guess(slab, key='atom')
+            s1e = mf_r.get_ovlp()
+            ne = float(cp.einsum('kij,kji->', dm0, s1e).real) / len(slab_kpts)
+            dm0 *= slab.tot_electrons(1) / ne
+            sr = GrandCanonicalKRKS(mf_r, sigma=1e-2, **kwargs)
+            sr.kernel(dm0=dm0)
             su = GrandCanonicalKS(mf_u, sigma=1e-2, **kwargs)
             self.assertIsInstance(su, GrandCanonicalKUKS)
-            su.run()
+            su.kernel(dm0=dm0)
             self.assertTrue(sr.converged and su.converged)
             self.assertAlmostEqual(su.free_energy, sr.free_energy, 7)
-            self.assertAlmostEqual(su.grand_potential, sr.grand_potential, 7)
+            # Omega = A - mu*N inherits the error of mu (small DOS at E_F here:
+            # ~5e-8 at conv_tol 1e-8), unlike the variational A, so it gets
+            # the same precision as mu below.
+            self.assertAlmostEqual(su.grand_potential, sr.grand_potential, 5)
             self.assertAlmostEqual(su.electron_number, sr.electron_number, 6)
             self.assertAlmostEqual(su.mu, sr.mu, 5)
             self.assertAlmostEqual(su.magnetization, 0, 5)
-            self.assertEqual(su.mo_occ.shape[0], 2)
+            # one entry per spin; a list rather than an array for ragged k-points
+            self.assertEqual(len(su.mo_occ), 2)
             return sr
         sr = compare(nelec=slab.tot_electrons(1) + .02)
         compare(mu=sr.mu)
