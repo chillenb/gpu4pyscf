@@ -25,7 +25,7 @@ from . import kgks
 from . import krkspu
 from . import kukspu
 from . import simple_krks
-from .grand_canonical import GrandCanonicalKRKS
+from .grand_canonical import GrandCanonicalKRKS, GrandCanonicalKUKS, GrandCanonicalKS
 from .rks import KohnShamDFT
 
 KRKS = krks.KRKS
