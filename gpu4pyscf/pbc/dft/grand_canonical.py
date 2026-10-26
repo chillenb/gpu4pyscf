@@ -12,12 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-'''Finite-temperature grand-canonical KRKS for periodic systems.
+'''Finite-temperature grand-canonical KRKS and KUKS for periodic systems.
 
 Fixed-electron-number problems are solved with residual DIIS.  At fixed
 chemical potential, a safeguarded secant iteration selects the electron
 number of a sequence of fixed-N problems.  This avoids applying DIIS directly
 to the discontinuously changing low-temperature occupations.
+
+Internally every matrix quantity (auxiliary Hamiltonian, Fock matrix,
+orbitals, occupations) is a flat list of blocks.  For KRKS there is one block
+per k-point; for KUKS there are 2*nkpts blocks ordered spin-major,
+``[alpha k0, alpha k1, ..., beta k0, beta k1, ...]``.  Both spins share a
+single chemical potential, so in KUKS only the total electron number is
+fixed (or controlled by mu) and the magnetization relaxes self-consistently.
 '''
 
 import csv
@@ -38,7 +45,7 @@ from gpu4pyscf.scf import hf as mol_hf
 from gpu4pyscf.pbc.dft.grand_canonical_cg import fixed_mu_diis, fixed_mu_diis_inner, nlcg
 
 
-__all__ = ['GrandCanonicalKRKS']
+__all__ = ['GrandCanonicalKRKS', 'GrandCanonicalKS', 'GrandCanonicalKUKS']
 
 
 # Relative to max|F| of the AO Fock matrix.
@@ -97,15 +104,23 @@ def _fermi_entropy(occ):
 
 
 class GCSolverCycle:
+    '''One evaluation of the finite-temperature KS map.
+
+    ``h``, ``eig``, ``coeff``, ``occ``, ``p``, ``fock`` and ``residual`` are
+    lists of blocks (see the module docstring); ``dm`` has the shape of the
+    underlying mf (nkpts,nao,nao) or (2,nkpts,nao,nao).  ``spin_nelec`` holds
+    the electron number of each spin channel (one entry for KRKS).
+    '''
     __slots__ = (
         'h', 'eig', 'coeff', 'occ', 'p', 'dm', 'fock',
         'mu', 'e_tot', 'nelec',
         'entropy', 'entropy_energy', 'free_energy', 'grand_potential',
-        'residual', 'residual_rms', 'grid_data')
+        'residual', 'residual_rms', 'grid_data', 'spin_nelec')
 
     def __init__(self, h, eig, coeff, occ, p, dm, fock, mu,
                  e_tot, nelec, entropy, entropy_energy, free_energy,
-                 grand_potential, residual, residual_rms, grid_data=None):
+                 grand_potential, residual, residual_rms, grid_data=None,
+                 spin_nelec=None):
         self.h = h
         self.eig = eig
         self.coeff = coeff
@@ -123,6 +138,14 @@ class GCSolverCycle:
         self.residual = residual
         self.residual_rms = residual_rms
         self.grid_data = grid_data
+        self.spin_nelec = spin_nelec
+
+    @property
+    def magnetization(self):
+        '''N_alpha - N_beta per cell (0 for KRKS).'''
+        if self.spin_nelec is None or len(self.spin_nelec) < 2:
+            return 0.
+        return self.spin_nelec[0] - self.spin_nelec[1]
 
 
 class FixedNCalc:
@@ -161,19 +184,17 @@ class MuSeed:
         self.fixed_n_calc = None
 
 
-class GrandCanonicalKRKS(lib.StreamObject):
-    '''Finite-temperature KRKS at fixed chemical potential or electron count.
+class _GrandCanonicalKSBase(lib.StreamObject):
+    '''Spin-generic finite-temperature KS solver; use GrandCanonicalKRKS or
+    GrandCanonicalKUKS.
 
-    Args:
-        mf : KRKS
-            A configured GPU4PySCF periodic restricted Kohn-Sham object.
-        mu : float or None
-            Chemical potential in Hartree.  Required unless ``nelec`` is set.
-        sigma : float
-            Fermi smearing width in Hartree.
-        nelec : float or None
-            Electron count for a canonical calculation.
+    Subclasses set ``nspin`` (number of spin channels, 1 or 2) and
+    ``_mf_type`` (the class name the mf must have).  Each orbital holds
+    ``occ_scale = 2/nspin`` electrons when fully occupied.
     '''
+
+    nspin = None
+    _mf_type = None
 
     nlcg = nlcg
     fixed_mu_diis = fixed_mu_diis
@@ -223,7 +244,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         'free_energy', 'grand_potential', 'electron_number', 'entropy',
         'entropy_energy', 'residual_rms', 'mo_energy', 'mo_coeff', 'mo_occ',
         'refinements', 'message', 'scf_summary',
-        'potential_residual_rms',
+        'potential_residual_rms', 'magnetization',
     }
 
     def __init__(self, mf, mu=None, sigma=None, nelec=None):
@@ -267,6 +288,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.entropy_energy = None
         self.residual_rms = None
         self.potential_residual_rms = None
+        self.magnetization = None
         self.mo_energy = None
         self.mo_coeff = None
         self.mo_occ = None
@@ -282,6 +304,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
         log.info('******** %s ********', self.__class__)
         log.info('ensemble = %s', 'fixed N' if self.nelec is not None else
                  'fixed mu')
+        if self.nspin == 2:
+            log.info('spin channels = 2 (common mu, magnetization relaxes)')
         log.info('sigma = %.12g Ha', self.sigma)
         if self.nelec is None:
             log.info('mu = %.12g Ha', self.mu)
@@ -373,13 +397,15 @@ class GrandCanonicalKRKS(lib.StreamObject):
     def _chk_envs(self, cycle_data):
         '''Orbitals of cycle_data for dump_chk, padded to nao at every k-point
         the way KSCF.eig pads k-points that dropped linearly dependent AOs:
-        zero coefficients, zero occupation, and a large orbital energy.'''
+        zero coefficients, zero occupation, and a large orbital energy.
+        Arrays have shape (nkpts,...) for KRKS and (2,nkpts,...) for KUKS.'''
         mo_coeff = [cp.asnumpy(x.dot(c))
                     for x, c in zip(self.x_ao2orth, cycle_data.coeff)]
-        coeff = np.zeros((self.nkpts, self.nao, self.nao),
+        nblocks = len(mo_coeff)
+        coeff = np.zeros((nblocks, self.nao, self.nao),
                          dtype=np.result_type(*mo_coeff))
-        energy = np.empty((self.nkpts, self.nao))
-        occ = np.zeros((self.nkpts, self.nao))
+        energy = np.empty((nblocks, self.nao))
+        occ = np.zeros((nblocks, self.nao))
         for k, (c, e, q) in enumerate(zip(mo_coeff, cycle_data.eig,
                                           cycle_data.occ)):
             e = cp.asnumpy(e)
@@ -387,9 +413,12 @@ class GrandCanonicalKRKS(lib.StreamObject):
             coeff[k, :, :nmo] = c
             energy[k, :nmo] = e
             energy[k, nmo:] = abs(e.max()) * 2 + 1e5
-            occ[k, :nmo] = cp.asnumpy(2.*q)
-        return {'e_tot': cycle_data.e_tot, 'mo_coeff': coeff,
-                'mo_occ': occ, 'mo_energy': energy}
+            occ[k, :nmo] = cp.asnumpy(self.occ_scale*q)
+        shape = self._spin_kpts_shape
+        return {'e_tot': cycle_data.e_tot,
+                'mo_coeff': coeff.reshape(shape + coeff.shape[1:]),
+                'mo_occ': occ.reshape(shape + occ.shape[1:]),
+                'mo_energy': energy.reshape(shape + energy.shape[1:])}
 
     def build(self):
         if self._built:
@@ -400,10 +429,11 @@ class GrandCanonicalKRKS(lib.StreamObject):
                     'check_linear_dependency')
         missing = [name for name in required if not hasattr(self.mf, name)]
         if missing:
-            raise TypeError('mf is not KRKS-compatible; missing ' +
-                            ', '.join(missing))
-        if hasattr(self.mf, 'istype') and not self.mf.istype('KRKS'):
-            raise TypeError('GrandCanonicalKRKS requires a periodic KRKS object')
+            raise TypeError('mf is not %s-compatible; missing %s' % (
+                self._mf_type, ', '.join(missing)))
+        if hasattr(self.mf, 'istype') and not self.mf.istype(self._mf_type):
+            raise TypeError('%s requires a periodic %s object' % (
+                self.__class__.__name__, self._mf_type))
         if getattr(self.mf, 'smearing_method', None):
             raise ValueError('remove the standard smearing decorator first')
         if getattr(self.mf, 'sigma', 0.) not in (None, 0, 0.):
@@ -418,28 +448,32 @@ class GrandCanonicalKRKS(lib.StreamObject):
             raise ValueError('kpts must have shape (nkpts,3)')
         self.nkpts = len(self.kpts)
         self.weight = 1. / self.nkpts
+        if self.nspin not in (1, 2):
+            raise TypeError('nspin must be 1 or 2')
+        self.occ_scale = 2. / self.nspin
+        self._spin_kpts_shape = ((self.nkpts,) if self.nspin == 1 else
+                                 (self.nspin, self.nkpts))
 
         self.mf.chkfile = self.chkfile
 
         if hasattr(self.mf, 'build'):
             self.mf.build()
-        self.s_ao = coerce_to_list_of_matrices(
+        s_ao = coerce_to_list_of_matrices(
             self.mf.get_ovlp(self.cell, self.mf.kpts), 'overlap')
-        self.hcore_ao = coerce_to_list_of_matrices(
+        hcore_ao = coerce_to_list_of_matrices(
             self.mf.get_hcore(self.cell, self.mf.kpts), 'hcore')
-        if len(self.s_ao) != self.nkpts or len(self.hcore_ao) != self.nkpts:
+        if len(s_ao) != self.nkpts or len(hcore_ao) != self.nkpts:
             raise ValueError('overlap, hcore, and k-point counts differ')
-        x = self.mf.check_linear_dependency(_stack_or_list(self.s_ao))
-        self.x_ao2orth = coerce_to_list_of_matrices(x, 'orthogonalizers')
-        if len(self.x_ao2orth) != self.nkpts:
+        x = self.mf.check_linear_dependency(_stack_or_list(s_ao))
+        x_ao2orth = coerce_to_list_of_matrices(x, 'orthogonalizers')
+        if len(x_ao2orth) != self.nkpts:
             raise ValueError('orthogonalizer and k-point counts differ')
 
-        self.nao = self.s_ao[0].shape[0]
-        self.north = []
-        self.identity = []
+        self.nao = s_ao[0].shape[0]
+        north = []
+        identity = []
         worst = 0.
-        for k, (s, h, x) in enumerate(zip(
-                self.s_ao, self.hcore_ao, self.x_ao2orth)):
+        for k, (s, h, x) in enumerate(zip(s_ao, hcore_ao, x_ao2orth)):
             if s.shape != (self.nao, self.nao) or h.shape != s.shape:
                 raise ValueError('inconsistent AO dimensions at k-point %d' % k)
             if x.shape[0] != self.nao or x.shape[1] == 0:
@@ -458,15 +492,25 @@ class GrandCanonicalKRKS(lib.StreamObject):
                     'X^H S X is not identity at k-point %d: max error %.3g, '
                     'tolerance %.3g, cond(S) %.3g' % (k, error, tol, cond))
             worst = max(worst, error / tol)
-            self.north.append(x.shape[1])
-            self.identity.append(cp.eye(x.shape[1], dtype=x.dtype))
+            north.append(x.shape[1])
+            identity.append(cp.eye(x.shape[1], dtype=x.dtype))
         logger.debug(self, 'max |X^H S X - 1| / tolerance = %.3g', worst)
+
+        # Per-block AO data: the k-point lists repeated for each spin, so
+        # they zip directly with the spin-major block lists of a cycle.
+        self.s_ao = s_ao * self.nspin
+        self.hcore_ao = hcore_ao * self.nspin
+        self.x_ao2orth = x_ao2orth * self.nspin
+        self.north = north * self.nspin
+        self.identity = identity * self.nspin
+        self.nblocks = self.nspin * self.nkpts
         self.ndof = self.weight * sum(n*n for n in self.north)
-        self.capacity = 2. * self.weight * sum(self.north)
+        self.capacity = self.occ_scale * self.weight * sum(self.north)
         if self.nelec is not None and not 0 < self.nelec < self.capacity:
             raise ValueError('nelec must lie between 0 and %g' % self.capacity)
 
-        self.hcore = _stack_or_list(self.hcore_ao)
+        # Per-k-point core Hamiltonian, as mf.energy_elec expects it.
+        self.hcore = _stack_or_list(hcore_ao)
         self.e_nuc = _as_float(self.mf.energy_nuc(), 'nuclear energy')
         self._built = True
         return self
@@ -502,13 +546,49 @@ class GrandCanonicalKRKS(lib.StreamObject):
         numerator = sum(float(cp.trace(x).real.item()) for x in blocks)
         return numerator / sum(x.shape[0] for x in blocks)
 
+    def _blocks(self, values, name='matrices'):
+        '''Split an mf-shaped (nkpts,...) or (2,nkpts,...) stack into the
+        spin-major list of blocks.'''
+        if self.nspin == 1:
+            blocks = coerce_to_list_of_matrices(values, name)
+        else:
+            if not (isinstance(values, (list, tuple)) and len(values) == 2):
+                values = cp.asarray(values)
+                if values.ndim != 4 or values.shape[0] != 2:
+                    raise ValueError('%s must have shape (2,nkpts,n,n)' % name)
+            blocks = (coerce_to_list_of_matrices(values[0], name) +
+                      coerce_to_list_of_matrices(values[1], name))
+        if len(blocks) != self.nblocks:
+            raise ValueError('%s: expected %d blocks, got %d' % (
+                name, self.nblocks, len(blocks)))
+        return blocks
+
+    def _from_blocks(self, blocks):
+        '''Stack equally shaped blocks into the mf layout.'''
+        out = cp.stack(blocks)
+        return out.reshape(self._spin_kpts_shape + out.shape[1:])
+
+    def _spin_slices(self):
+        return [slice(s*self.nkpts, (s+1)*self.nkpts)
+                for s in range(self.nspin)]
+
+    def _initial_dm(self, dm0=None):
+        '''Initial AO density in the mf layout.'''
+        raise NotImplementedError
+
+    def _spin_info(self, cycle_data):
+        '''Suffix for log lines: the magnetization in KUKS, nothing in KRKS.'''
+        if self.nspin == 1:
+            return ''
+        return '  M = %.8g' % cycle_data.magnetization
+
     def _sanitize_h(self, h):
         h = coerce_to_list_of_matrices(h, 'auxiliary Hamiltonian')
-        if len(h) != self.nkpts:
-            raise ValueError('Hamiltonian and k-point counts differ')
+        if len(h) != self.nblocks:
+            raise ValueError('Hamiltonian and block counts differ')
         for k, x in enumerate(h):
             if x.shape != (self.north[k], self.north[k]):
-                raise ValueError('invalid Hamiltonian shape at k-point %d' % k)
+                raise ValueError('invalid Hamiltonian shape at block %d' % k)
             if not bool(cp.all(cp.isfinite(x)).item()):
                 raise FloatingPointError('Hamiltonian contains nonfinite values')
         return self._hermi(h)
@@ -524,7 +604,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             scale = max(1.0, cp.max(cp.abs(a)).item())
             if error > _HERMITICITY_TOL * scale:
                 raise FloatingPointError(
-                    'Fock matrix at k-point %d is not Hermitian: '
+                    'Fock matrix at block %d is not Hermitian: '
                     'max |F - F^H| = %.3g, max |F| = %.3g' % (k, error, scale))
             worst = max(worst, error / scale)
             value = x.conj().T.dot(a).dot(x)
@@ -539,17 +619,17 @@ class GrandCanonicalKRKS(lib.StreamObject):
             fock = self.mf.get_fock(
                 h1e=self.hcore, vhf=veff, dm=dm, cycle=-1, diis=None, level_shift_factor=0.0, damp_factor=0.0
             )
-            return cp.stack(coerce_to_list_of_matrices(fock, 'decorated Fock matrices'))
-        veff_array = cp.asarray(veff)
-        return cp.stack([hcore + veff_array[k] for k, hcore in enumerate(self.hcore_ao)])
+            return self._blocks(fock, 'decorated Fock matrices')
+        veff_blocks = self._blocks(cp.asarray(veff), 'veff')
+        return [hcore + v for hcore, v in zip(self.hcore_ao, veff_blocks)]
 
     def _initial_h(self, dm0=None):
-        if dm0 is None:
-            dm0 = self.mf.get_init_guess(self.cell, key=self.mf.init_guess)
-        dm = cp.stack(self._hermi(coerce_to_list_of_matrices(dm0, 'initial density')))
+        dm_blocks = self._hermi(self._blocks(
+            self._initial_dm(dm0), 'initial density'))
+        dm = self._from_blocks(dm_blocks)
         nelec = self.weight * sum(_as_float(
             cp.einsum('ij,ji->', d, s), 'initial electron number')
-            for d, s in zip(dm, self.s_ao))
+            for d, s in zip(dm_blocks, self.s_ao))
         self.nfev += 1
         veff = self.mf.get_veff(
             self.cell, dm, dm_last=None, vhf_last=None, hermi=1,
@@ -560,7 +640,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
     def _solve_mu(self, orbital_energies, nelec):
         mo_energy = np.concatenate([
             cp.asnumpy(cp.asarray(x)).ravel() for x in orbital_energies])
-        nocc = nelec * self.nkpts / 2.
+        nocc = nelec * self.nkpts / self.occ_scale
         mu, _ = _smearing_optimize(
             _fermi_smearing_occ, mo_energy, nocc, self.sigma)
         mu = np.asarray(mu).reshape(-1)
@@ -573,7 +653,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         return mu
 
     def nelec_from_eig(self, orbital_energies, mu):
-        return 2.0 * self.weight * sum(float(cp.sum(_fermi_occ(self.beta * (x - mu))).item()) for x in orbital_energies)
+        return self.occ_scale * self.weight * sum(float(cp.sum(_fermi_occ(self.beta * (x - mu))).item()) for x in orbital_energies)
 
     def nelec_at_mu(self, h, mu):
         return self.nelec_from_eig([cp.linalg.eigvalsh(x) for x in h], mu)
@@ -591,7 +671,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
 
         occ = []
         p = []
-        dm = cp.empty((self.nkpts, self.nao, self.nao),
+        dm = cp.empty((self.nblocks, self.nao, self.nao),
                       dtype=cp.result_type(*h, cp.complex128))
         entropy_sum = 0.
         for k, (energy, c, x) in enumerate(zip(eig, coeff, self.x_ao2orth)):
@@ -599,17 +679,22 @@ class GrandCanonicalKRKS(lib.StreamObject):
             q = _fermi_occ(gamma)
             density = (c * q[None, :]).dot(c.conj().T)
             density = 0.5 * (density + density.conj().T)
-            dmk = 2.0 * x.dot(density).dot(x.conj().T)
+            dmk = self.occ_scale * x.dot(density).dot(x.conj().T)
             dm[k] = 0.5 * (dmk + dmk.conj().T)
             occ.append(q)
             p.append(density)
             entropy_sum += float(_fermi_entropy(q))
         p = self._hermi(p)
-        dm = cp.stack(self._hermi([dm[k] for k in range(self.nkpts)]))
+        dm_blocks = self._hermi([dm[k] for k in range(self.nblocks)])
+        dm = self._from_blocks(dm_blocks)
 
-        electron_number = 2.0 * self.weight * sum(float(cp.trace(x).real.item()) for x in p)
+        spin_nelec = tuple(
+            self.occ_scale * self.weight *
+            sum(float(cp.trace(x).real.item()) for x in p[sl])
+            for sl in self._spin_slices())
+        electron_number = sum(spin_nelec)
         ao_nelec = self.weight * sum(
-            _as_float(cp.einsum('ij,ji->', d, s), 'AO electron count') for d, s in zip(dm, self.s_ao)
+            _as_float(cp.einsum('ij,ji->', d, s), 'AO electron count') for d, s in zip(dm_blocks, self.s_ao)
         )
         if abs(electron_number - ao_nelec) > 1e-8 * max(1.0, electron_number):
             raise ValueError('AO and orthogonal electron counts disagree')
@@ -619,7 +704,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
         e_elec = _as_float(self.mf.energy_elec(dm, self.hcore, veff)[0], 'electronic energy')
         fock = self._to_orth(fock_ao)
         e_tot = e_elec + self.e_nuc
-        entropy = 2.0 * self.weight * entropy_sum
+        entropy = self.occ_scale * self.weight * entropy_sum
         entropy_energy = -self.sigma * entropy
         free_energy = e_tot + entropy_energy
 
@@ -640,7 +725,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             h, eig, coeff, occ, p, dm, fock, mu,
             e_tot, electron_number, entropy, entropy_energy, free_energy,
             grand_potential, residual, self._rms(mismatch),
-            getattr(veff, 'lpbe_grid', None))
+            getattr(veff, 'lpbe_grid', None), spin_nelec)
 
     def diis_pack(self, blocks, weight_errors=False):
         scale = self.weight**.5 if weight_errors else 1.
@@ -666,12 +751,13 @@ class GrandCanonicalKRKS(lib.StreamObject):
         logger.info(
             self,
             'Fixed-N cycle %d  N = %.12g  mu = %.12g  A = %.12g  '
-            'residual = %.6g',
+            'residual = %.6g%s',
             self.cycles,
             nelec,
             cycle_data.mu,
             cycle_data.free_energy,
             cycle_data.residual_rms,
+            self._spin_info(cycle_data),
         )
         return FixedNCalc(float(nelec), cycle_data, adiis, self.damp)
 
@@ -751,7 +837,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             logger.info(
                 self,
                 'Fixed-N cycle %d  N = %.12g  mu = %.12g  A = %.12g  '
-                'residual = %.6g  damping = %.3g  ratio = %.3g',
+                'residual = %.6g  damping = %.3g  ratio = %.3g%s',
                 self.cycles,
                 fixed_n_calc.nelec,
                 trial.mu,
@@ -759,6 +845,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
                 trial.residual_rms,
                 step,
                 ratio,
+                self._spin_info(trial),
             )
 
             if dump_chk and self.chkfile:
@@ -894,12 +981,13 @@ class GrandCanonicalKRKS(lib.StreamObject):
             logger.info(
                 self,
                 'Fixed-mu outer cycle %d  N = %.12g  optimized mu = '
-                '%.12g  delta mu = %.3g  residual = %.6g',
+                '%.12g  delta mu = %.3g  residual = %.6g%s',
                 self.outer_cycles,
                 current_n,
                 cycle_data.mu,
                 error,
                 cycle_data.residual_rms,
+                self._spin_info(cycle_data),
             )
 
             if abs(error) <= self.diis_max_dmu:
@@ -943,6 +1031,9 @@ class GrandCanonicalKRKS(lib.StreamObject):
             writer.writeheader()
         with h5py.File(h5_path, 'w') as h5f:
             h5f.create_dataset('sigma', data=self.sigma)
+            # points/<i>/mo_*/<b> are indexed by spin-major block b.
+            h5f.attrs['nspin'] = self.nspin
+            h5f.attrs['nkpts'] = self.nkpts
             for name, dtype in columns.items():
                 if dtype is str:
                     dtype = h5py.string_dtype(encoding='utf-8')
@@ -952,6 +1043,20 @@ class GrandCanonicalKRKS(lib.StreamObject):
             h5f.attrs['completed_points'] = 0
         return csv_path, h5_path
 
+    def _add_spin_columns(self, columns):
+        if self.nspin == 2:
+            columns['nelec_alpha'] = np.float64
+            columns['nelec_beta'] = np.float64
+            columns['magnetization'] = np.float64
+        return columns
+
+    def _add_spin_record(self, record, cycle_data):
+        if self.nspin == 2:
+            record['nelec_alpha'] = cycle_data.spin_nelec[0]
+            record['nelec_beta'] = cycle_data.spin_nelec[1]
+            record['magnetization'] = cycle_data.magnetization
+        return record
+
     def _append_scan_output(
             self, csv_path, h5_path, columns, record, cycle_data):
         index = record['index']
@@ -960,7 +1065,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
             data = {
                 'mo_coeff': [cp.asnumpy(x.dot(c)) for x, c in zip(
                     self.x_ao2orth, cycle_data.coeff)],
-                'mo_occ': [cp.asnumpy(2.*x) for x in cycle_data.occ],
+                'mo_occ': [cp.asnumpy(self.occ_scale*x)
+                           for x in cycle_data.occ],
                 'mo_energy': [cp.asnumpy(x) for x in cycle_data.eig],
             }
             for name, values in data.items():
@@ -1018,6 +1124,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             'cycles': np.int64,
             'fock_evaluations': np.int64,
         }
+        self._add_spin_columns(columns)
         csv_path, h5_path = self._initialize_scan_output(
             output_prefix, columns)
 
@@ -1052,6 +1159,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
                 'cycles': self.cycles-cycle_start,
                 'fock_evaluations': self.nfev-nfev_start,
             }
+            self._add_spin_record(record, cycle_data)
             records.append(record)
             self._append_scan_output(
                 csv_path, h5_path, columns, record, cycle_data)
@@ -1246,13 +1354,18 @@ class GrandCanonicalKRKS(lib.StreamObject):
         return nelec, seeds
 
     def _density_from_nelec_scan_h5(self, filename, index):
+        '''AO density of an N-scan point in the layout of the scan's solver:
+        (nkpts,nao,nao) for a KRKS scan, (2,nkpts,nao,nao) for a KUKS scan.
+        _initial_dm converts it to this solver's spin treatment.'''
         with h5py.File(filename, 'r') as h5f:
             point = h5f['points'][str(index)]
             coeff_group = point['mo_coeff']
             occ_group = point['mo_occ']
             coeff_keys = sorted(coeff_group, key=int)
             occ_keys = sorted(occ_group, key=int)
-            expected = [str(k) for k in range(self.nkpts)]
+            # Files written before KUKS support carry no nspin attribute.
+            nspin = int(h5f.attrs.get('nspin', 1))
+            expected = [str(k) for k in range(nspin*self.nkpts)]
             if coeff_keys != expected or occ_keys != expected:
                 raise ValueError(
                     'N-scan orbital k-points do not match the solver')
@@ -1265,7 +1378,10 @@ class GrandCanonicalKRKS(lib.StreamObject):
                     raise ValueError('invalid N-scan orbital dimensions')
                 value = (coeff*occ[None, :]).dot(coeff.conj().T)
                 dm.append(0.5*(value+value.conj().T))
-        return cp.stack(dm)
+        dm = cp.stack(dm)
+        if nspin == 2:
+            dm = dm.reshape((2, self.nkpts) + dm.shape[1:])
+        return dm
 
     def _nelec_scan_restarts(self, filename):
         records = [dict(record) for record in
@@ -1346,6 +1462,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
             'refinements': np.int64,
             'fock_evaluations': np.int64,
         }
+        self._add_spin_columns(columns)
         csv_path, h5_path = self._initialize_scan_output(
             output_prefix, columns)
         records = []
@@ -1382,6 +1499,7 @@ class GrandCanonicalKRKS(lib.StreamObject):
                 'refinements': self.refinements-refinement_start,
                 'fock_evaluations': self.nfev-nfev_start,
             }
+            self._add_spin_record(record, cycle_data)
             records.append(record)
             self._append_scan_output(
                 csv_path, h5_path, columns, record, cycle_data)
@@ -1402,13 +1520,25 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self._finalize(last_cycle_data, last_converged)
         return records
 
+    def _stack_spin(self, blocks):
+        '''Per-k stacks (or lists, for ragged k-points) of each spin, stacked
+        once more over spin for KUKS.'''
+        per_spin = [_stack_or_list(blocks[sl]) for sl in self._spin_slices()]
+        if self.nspin == 1:
+            return per_spin[0]
+        if (all(isinstance(x, cp.ndarray) for x in per_spin) and
+                per_spin[0].shape == per_spin[1].shape):
+            return cp.stack(per_spin)
+        return per_spin
+
     def _finalize(self, cycle_data, converged):
         mo_coeff = [x.dot(c) for x, c in zip(self.x_ao2orth, cycle_data.coeff)]
         mo_energy = [e for e in cycle_data.eig]
-        mo_occ = [2.*x for x in cycle_data.occ]
-        self.mo_coeff = _stack_or_list(mo_coeff)
-        self.mo_energy = _stack_or_list(mo_energy)
-        self.mo_occ = _stack_or_list(mo_occ)
+        mo_occ = [self.occ_scale*x for x in cycle_data.occ]
+        self.mo_coeff = self._stack_spin(mo_coeff)
+        self.mo_energy = self._stack_spin(mo_energy)
+        self.mo_occ = self._stack_spin(mo_occ)
+        self.magnetization = cycle_data.magnetization
         self.converged = bool(converged)
         self.e_tot = cycle_data.e_tot
         self.free_energy = cycle_data.free_energy
@@ -1433,6 +1563,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
             'outer_cycles': self.outer_cycles,
             'refinements': self.refinements,
         }
+        if self.nspin == 2:
+            self.scf_summary['magnetization'] = self.magnetization
 
         self.mf.converged = self.converged
         self.mf.mo_coeff = self.mo_coeff
@@ -1444,6 +1576,8 @@ class GrandCanonicalKRKS(lib.StreamObject):
         self.mf.electron_number_gc = self.electron_number
         self.mf.mu_gc = self.mu
         self.mf.sigma_gc = self.sigma
+        if self.nspin == 2:
+            self.mf.magnetization_gc = self.magnetization
         if not hasattr(self.mf, 'scf_summary') or self.mf.scf_summary is None:
             self.mf.scf_summary = {}
         self.mf.scf_summary.update(self.scf_summary)
@@ -1480,3 +1614,132 @@ class GrandCanonicalKRKS(lib.StreamObject):
         return self._finalize(cycle_data, converged)
 
     scf = kernel
+
+
+class GrandCanonicalKRKS(_GrandCanonicalKSBase):
+    '''Finite-temperature KRKS at fixed chemical potential or electron count.
+
+    Args:
+        mf : KRKS
+            A configured GPU4PySCF periodic restricted Kohn-Sham object.
+        mu : float or None
+            Chemical potential in Hartree.  Required unless ``nelec`` is set.
+        sigma : float
+            Fermi smearing width in Hartree.
+        nelec : float or None
+            Electron count for a canonical calculation.
+    '''
+
+    nspin = 1
+    _mf_type = 'KRKS'
+
+    def _initial_dm(self, dm0=None):
+        '''Initial density; a spin-resolved (2,nkpts,nao,nao) density, e.g.
+        from a KUKS scan, is summed over spin.'''
+        if dm0 is None:
+            dm0 = self.mf.get_init_guess(self.cell, key=self.mf.init_guess)
+        if not isinstance(dm0, (list, tuple)):
+            dm0 = cp.asarray(dm0)
+            if dm0.ndim == 4:
+                if dm0.shape[0] != 2:
+                    raise ValueError('initial density has an invalid shape')
+                dm0 = dm0[0] + dm0[1]
+        return dm0
+
+
+class GrandCanonicalKUKS(_GrandCanonicalKSBase):
+    '''Finite-temperature KUKS at fixed chemical potential or electron count.
+
+    Both spin channels share one chemical potential: at fixed mu, and at fixed
+    total ``nelec``, the magnetization N_alpha - N_beta is variational.
+
+    Args:
+        mf : KUKS
+            A configured GPU4PySCF periodic unrestricted Kohn-Sham object.
+        mu : float or None
+            Chemical potential in Hartree.  Required unless ``nelec`` is set.
+        sigma : float
+            Fermi smearing width in Hartree.
+        nelec : float or None
+            Total electron count for a canonical calculation.
+
+    Attributes:
+        init_magnetization : float or None
+            If set, the initial guess from ``mf.get_init_guess`` and any
+            spin-summed (nkpts,nao,nao) initial density (``dm0`` or a KRKS
+            N-scan seed) are rescaled to this N_alpha - N_beta per cell.  A
+            spin-symmetric start stays spin-symmetric, so set this (or pass a
+            spin-polarized ``dm0``) to look for magnetic solutions.
+            Spin-resolved ``dm0`` and KUKS N-scan seeds are used unchanged.
+    '''
+
+    nspin = 2
+    _mf_type = 'KUKS'
+    init_magnetization = getattr(
+        __config__, 'pbc_dft_grand_canonical_init_magnetization', None)
+
+    _keys = {'init_magnetization'}
+
+    def dump_flags(self, verbose=None):
+        super().dump_flags(verbose)
+        if self.init_magnetization is not None:
+            logger.info(self, 'initial magnetization = %.12g',
+                        self.init_magnetization)
+        return self
+
+    def _initial_dm(self, dm0=None):
+        from_guess = dm0 is None
+        if from_guess:
+            key = self.mf.init_guess
+            if isinstance(key, str) and key.lower()[:3] == 'chk':
+                # KUHF.get_init_guess rescales each spin density to mf.nelec
+                # (from cell.spin) when it is off by more than 0.01 e/cell,
+                # which would erase the excess charge and the magnetization
+                # stored in the chkfile.  KUHF.init_guess_by_chkfile defaults
+                # to project=True, which renormalizes every MO and turns the
+                # zero columns padding dropped AOs (see _chk_envs) into NaN;
+                # project=None projects only if the basis set changed.
+                try:
+                    dm0 = self.mf.init_guess_by_chkfile(project=None)
+                except (OSError, KeyError):
+                    logger.warn(self, 'Fail in reading %s. Use MINAO initial '
+                                'guess', self.mf.chkfile)
+                    dm0 = self.mf.get_init_guess(self.cell, key='minao')
+            else:
+                dm0 = self.mf.get_init_guess(self.cell, key=key)
+        if isinstance(dm0, (list, tuple)) and len(dm0) == 2:
+            dm = cp.stack([cp.asarray(dm0[0]), cp.asarray(dm0[1])])
+        else:
+            dm = cp.asarray(dm0)
+        spin_summed = dm.ndim == 3
+        if spin_summed:
+            dm = cp.stack([.5*dm, .5*dm])
+        elif dm.ndim != 4 or dm.shape[0] != 2:
+            raise ValueError('initial density must have shape (nkpts,nao,nao) '
+                             'or (2,nkpts,nao,nao)')
+        if self.init_magnetization is not None and (from_guess or spin_summed):
+            dm = self._magnetize(dm, self.init_magnetization)
+        return dm
+
+    def _magnetize(self, dm, magnetization):
+        '''Rescale the spin densities of dm to N_alpha - N_beta =
+        magnetization, keeping the total density.'''
+        magnetization = _as_float(magnetization, 'init_magnetization')
+        total = dm[0] + dm[1]
+        nelec = self.weight * sum(_as_float(
+            cp.einsum('ij,ji->', d, s), 'initial electron number')
+            for d, s in zip(total, self.s_ao))
+        if not abs(magnetization) < nelec:
+            raise ValueError('|init_magnetization| must be smaller than the '
+                             'initial electron number %g' % nelec)
+        logger.info(self, 'Initial guess magnetization set to %.12g',
+                    magnetization)
+        return cp.stack([total * (.5 + .5*magnetization/nelec),
+                         total * (.5 - .5*magnetization/nelec)])
+
+
+def GrandCanonicalKS(mf, *args, **kwargs):
+    '''GrandCanonicalKRKS or GrandCanonicalKUKS, whichever matches mf.'''
+    if hasattr(mf, 'istype') and mf.istype('KUKS'):
+        return GrandCanonicalKUKS(mf, *args, **kwargs)
+    return GrandCanonicalKRKS(mf, *args, **kwargs)

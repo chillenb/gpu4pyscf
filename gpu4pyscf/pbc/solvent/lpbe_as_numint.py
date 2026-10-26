@@ -805,6 +805,30 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
 
 
 
+def _lpbe_coulomb_in_place(ni, rhoG, Gv_bases, log):
+    '''Hartree energy and potential of the total electron density rhoG plus
+    the LPBE solvation correction.  rhoG is overwritten by the potential on
+    the G mesh, which is returned together with the energy.'''
+    mesh = ni.mesh
+    vol = ni.cell.vol
+    lpbe_res = lpbe_inner(
+        ni, rhoG.reshape(-1), Gv_bases,
+        options=ni.options, pot_guess=ni.pot_guess)
+
+    ecoul, coulomb_on_g_mesh = _get_coulomb_in_place(rhoG, Gv_bases)
+    ecoul = (.5 / vol) * float(ecoul.get())
+    log.debug('Multigrid Coulomb energy %s', ecoul)
+
+    ni.pot_guess = lpbe_res['pot_guess']
+    vcorr_g = lpbe_res['vcorr_g']
+    Ecorr = float(cp.real(
+        lpbe_res['E_coul_corr'] + lpbe_res['Ecav']).get())
+
+    ecoul += Ecorr
+    coulomb_on_g_mesh += vcorr_g.reshape(*mesh)
+    return ecoul, coulomb_on_g_mesh
+
+
 def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
            kpts=None, kpts_band=None, with_j=True, verbose=None):
     '''Compute the XC energy and RKS XC matrix at sampled k-points.
@@ -882,21 +906,7 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
 
 
 
-    lpbe_res = lpbe_inner(
-        ni, rhoG.reshape(-1), Gv_bases,
-        options=ni.options, pot_guess=ni.pot_guess)
-
-    ecoul, coulomb_on_g_mesh = _get_coulomb_in_place(rhoG, Gv_bases)
-    ecoul = (.5 / vol) * float(ecoul.get())
-    log.debug('Multigrid Coulomb energy %s', ecoul)
-
-    ni.pot_guess = lpbe_res['pot_guess']
-    vcorr_g = lpbe_res['vcorr_g']
-    Ecorr = float(cp.real(
-        lpbe_res['E_coul_corr'] + lpbe_res['Ecav']).get())
-
-    ecoul += Ecorr
-    coulomb_on_g_mesh += vcorr_g.reshape(*mesh)
+    ecoul, coulomb_on_g_mesh = _lpbe_coulomb_in_place(ni, rhoG, Gv_bases, log)
 
     xc_for_fock *= weight
     # Now xc_for_fock represents xc on G space
@@ -916,6 +926,125 @@ def nr_rks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
         ni.mesh = mesh
         veff = _eval_xc_mat(ni, xc_for_fock)
         veff = _inverse_wannier_transform_fock(ni, veff, kpts_band)
+
+    veff = _format_jks(veff, dm_kpts, kpts_band, kpts)
+    veff = tag_array(veff, ecoul=ecoul, exc=xc_energy_sum)
+    t0 = log.timer_debug1("xc matrix", *t0)
+
+    RangePop()
+
+    return n_electrons, xc_energy_sum, veff
+
+
+def nr_uks_lpbe(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
+           kpts=None, kpts_band=None, with_j=True, verbose=None):
+    '''Compute the XC energy and UKS XC matrix at sampled k-points, with the
+    Hartree and LPBE solvation potentials of the total density added to both
+    spin channels.  multigrid version of function pbc.dft.numint.nr_uks.
+
+    Args:
+        dm_kpts : (2, nkpts, nao, nao) ndarray
+            Alpha and beta density matrices at each k-point.
+        kpts : (nkpts, 3) ndarray
+
+    Kwargs:
+        kpts_band : ``(3,)`` ndarray or ``(*,3)`` ndarray
+            A list of arbitrary "band" k-points at which to evalute the matrix.
+        with_j : bool
+            Must be True: the solvation model is part of the electrostatics.
+
+    Returns:
+        nelec : (2,) ndarray, electron numbers of each spin channel
+        exc : XC energy
+        veff : (2, nkpts, nao, nao) ndarray
+    '''
+    RangePush("nr_uks_lpbe")
+    log = logger.new_logger(cell, verbose)
+    t0 = log.init_timer()
+
+    xctype = ni._xc_type(xc_code)
+    nvar = _xc_var_length(xctype)
+
+    if not with_j:
+        raise ValueError("Why are you calling this function if you don't want electrostatics?")
+
+    dm_sc = _wannier_transform_dm(ni, dm_kpts, kpts, hermi, xctype)
+    assert len(dm_sc) == 2
+
+    cell = ni.cell
+    mesh = ni.mesh
+    ngrids = np.prod(mesh)
+    vol = cell.vol
+    weight = vol / ngrids
+    Gv_bases = _get_Gv_bases(mesh, cell.reciprocal_vectors())
+
+    rhoG , tauG  = _eval_density(ni, dm_sc[0], with_tau=xctype=='MGGA')
+    rhoGb, tauGb = _eval_density(ni, dm_sc[1], with_tau=xctype=='MGGA')
+    n_electrons = np.array([float(rhoG[0,0,0].real.get()),
+                            float(rhoGb[0,0,0].real.get())])
+
+    # dm_sc is represented in primitive bases (by sorted_cell). Its size can be
+    # much larger than the input dm_kpts. Release its memory if remaining memory
+    # is insufficient.
+    if (2*nvar+4)*ngrids*8 > get_avail_mem():
+        dm_sc = [None, None]
+
+    density = cp.empty((2, nvar, ngrids))
+    _density_to_real_space(rhoG , tauG , Gv_bases, xctype, out=density[0])
+    _density_to_real_space(rhoGb, tauGb, Gv_bases, xctype, out=density[1])
+    rhoG += rhoGb # rhoG now stores the spin-free density
+    tauG = tauGb = None
+    # *(1./weight) because rhoR is scaled by weight in _eval_density. If
+    # computing rhoR with IFFT, the weight factor is not needed.
+    density *= 1./weight
+
+    rho_sf = ndarray(ngrids, dtype=np.float64, buffer=rhoGb)
+    rho_sf[:] = density[0,0].real
+    rho_sf[:] += density[1,0].real
+    t0 = log.timer_debug1("density", *t0)
+
+    # eval_xc_eff supports float64 only
+    xc_for_energy, xc_for_fock = ni.eval_xc_eff(
+        xc_code, density, deriv=1, xctype=xctype, spin=1, inplace=True)[:2]
+
+    xc_for_fock = xc_for_fock.reshape(2, nvar, *mesh)
+
+    xc_energy_sum = float(vec_dot(rho_sf, xc_for_energy).get()) * weight
+    xc_for_energy = density = rho_sf = None
+    log.debug("Multigrid exc %s  nelec %s", xc_energy_sum, n_electrons)
+    t0 = log.timer_debug1("eval_xc_eff", *t0)
+
+    # The solvent responds to the total density only, so both spin channels
+    # receive the same electrostatic potential.
+    ecoul, coulomb_a = _lpbe_coulomb_in_place(ni, rhoG, Gv_bases, log)
+    coulomb_b = rhoGb.reshape(*mesh)
+    coulomb_b[:] = coulomb_a
+    rhoG = rhoGb = None
+
+    xc_for_fock *= weight
+    vxc_a = _vxc_to_reciprocal_space(xc_for_fock[0], coulomb_a, Gv_bases)
+    vxc_b = _vxc_to_reciprocal_space(xc_for_fock[1], coulomb_b, Gv_bases)
+    xc_for_fock = coulomb_a = coulomb_b = None
+
+    if kpts_band is None:
+        # dm_sc and the output have the same shape. Reuse its memory.
+        veff_a = _eval_xc_mat(ni, vxc_a, out=dm_sc[0])
+        veff_b = _eval_xc_mat(ni, vxc_b, out=dm_sc[1])
+        veff = cp.stack([
+            _inverse_wannier_transform_fock(ni, veff_a, kpts),
+            _inverse_wannier_transform_fock(ni, veff_b, kpts)])
+    else:
+        kpts_band = kpts_band.reshape(-1, 3)
+        kmesh = k2gamma.kpts_to_kmesh(cell, kpts_band)
+        ni = ni.copy().reset().build(kmesh=kmesh, xctype=xctype)
+        # ni.build may alter the mesh. vxc was created with mesh different to
+        # this new mesh.
+        ni.mesh = mesh
+        veff_a = _eval_xc_mat(ni, vxc_a)
+        veff_b = _eval_xc_mat(ni, vxc_b)
+        veff = cp.stack([
+            _inverse_wannier_transform_fock(ni, veff_a, kpts_band),
+            _inverse_wannier_transform_fock(ni, veff_b, kpts_band)])
 
     veff = _format_jks(veff, dm_kpts, kpts_band, kpts)
     veff = tag_array(veff, ecoul=ecoul, exc=xc_energy_sum)
@@ -951,9 +1080,10 @@ class LPBEMultiGridNumInt(MultiGridNumInt):
         super().build(*args, **kwargs)
         self.vpplocG = multigrid_v1.eval_vpplocG(self.cell, self.mesh)
         self.pseudocore_densityG = pseudocore_density(self.cell, self.mesh)
+        return self
 
     nr_rks = nr_rks_lpbe
-    nr_uks = NotImplemented
+    nr_uks = nr_uks_lpbe
 
 
 def multigrid_lpbe(mf, mesh=None, **kwargs):

@@ -71,8 +71,13 @@ def fermi_divided_difference(gamma, rho, rtol=FERMI_DIVDIFF_RTOL):
     return cp.minimum(0.0, divided).real
 
 
-def omega_gradient_wrt_h(h, f, beta, mu, diag_term_multiplier=1.0):
-    """Return the real and imaginary gradients of the grand potential."""
+def omega_gradient_wrt_h(h, f, beta, mu, diag_term_multiplier=1.0,
+                         occ_scale=2.0):
+    """Return the real and imaginary gradients of the grand potential.
+
+    occ_scale is the occupation of a filled orbital: 2 for one block of a
+    restricted calculation, 1 for one spin block of an unrestricted one.
+    """
     h = 0.5 * (h + h.conj().T)
     gamma_matrix = beta * (
         h - mu * cp.eye(h.shape[0], dtype=h.dtype))
@@ -87,7 +92,7 @@ def omega_gradient_wrt_h(h, f, beta, mu, diag_term_multiplier=1.0):
         response_tilde = response_tilde + cp.diag(
             (diag_term_multiplier - 1.0) * diagonal)
 
-    gradient = 2.0 * beta * u @ response_tilde @ u.conj().T
+    gradient = occ_scale * beta * u @ response_tilde @ u.conj().T
     gradient = 0.5 * (gradient + gradient.conj().T)
     return gradient.real, gradient.imag
 
@@ -112,7 +117,8 @@ def objective_gradient(self, state, fixed_n):
     gradient = [
         grad_re + 1j * grad_im
         for grad_re, grad_im in (
-            omega_gradient_wrt_h(h, f, self.beta, state.mu)
+            omega_gradient_wrt_h(h, f, self.beta, state.mu,
+                                 occ_scale=self.occ_scale)
             for h, f in zip(state.h, state.fock)
         )
     ]
@@ -653,9 +659,9 @@ def fixed_mu_diis_inner(self, dm0=None, h=None, dump_chk=True):
         logger.info(
             self,
             'Fixed-mu DIIS cycle %d: grand potential = %f, residual = %e, '
-            'nelec = %f',
+            'nelec = %f%s',
             diis_cycle, state.grand_potential, state.residual_rms,
-            state.nelec)
+            state.nelec, self._spin_info(state))
 
         if dump_chk and self.chkfile:
             self.dump_chk(self._chk_envs(state))
