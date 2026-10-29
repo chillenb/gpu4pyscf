@@ -448,6 +448,7 @@ class _GrandCanonicalKSBase(lib.StreamObject):
             raise ValueError('kpts must have shape (nkpts,3)')
         self.nkpts = len(self.kpts)
         self.weight = 1. / self.nkpts
+        self._kinv = self._inversion_partners()
         if self.nspin not in (1, 2):
             raise TypeError('nspin must be 1 or 2')
         self.occ_scale = 2. / self.nspin
@@ -576,6 +577,36 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         '''Initial AO density in the mf layout.'''
         raise NotImplementedError
 
+    def _inversion_partners(self, tol=1e-6):
+        '''Index of -k in self.kpts for every k, or None if the k-point set is not
+        closed under inversion.'''
+        scaled = self.cell.get_scaled_kpts(self.kpts)
+        diff = scaled[:, None, :] + scaled[None, :, :]
+        match = np.all(abs(diff - np.rint(diff)) < tol, axis=2)
+        if not np.all(match.sum(axis=1) == 1):
+            logger.info(self, 'k-points not closed under inversion; '
+                        'D(-k) = D(k)* is not enforced')
+            return None
+        return match.argmax(axis=1)
+
+    def _time_reversal(self, blocks):
+        '''Enforce D(-k) = D(k)* in each spin block. A real-AO Hamiltonian has
+        H(-k) = H(k)*, so the exact density does too, but rounding in an ill-conditioned
+        basis (and far-from-converged steps) breaks it; the multigrid transform of D(k)
+        to the supercell then finds a large imaginary part.'''
+        if self._kinv is None:
+            return blocks
+        out = []
+        worst = 0.
+        for sl in self._spin_slices():
+            spin = blocks[sl]
+            for d, j in zip(spin, self._kinv):
+                partner = spin[j].conj()
+                worst = max(worst, cp.max(cp.abs(d - partner)).item())
+                out.append(0.5 * (d + partner))
+        logger.debug(self, 'max |D(k) - D(-k)*| = %.3g', worst)
+        return out
+
     def _spin_info(self, cycle_data):
         '''Suffix for log lines: the magnetization in KUKS, nothing in KRKS.'''
         if self.nspin == 1:
@@ -624,8 +655,8 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         return [hcore + v for hcore, v in zip(self.hcore_ao, veff_blocks)]
 
     def _initial_h(self, dm0=None):
-        dm_blocks = self._hermi(self._blocks(
-            self._initial_dm(dm0), 'initial density'))
+        dm_blocks = self._time_reversal(self._hermi(self._blocks(
+            self._initial_dm(dm0), 'initial density')))
         dm = self._from_blocks(dm_blocks)
         nelec = self.weight * sum(_as_float(
             cp.einsum('ij,ji->', d, s), 'initial electron number')
@@ -685,7 +716,8 @@ class _GrandCanonicalKSBase(lib.StreamObject):
             p.append(density)
             entropy_sum += float(_fermi_entropy(q))
         p = self._hermi(p)
-        dm_blocks = self._hermi([dm[k] for k in range(self.nblocks)])
+        dm_blocks = self._time_reversal(
+            self._hermi([dm[k] for k in range(self.nblocks)]))
         dm = self._from_blocks(dm_blocks)
 
         spin_nelec = tuple(
