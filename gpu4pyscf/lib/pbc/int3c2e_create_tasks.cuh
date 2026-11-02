@@ -29,8 +29,7 @@
 #define WARP_SIZE       32
 #endif
 #define WARPS           8
-#define LMAX            4
-#define LMAX1           (LMAX+1)
+#include "pbc_lmax.cuh"
 #define MAX_IMGS_PER_TASK  31
 #define POOL_SIZE       16384
 

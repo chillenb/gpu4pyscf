@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include "pbc/pbc_lmax.cuh"
 #include "constant_objects.cuh"
 #include "gvhf-rys/vhf.cuh"
 #include "cartesian.cuh"
@@ -263,7 +264,7 @@ void eval_mgga_mat_kernel_v2(double *out, double *vrho_weights, double *vtau_wei
 
 extern "C" {
 #define eval_mgga_mat_kernel_v2_case(li, lj, slice_i, slice_j) \
-    case (li * LMAX1 + lj): \
+    case (li * PBC_LMAX1 + lj): \
         eval_mgga_mat_kernel_v2<li,lj,slice_i,slice_j><<<npairs, threads, 0, stream>>>(\
             out, vxc, tau, *envs, bas_ij_idx, grid_frac_ranges, \
             da_squared, db_squared, dc_squared, mesh_a, mesh_b, mesh_c, npairs, \
@@ -282,7 +283,7 @@ int evaluate_mgga_mat_v2(double *out, double *vxc, double *tau, PBCIntEnvVars *e
     double db_squared = distance_squared(dxyz_dabc[3], dxyz_dabc[4], dxyz_dabc[5]);
     double dc_squared = distance_squared(dxyz_dabc[6], dxyz_dabc[7], dxyz_dabc[8]);
     dim3 threads(16, 16);
-    switch (li * LMAX1 + lj) {
+    switch (li * PBC_LMAX1 + lj) {
         eval_mgga_mat_kernel_v2_case(0,0, 1, 1);
         eval_mgga_mat_kernel_v2_case(1,0, 3, 1);
         eval_mgga_mat_kernel_v2_case(1,1, 3, 3);
@@ -298,6 +299,15 @@ int evaluate_mgga_mat_v2(double *out, double *vxc, double *tau, PBCIntEnvVars *e
         eval_mgga_mat_kernel_v2_case(4,2,15, 3);
         eval_mgga_mat_kernel_v2_case(4,3, 8, 5);
         eval_mgga_mat_kernel_v2_case(4,4,15, 3);
+        eval_mgga_mat_kernel_v2_case(5,0,21, 1);
+        eval_mgga_mat_kernel_v2_case(5,1, 7, 3);
+        eval_mgga_mat_kernel_v2_case(5,2, 7, 3);
+        eval_mgga_mat_kernel_v2_case(5,3, 7, 5);
+        eval_mgga_mat_kernel_v2_case(5,4, 7, 3);
+        eval_mgga_mat_kernel_v2_case(5,5, 7, 3);
+        default:
+            fprintf(stderr, "eval_mgga_mat_kernel_v2: angular momentum (%d,%d) not supported\n", li, lj);
+            return 1;
     }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
