@@ -61,7 +61,11 @@ from gpu4pyscf.pbc.dft import multigrid as multigrid_v1
 
 libmgrid = load_library('libmgrid_v3')
 NBAS_MAX = 16777216
-LMAX = 4
+# Must match PBC_LMAX in lib/pbc/pbc_lmax.cuh
+LMAX = 5
+# The aft_eval_* kernels size their static shared memory by LMAX of
+# gvhf-rys/vhf.cuh. Shell pairs with higher angular momentum use the FFT path.
+AFT_LMAX = 4
 
 _kernel_registery = {}
 
@@ -2079,7 +2083,20 @@ class MultiGridNumInt(multigrid_v1.MultiGridNumIntBase):
         init_ke = mesh_to_ke(a, [8]*3).max()
         log.debug1('initial ke_cutoff = %g', init_ke)
 
+        # Shell pairs that the AFT kernels cannot handle
+        high_l_pairs = None
         if self.enable_aft and is_orth_lattice and nimgs > 20:
+            ang = cp.asarray(bvkcell._bas[:,ANG_OF])
+            ish, jsh = divmod(bas_ij_idx, NBAS_MAX)
+            high_l = (ang[ish] > AFT_LMAX) | (ang[jsh] > AFT_LMAX)
+            if high_l.any():
+                high_l_pairs = bas_ij_idx[high_l]
+                bas_ij_idx = bas_ij_idx[~high_l]
+                log.debug1('%d shell pairs with l > %d are excluded from AFT',
+                           len(high_l_pairs), AFT_LMAX)
+
+        if (self.enable_aft and is_orth_lattice and nimgs > 20 and
+            len(bas_ij_idx) > 0):
             # Estimate Ecut for AFT integrals. These can be potentially handled by
             # aft_eval_* functions.
             # Use ke_cutoff to limit the highest Ecut. This ensures to handle
@@ -2105,6 +2122,12 @@ class MultiGridNumInt(multigrid_v1.MultiGridNumIntBase):
                     bas_ij_idx = None
 
             init_ke = aft_final_ke * 1.5
+
+        if high_l_pairs is not None:
+            if bas_ij_idx is None:
+                bas_ij_idx = high_l_pairs
+            else:
+                bas_ij_idx = cp.concatenate([bas_ij_idx, high_l_pairs])
 
         if bas_ij_idx is not None and len(bas_ij_idx) > 0:
             # bas_ij_idx are the effective paris between cell0 and bvkcell.

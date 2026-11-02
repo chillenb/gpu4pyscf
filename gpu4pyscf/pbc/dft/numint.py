@@ -42,7 +42,8 @@ __all__ = ['NumInt', 'KNumInt']
 
 MIN_BLK_SIZE = getattr(__config__, 'min_grid_blksize', 4096)
 ALIGNED = getattr(__config__, 'grid_aligned', 16*16)
-LMAX = 4
+# Must match PBC_LMAX in lib/pbc/pbc_lmax.cuh
+LMAX = 5
 
 def eval_ao(cell, coords, kpt=np.zeros(3), deriv=0, relativity=0, shls_slice=None,
             non0tab=None, cutoff=None, out=None, verbose=None, opt=None):

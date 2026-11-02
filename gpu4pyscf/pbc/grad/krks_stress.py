@@ -48,6 +48,7 @@ import ctypes
 import numpy as np
 import cupy as cp
 from pyscf import lib
+from pyscf.gto.mole import ANG_OF
 from pyscf.pbc.lib.kpts_helper import is_zero
 from gpu4pyscf.pbc.tools import pbc as pbctools
 from gpu4pyscf.pbc.dft.gen_grid import UniformGrids
@@ -287,6 +288,10 @@ def _eval_ao_strain_derivatives(cell, coords, kpts=None, deriv=0, out=None,
             AO values at each k-point
     '''
     assert deriv <= 2
+    if cell._bas[:,ANG_OF].max() > 4:
+        # The strain tensor kernels in lib/pbc/nr_eval_gto.cu are only
+        # implemented up to g functions
+        raise NotImplementedError('AO strain derivatives for l > 4')
     if opt is None:
         opt = _GTOvalOpt(cell, kpts, deriv=deriv)
     else:

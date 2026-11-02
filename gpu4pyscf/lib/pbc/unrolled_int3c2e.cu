@@ -607,19 +607,23 @@ int int3c2e_unrolled(double *out, double omega, PBCIntEnvVars& envs, uint32_t *i
                      int ao_pair_offset, int aux_offset, int nauxbas, int naux, int to_sph,
                      int thread_id, int worker_id, double *shared_memory)
 {
-    int kij_type = lk*25 + li*5 + lj;
+    // Only a few low angular momentum triplets are unrolled. The encoding
+    // must be unique for any li, lj, lk (all < 8).
+#define UNROLLED_KIJ(i, j, k) (((k) * 8 + (i)) * 8 + (j))
+    int kij_type = UNROLLED_KIJ(li, lj, lk);
     switch (kij_type) {
-    case 0: // li=0 lj=0 lk=0
+    case UNROLLED_KIJ(0, 0, 0):
         LAUNCH_KERNEL(int3c2e_000); break;
-    case 5: // li=1 lj=0 lk=0
+    case UNROLLED_KIJ(1, 0, 0):
         LAUNCH_KERNEL(int3c2e_100); break;
-    case 6: // li=1 lj=1 lk=0
+    case UNROLLED_KIJ(1, 1, 0):
         LAUNCH_KERNEL(int3c2e_110); break;
-    case 25: // li=0 lj=0 lk=1
+    case UNROLLED_KIJ(0, 0, 1):
         LAUNCH_KERNEL(int3c2e_001); break;
-    case 30: // li=1 lj=0 lk=1
+    case UNROLLED_KIJ(1, 0, 1):
         LAUNCH_KERNEL(int3c2e_101); break;
     default: return 0;
     }
+#undef UNROLLED_KIJ
     return 1;
 }

@@ -22,8 +22,91 @@
 #include <cuda_runtime.h>
 #include "gvhf-rys/vhf.cuh"
 
-#define LMAX 4
+#include "pbc_lmax.cuh"
 #define THREADS 256
+
+// Cartesian GTO values ce*x^lx*y^ly*z^lz in lexical order, for shells without
+// the hand-written cases below
+template <int ANG> __device__ __forceinline__
+void _cart_gto_deriv0(double gto[], double ce, double rx, double ry, double rz)
+{
+    double gx[ANG+1];
+    double gy[ANG+1];
+    double gz[ANG+1];
+    gx[0] = ce;
+    gy[0] = 1.;
+    gz[0] = 1.;
+#pragma unroll
+    for (int i = 0; i < ANG; ++i) {
+        gx[i+1] = gx[i] * rx;
+        gy[i+1] = gy[i] * ry;
+        gz[i+1] = gz[i] * rz;
+    }
+#pragma unroll
+    for (int i = 0, lx = ANG; lx >= 0; lx--){
+#pragma unroll
+        for (int ly = ANG - lx; ly >= 0; ly--, i++){
+            gto[i] += gx[lx] * gy[ly] * gz[ANG-lx-ly];
+        }
+    }
+}
+
+// Cartesian GTO values and first derivatives in lexical order, where
+// ce = sum_p c_p exp(-a_p r^2) and ce_2a = sum_p -2 a_p c_p exp(-a_p r^2)
+template <int ANG> __device__ __forceinline__
+void _cart_gto_deriv1(double gto[], double gtox[], double gtoy[], double gtoz[],
+                      double ce, double ce_2a, double rx, double ry, double rz)
+{
+    double gx[ANG+2];
+    double gy[ANG+2];
+    double gz[ANG+2];
+    gx[0] = 1.;
+    gy[0] = 1.;
+    gz[0] = 1.;
+#pragma unroll
+    for (int i = 0; i < ANG+1; ++i) {
+        gx[i+1] = gx[i] * rx;
+        gy[i+1] = gy[i] * ry;
+        gz[i+1] = gz[i] * rz;
+    }
+#pragma unroll
+    for (int i = 0, lx = ANG; lx >= 0; lx--){
+#pragma unroll
+        for (int ly = ANG - lx; ly >= 0; ly--, i++){
+            int lz = ANG - lx - ly;
+            double fx0 = gx[lx];
+            double fy0 = gy[ly];
+            double fz0 = gz[lz];
+            double fx1 = ce_2a * gx[lx+1];
+            double fy1 = ce_2a * gy[ly+1];
+            double fz1 = ce_2a * gz[lz+1];
+            if (lx > 0) fx1 += lx*ce*gx[lx-1];
+            if (ly > 0) fy1 += ly*ce*gy[ly-1];
+            if (lz > 0) fz1 += lz*ce*gz[lz-1];
+            gto [i] += ce * fx0 * fy0 * fz0;
+            gtox[i] += fx1 * fy0 * fz0;
+            gtoy[i] += fx0 * fy1 * fz0;
+            gtoz[i] += fx0 * fy0 * fz1;
+        }
+    }
+}
+
+// cart2sph transformation for l=5 (the convention of pyscf.gto.cart2sph)
+__device__ __forceinline__
+void _cart2sph_l5(double *sph, size_t sph_stride, const double *cart, int stride)
+{
+    sph[0*sph_stride] = 3.281910284200850736 * cart[1*stride] - 6.563820568401700584 * cart[6*stride] + 0.656382056840170147 * cart[15*stride];
+    sph[1*sph_stride] = 8.302649259524164549 * cart[4*stride] - 8.302649259524164549 * cart[11*stride];
+    sph[2*sph_stride] = -1.467714898305751081 * cart[1*stride] - 0.978476598870500758 * cart[6*stride] + 11.741719186446008649 * cart[8*stride] + 0.489238299435250379 * cart[15*stride] - 3.913906395482003031 * cart[17*stride];
+    sph[3*sph_stride] = -4.793536784973324139 * cart[4*stride] - 4.793536784973324139 * cart[11*stride] + 9.587073569946648277 * cart[13*stride];
+    sph[4*sph_stride] = 0.452946651195696937 * cart[1*stride] + 0.905893302391393873 * cart[6*stride] - 5.435359814348363017 * cart[8*stride] + 0.452946651195696937 * cart[15*stride] - 5.435359814348363017 * cart[17*stride] + 3.623573209565575493 * cart[19*stride];
+    sph[5*sph_stride] = 1.754254836801353967 * cart[2*stride] + 3.508509673602707934 * cart[7*stride] - 4.678012898136944209 * cart[9*stride] + 1.754254836801353967 * cart[16*stride] - 4.678012898136944209 * cart[18*stride] + 0.935602579627388797 * cart[20*stride];
+    sph[6*sph_stride] = 0.452946651195696937 * cart[0*stride] + 0.905893302391393873 * cart[3*stride] - 5.435359814348363017 * cart[5*stride] + 0.452946651195696937 * cart[10*stride] - 5.435359814348363017 * cart[12*stride] + 3.623573209565575493 * cart[14*stride];
+    sph[7*sph_stride] = -2.396768392486662069 * cart[2*stride] + 4.793536784973324139 * cart[9*stride] + 2.396768392486662069 * cart[16*stride] - 4.793536784973324139 * cart[18*stride];
+    sph[8*sph_stride] = -0.489238299435250379 * cart[0*stride] + 0.978476598870500758 * cart[3*stride] + 3.913906395482003031 * cart[5*stride] + 1.467714898305751081 * cart[10*stride] - 11.741719186446008649 * cart[12*stride];
+    sph[9*sph_stride] = 2.075662314881041137 * cart[2*stride] - 12.453973889286247712 * cart[7*stride] + 2.075662314881041137 * cart[16*stride];
+    sph[10*sph_stride] = 0.656382056840170147 * cart[0*stride] - 6.563820568401700584 * cart[3*stride] + 3.281910284200850736 * cart[10*stride];
+}
 
 template <int ANG> __device__ __forceinline__
 void _cart_gto_ip2(double gto[], double gx[], double gy[], double gz[],
@@ -165,9 +248,9 @@ void _eval_deriv1_strain_tensor(
     double cell0_Rx = ri[0];
     double cell0_Ry = ri[1];
     double cell0_Rz = ri[2];
-    double gx[LMAX+3];
-    double gy[LMAX+3];
-    double gz[LMAX+3];
+    double gx[PBC_LMAX+3];
+    double gy[PBC_LMAX+3];
+    double gz[PBC_LMAX+3];
     double ao[72];
     gy[0] = 1.;
     gz[0] = 1.;
@@ -422,7 +505,7 @@ static void _cart_deriv0_kernel(double *out, PBCIntEnvVars envs, double *grids,
     double xi = gridx[grid_id] - ri[0];
     double yi = gridy[grid_id] - ri[1];
     double zi = gridz[grid_id] - ri[2];
-    constexpr int n_cart_max = (LMAX+1)*(LMAX+2)/2;
+    constexpr int n_cart_max = (PBC_LMAX+1)*(PBC_LMAX+2)/2;
     double gto[n_cart_max];
     for (int n = 0; n < n_cart_max; ++n) {
         gto[n] = 0;
@@ -488,6 +571,9 @@ static void _cart_deriv0_kernel(double *out, PBCIntEnvVars envs, double *grids,
             gto[13] += ce * ry * rz * rz * rz;
             gto[14] += ce * rz * rz * rz * rz;
             break;
+        case 5:
+            _cart_gto_deriv0<5>(gto, ce, rx, ry, rz);
+            break;
         }
     }
     int *ao_loc = envs.ao_loc;
@@ -522,7 +608,7 @@ static void _cart_deriv1_kernel(double *out, PBCIntEnvVars envs, double *grids,
     double xi = gridx[grid_id] - ri[0];
     double yi = gridy[grid_id] - ri[1];
     double zi = gridz[grid_id] - ri[2];
-    constexpr int n_cart_max = (LMAX+1)*(LMAX+2)/2;
+    constexpr int n_cart_max = (PBC_LMAX+1)*(PBC_LMAX+2)/2;
     double gto [n_cart_max];
     double gtox[n_cart_max];
     double gtoy[n_cart_max];
@@ -705,7 +791,11 @@ static void _cart_deriv1_kernel(double *out, PBCIntEnvVars envs, double *grids,
             gtoz[12] += (az * rz + 2 * ce) * ry * ry * rz;
             gtoz[13] += (az * rz + 3 * ce) * ry * rz * rz;
             gtoz[14] += (az * rz + 4 * ce) * rz * rz * rz;
-        } }
+        } break;
+        case 5:
+            _cart_gto_deriv1<5>(gto, gtox, gtoy, gtoz, ce, ce_2a, rx, ry, rz);
+            break;
+        }
     }
     int *ao_loc = envs.ao_loc;
     int nf = (li + 1) * (li + 2) / 2;
@@ -745,10 +835,10 @@ static void _cart_ip2_kernel(double *out, PBCIntEnvVars envs, double *grids,
     double xi = gridx[grid_id] - ri[0];
     double yi = gridy[grid_id] - ri[1];
     double zi = gridz[grid_id] - ri[2];
-    double gx[LMAX+3];
-    double gy[LMAX+3];
-    double gz[LMAX+3];
-    constexpr int n_cart_max = (LMAX+1)*(LMAX+2)/2;
+    double gx[PBC_LMAX+3];
+    double gy[PBC_LMAX+3];
+    double gz[PBC_LMAX+3];
+    constexpr int n_cart_max = (PBC_LMAX+1)*(PBC_LMAX+2)/2;
     double gto[6*n_cart_max];
     for (int n = 0; n < 6*n_cart_max; ++n) {
         gto[n] = 0;
@@ -808,6 +898,9 @@ static void _cart_ip2_kernel(double *out, PBCIntEnvVars envs, double *grids,
             case 4:
                 _cart_gto_ip2<4>(gto, gx, gy, gz, a2, rx, ry, rz);
                 break;
+            case 5:
+                _cart_gto_ip2<5>(gto, gx, gy, gz, a2, rx, ry, rz);
+                break;
             }
         }
     }
@@ -846,7 +939,7 @@ static void _sph_deriv0_kernel(double *out, PBCIntEnvVars envs, double *grids,
     double xi = gridx[grid_id] - ri[0];
     double yi = gridy[grid_id] - ri[1];
     double zi = gridz[grid_id] - ri[2];
-    constexpr int n_cart_max = (LMAX+1)*(LMAX+2)/2;
+    constexpr int n_cart_max = (PBC_LMAX+1)*(PBC_LMAX+2)/2;
     double gto[n_cart_max];
     for (int n = 0; n < n_cart_max; ++n) {
         gto[n] = 0;
@@ -912,6 +1005,9 @@ static void _sph_deriv0_kernel(double *out, PBCIntEnvVars envs, double *grids,
             gto[13] += ce * ry * rz * rz * rz;
             gto[14] += ce * rz * rz * rz * rz;
             break;
+        case 5:
+            _cart_gto_deriv0<5>(gto, ce, rx, ry, rz);
+            break;
         }
     }
     int *ao_loc = envs.ao_loc;
@@ -952,6 +1048,9 @@ static void _sph_deriv0_kernel(double *out, PBCIntEnvVars envs, double *grids,
         out[7*ngrids+grid_id] += 1.770130769779930531 * gto[2] - 5.310392309339791590 * gto[7];
         out[8*ngrids+grid_id] += 0.625835735449176134 * (gto[0] + gto[10]) - 3.755014412695056800 * gto[3];
         break;
+    case 5:
+        _cart2sph_l5(out+grid_id, ngrids, gto, 1);
+        break;
     }
 }
 
@@ -978,7 +1077,7 @@ static void _sph_deriv1_kernel(double *out, PBCIntEnvVars envs, double *grids,
     double xi = gridx[grid_id] - ri[0];
     double yi = gridy[grid_id] - ri[1];
     double zi = gridz[grid_id] - ri[2];
-    constexpr int n_cart_max = (LMAX+1)*(LMAX+2)/2;
+    constexpr int n_cart_max = (PBC_LMAX+1)*(PBC_LMAX+2)/2;
     double gto [4*n_cart_max];
     for (int n = 0; n < 4*n_cart_max; ++n) {
         gto [n] = 0;
@@ -1155,7 +1254,11 @@ static void _sph_deriv1_kernel(double *out, PBCIntEnvVars envs, double *grids,
             gto[57] += (az * rz + 2 * ce) * ry * ry * rz;
             gto[58] += (az * rz + 3 * ce) * ry * rz * rz;
             gto[59] += (az * rz + 4 * ce) * rz * rz * rz;
-        } }
+        } break;
+        case 5:
+            _cart_gto_deriv1<5>(gto, gto+21, gto+42, gto+63, ce, ce_2a, rx, ry, rz);
+            break;
+        }
     }
     int *ao_loc = envs.ao_loc;
     out += (size_t)ao_loc[bas_id] * ngrids + grid_id;
@@ -1205,6 +1308,11 @@ static void _sph_deriv1_kernel(double *out, PBCIntEnvVars envs, double *grids,
             out[(n*nao+8)*ngrids] = 0.625835735449176134 * (gto[n*15+0] + gto[n*15+10]) - 3.755014412695056800 * gto[n*15+3];
         }
         break;
+    case 5:
+        for (int n = 0; n < 4; ++n) {
+            _cart2sph_l5(out + (size_t)n*nao*ngrids, ngrids, gto + n*21, 1);
+        }
+        break;
     }
 }
 
@@ -1231,10 +1339,10 @@ static void _sph_ip2_kernel(double *out, PBCIntEnvVars envs, double *grids,
     double xi = gridx[grid_id] - ri[0];
     double yi = gridy[grid_id] - ri[1];
     double zi = gridz[grid_id] - ri[2];
-    double gx[LMAX+3];
-    double gy[LMAX+3];
-    double gz[LMAX+3];
-    constexpr int n_cart_max = (LMAX+1)*(LMAX+2)/2;
+    double gx[PBC_LMAX+3];
+    double gy[PBC_LMAX+3];
+    double gz[PBC_LMAX+3];
+    constexpr int n_cart_max = (PBC_LMAX+1)*(PBC_LMAX+2)/2;
     double gto[6*n_cart_max];
     for (int n = 0; n < 6*n_cart_max; ++n) {
         gto[n] = 0;
@@ -1294,6 +1402,9 @@ static void _sph_ip2_kernel(double *out, PBCIntEnvVars envs, double *grids,
             case 4:
                 _cart_gto_ip2<4>(gto, gx, gy, gz, a2, rx, ry, rz);
                 break;
+            case 5:
+                _cart_gto_ip2<5>(gto, gx, gy, gz, a2, rx, ry, rz);
+                break;
             }
         }
     }
@@ -1346,6 +1457,11 @@ static void _sph_ip2_kernel(double *out, PBCIntEnvVars envs, double *grids,
             out[(n*nao+8)*ngrids] = 0.625835735449176134 * (gto[0*6+n] + gto[10*6+n]) - 3.755014412695056800 * gto[3*6+n];
         }
         break;
+    case 5:
+        for (int n = 0; n < 6; ++n) {
+            _cart2sph_l5(out + (size_t)n*nao*ngrids, ngrids, gto + n, 6);
+        }
+        break;
     }
 }
 
@@ -1377,7 +1493,7 @@ static void _deriv0_strain_tensor_kernel(
     double cell0_Rx = ri[0];
     double cell0_Ry = ri[1];
     double cell0_Rz = ri[2];
-    constexpr int n_cart_max = (LMAX+1)*(LMAX+2)/2;
+    constexpr int n_cart_max = (PBC_LMAX+1)*(PBC_LMAX+2)/2;
     double gto[n_cart_max];
     double ao[90];
     for (int n = 0; n < 90; ++n) {

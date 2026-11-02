@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <cuda_runtime.h>
 #include "gvhf-rys/vhf.cuh"
+#include "pbc_lmax.cuh"
 #include "gvhf-rys/rys_contract_k.cuh"
 
 #define WARP_SIZE       32
@@ -77,7 +78,7 @@ while (1) {
         // Note: must use this ao_loc than envs.ao_loc because envs.ao_loc
         // cannot handle spherical integrals
         nao = envs.ao_loc[envs.nbas];
-        gout_stride = gout_stride_lookup[li*LMAX1+lj];
+        gout_stride = gout_stride_lookup[li*PBC_LMAX1+lj];
         nsp_per_block = sp_threads / gout_stride;
     }
     __syncthreads();
@@ -365,7 +366,7 @@ while (1) {
         // Note: must use this ao_loc than envs.ao_loc because envs.ao_loc
         // cannot handle spherical integrals
         nao = envs.ao_loc[envs.nbas];
-        gout_stride = gout_stride_lookup[li*LMAX1+lj];
+        gout_stride = gout_stride_lookup[li*PBC_LMAX1+lj];
         nsp_per_block = sp_threads / gout_stride;
     }
     __syncthreads();

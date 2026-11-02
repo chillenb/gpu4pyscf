@@ -57,7 +57,8 @@ libpbc.PBCcontract_int3c2e_dm.restype = ctypes.c_int
 libpbc.PBCcontract_int3c2e_auxvec.restype = ctypes.c_int
 libpbc.PBCpair_recontraction_info.restype = ctypes.c_int
 
-LMAX = 4
+# Must match PBC_LMAX in lib/pbc/pbc_lmax.cuh
+LMAX = 5
 L_AUX_MAX = 6
 THREADS = 256
 POOL_SIZE = 16384
@@ -794,7 +795,8 @@ def int3c2e_scheme(*, shm_size=SHM_SIZE, gout_width=None, gout_ndim='ijk',
                    deriv=None, cache_cart_idx=False):
     return mol_int3c2e_scheme(
         short_range=True, shm_size=shm_size, gout_width=gout_width,
-        gout_ndim=gout_ndim, deriv=deriv, cache_cart_idx=cache_cart_idx)
+        gout_ndim=gout_ndim, deriv=deriv, cache_cart_idx=cache_cart_idx,
+        lmax=LMAX)
 
 # This modified rcut estimation function will be available in pyscf-2.8 or newer
 # TODO: improve the rcut estimation for PBCsr_int3c2e_latsum23 kernel

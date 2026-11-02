@@ -559,15 +559,18 @@ class Int3c2eEnvVars(ctypes.Structure):
 
 def int3c2e_scheme(*, short_range=False, shm_size=SHM_SIZE, gout_width=None,
                    gout_ndim='ijk', deriv=None, cache_cart_idx=False,
-                   angular_inc=None):
+                   angular_inc=None, lmax=LMAX):
+    '''Launch parameters for each (lk, li, lj). The tables have the shape
+    (L_AUX_MAX+1, lmax+1, lmax+1). lmax must match the stride of the lookup
+    in the CUDA kernels (LMAX1 for the molecular kernels).'''
     if deriv is None:
         deriv = (0, 0, 0)
     if angular_inc is None:
         angular_inc = sum(deriv)
     i_inc, j_inc, k_inc = deriv
 
-    li = np.arange(LMAX+1)[:,None]
-    lj = np.arange(LMAX+1)
+    li = np.arange(lmax+1)[:,None]
+    lj = np.arange(lmax+1)
     lk = np.arange(L_AUX_MAX+1)[:,None,None]
     nfi = (li + 1) * (li + 2) // 2
     nfj = (lj + 1) * (lj + 2) // 2

@@ -21,9 +21,13 @@
 #include "gvhf-rys/vhf.cuh"
 #include "gvhf-rys/rys_contract_k.cuh"
 #include "ft_ao.cuh"
+#include "pbc_lmax.cuh"
 
 #define THREADS         256
 #define GOUT_WIDTH      30
+// Pairs with more than WARPS*GOUT_WIDTH Cartesian components (e.g. (h,g) and
+// (h,h)) are evaluated by the kernel instance with the wider gout buffer
+#define GOUT_WIDTH_HIGH_L 56
 #define POOL_SIZE       65536
 
 __global__ static
@@ -184,7 +188,7 @@ void ft_ao_bdiv_kernel(double *out, RysIntEnvVars envs, int nGv, double *Gv)
     }
 }
 
-__global__ static
+template <int gout_width> __global__ static
 void ft_aopair_kernel(double *out, PBCIntEnvVars envs, double *pool, int *shl_pair_offsets,
                       uint32_t *bas_ij_idx, int *img_idx, uint32_t *img_offsets,
                       int *gout_stride_lookup, int *ao_pair_loc, int ao_pair_offset,
@@ -232,10 +236,14 @@ while (1) {
         // Note: must use this ao_loc than envs.ao_loc because envs.ao_loc
         // cannot handle spherical integrals
         nao = ao_loc[envs.nbas];
-        gout_stride = gout_stride_lookup[li*LMAX1+lj];
+        gout_stride = gout_stride_lookup[li*PBC_LMAX1+lj];
         nsp_per_block = WARPS / gout_stride;
     }
     __syncthreads();
+    // Each pair type is evaluated by exactly one of the two kernel instances
+    if ((c_nf[li] * c_nf[lj] > WARPS * GOUT_WIDTH) != (gout_width > GOUT_WIDTH)) {
+        continue;
+    }
     int nGsp_per_block = nGv_per_block * nsp_per_block;
     int gout_id = warp_id / nsp_per_block;
     int sp_id = warp_id - nsp_per_block * gout_id;
@@ -316,10 +324,10 @@ while (1) {
         double xjxi = rj[0] - xi;
         double yjyi = rj[1] - yi;
         double zjzi = rj[2] - zi;
-        double goutR[GOUT_WIDTH];
-        double goutI[GOUT_WIDTH];
+        double goutR[gout_width];
+        double goutI[gout_width];
 #pragma unroll
-        for (int n = 0; n < GOUT_WIDTH; ++n) {
+        for (int n = 0; n < gout_width; ++n) {
             goutR[n] = 0.;
             goutI[n] = 0.;
         }
@@ -424,7 +432,7 @@ while (1) {
                 if (pair_idx < shl_pair1 && img < img1 && Gv_id < nGv) {
                     float div_nfi = c_div_nf[li];
 #pragma unroll
-                    for (int n = 0; n < GOUT_WIDTH; ++n) {
+                    for (int n = 0; n < gout_width; ++n) {
                         uint32_t ij = n*gout_stride + gout_id;
                         if (ij >= nfij) break;
                         uint32_t j = ij * div_nfi;
@@ -464,7 +472,7 @@ while (1) {
                 double *out_local = c2s_pool +
                     (sp_id * nfij * nGv_per_block + Gv_id_in_block) * OF_COMPLEX;
 #pragma unroll
-                for (int n = 0; n < GOUT_WIDTH; ++n) {
+                for (int n = 0; n < gout_width; ++n) {
                     int ij = n*gout_stride + gout_id;
                     if (ij >= nfij) break;
                     size_t addr = ij * nGv_per_block * OF_COMPLEX;
@@ -474,7 +482,7 @@ while (1) {
             } else {
                 double *aft_tensor = out + ((size_t)pair_offset * nGv + Gv_id) * OF_COMPLEX;
 #pragma unroll
-                for (int n = 0; n < GOUT_WIDTH; ++n) {
+                for (int n = 0; n < gout_width; ++n) {
                     int ij = n*gout_stride + gout_id;
                     if (ij >= nfij) break;
                     size_t addr = ij;
@@ -1158,17 +1166,28 @@ int build_ft_aopair(double *out, PBCIntEnvVars *envs, double *pool, int *head,
                     int shm_size, int nbatches_shl_pair, int *shl_pair_offsets,
                     uint32_t *bas_ij_idx, int *img_idx, uint32_t *img_offsets,
                     int *gout_stride_lookup, int *ao_pair_loc, int ao_pair_offset,
-                    double *grids, int ngrids, int *ao_loc, int compressing, int to_sph)
+                    double *grids, int ngrids, int *ao_loc, int compressing, int to_sph,
+                    int with_high_l)
 {
-    cudaFuncSetAttribute(ft_aopair_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
     int workers = prop.multiProcessorCount;
+    cudaFuncSetAttribute(ft_aopair_kernel<GOUT_WIDTH>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     cudaMemset(head, 0, sizeof(int));
-    ft_aopair_kernel<<<workers, THREADS, shm_size>>>(
+    ft_aopair_kernel<GOUT_WIDTH><<<workers, THREADS, shm_size>>>(
         out, *envs, pool, shl_pair_offsets, bas_ij_idx, img_idx, img_offsets,
         gout_stride_lookup, ao_pair_loc, ao_pair_offset, grids, ngrids,
         ao_loc, compressing, to_sph, head, nbatches_shl_pair);
+    if (with_high_l) {
+        cudaFuncSetAttribute(ft_aopair_kernel<GOUT_WIDTH_HIGH_L>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+        cudaMemset(head, 0, sizeof(int));
+        ft_aopair_kernel<GOUT_WIDTH_HIGH_L><<<workers, THREADS, shm_size>>>(
+            out, *envs, pool, shl_pair_offsets, bas_ij_idx, img_idx, img_offsets,
+            gout_stride_lookup, ao_pair_loc, ao_pair_offset, grids, ngrids,
+            ao_loc, compressing, to_sph, head, nbatches_shl_pair);
+    }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in ft_aopair_kernel: %s\n", cudaGetErrorString(err));

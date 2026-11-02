@@ -20,6 +20,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include "gvhf-rys/vhf.cuh"
+#include "pbc/pbc_lmax.cuh"
 #include "constant_objects.cuh"
 #include "cartesian.cuh"
 #include "utils.cuh"
@@ -285,7 +286,7 @@ for (int c_index0 = c_start; c_index0 < c_stop; c_index0 += c_stride) {
 
 extern "C" {
 #define eval_tau_kernel_case(li, lj, slice_i, slice_j) \
-    case (li * LMAX1 + lj): \
+    case (li * PBC_LMAX1 + lj): \
         eval_tau_kernel<li,lj,slice_i,slice_j><<<ntasks, threads, shmsize>>>( \
             rho_c, tau_c, dm, *envs, factor, shl_pair_offsets, bas_ij_idx, \
             atom_frac_ranges, atom_mesh[0], nseg, c_stride, \
@@ -312,7 +313,7 @@ int evaluate_tau_v2(double *rho_c, double *tau_c, double *dm,
     double da_squared = distance_squared(dxyz_dabc[0], dxyz_dabc[1], dxyz_dabc[2]);
     double db_squared = distance_squared(dxyz_dabc[3], dxyz_dabc[4], dxyz_dabc[5]);
     double dc_squared = distance_squared(dxyz_dabc[6], dxyz_dabc[7], dxyz_dabc[8]);
-    switch (i_angular * LMAX1 + j_angular) {
+    switch (i_angular * PBC_LMAX1 + j_angular) {
         eval_tau_kernel_case(0,0, 1, 1);
         eval_tau_kernel_case(1,0, 3, 1);
         eval_tau_kernel_case(1,1, 3, 3);
@@ -328,6 +329,15 @@ int evaluate_tau_v2(double *rho_c, double *tau_c, double *dm,
         eval_tau_kernel_case(4,2, 8, 6);
         eval_tau_kernel_case(4,3, 8, 5);
         eval_tau_kernel_case(4,4, 8, 5);
+        eval_tau_kernel_case(5,0,21, 1);
+        eval_tau_kernel_case(5,1, 7, 3);
+        eval_tau_kernel_case(5,2, 7, 6);
+        eval_tau_kernel_case(5,3, 7, 5);
+        eval_tau_kernel_case(5,4, 7, 5);
+        eval_tau_kernel_case(5,5, 7, 7);
+        default:
+            fprintf(stderr, "eval_tau_kernel: angular momentum (%d,%d) not supported\n", i_angular, j_angular);
+            return 1;
     }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {

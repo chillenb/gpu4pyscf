@@ -50,8 +50,12 @@ libpbc = load_library('libpbc')
 libpbc.build_ft_ao.restype = ctypes.c_int
 libpbc.build_ft_aopair.restype = ctypes.c_int
 
-LMAX = 4
+# Must match PBC_LMAX in lib/pbc/pbc_lmax.cuh
+LMAX = 5
 GOUT_WIDTH = 30
+# Width of the ft_aopair kernel instance for pairs with more than
+# (THREADS//nGv_per_block)*GOUT_WIDTH Cartesian components, see lib/pbc/ft_ao.cu
+GOUT_WIDTH_HIGH_L = 56
 THREADS = 256
 POOL_SIZE = 65536
 
@@ -394,6 +398,9 @@ class FTOpt:
         img_offsets = cp.asarray(self.img_offsets)
         bvk_ncells = len(self.bvkmesh_Ls)
         kern = libpbc.build_ft_aopair
+        # Whether the basis has pairs for the wide kernel instance
+        nf_max = (lmax + 1) * (lmax + 2) // 2
+        with_high_l = nf_max**2 > (THREADS // 32) * GOUT_WIDTH
 
         def evaluate_ft(Gv, batch_id=0, out=None):
             nGv = len(Gv)
@@ -434,7 +441,8 @@ class FTOpt:
                 ctypes.c_int(nGv),
                 ctypes.cast(ao_loc.data.ptr, ctypes.c_void_p),
                 ctypes.c_int(compressing),
-                ctypes.c_int(not cart))
+                ctypes.c_int(not cart),
+                ctypes.c_int(with_high_l))
             if err != 0:
                 raise RuntimeError('build_ft_aopair kernel failed')
             return out
@@ -655,7 +663,13 @@ class FTOpt:
         return vj
 
 def ft_ao_scheme(shm_size=SHM_SIZE, gout_width=GOUT_WIDTH, deriv=None,
-                 nGv_per_block=32, cache_cart_idx=False):
+                 nGv_per_block=32, cache_cart_idx=False,
+                 gout_width_high_l=GOUT_WIDTH_HIGH_L):
+    '''Launch parameters of the ft_aopair kernels for each (li, lj).
+
+    Pairs with more than (THREADS//nGv_per_block)*gout_width Cartesian
+    components use gout_width_high_l (the wide instance of ft_aopair_kernel).
+    '''
     if deriv is None:
         deriv = (0, 0)
     i_inc, j_inc = deriv
@@ -665,11 +679,12 @@ def ft_ao_scheme(shm_size=SHM_SIZE, gout_width=GOUT_WIDTH, deriv=None,
     nfi = (li + 1) * (li + 2) // 2
     nfj = (lj + 1) * (lj + 2) // 2
     gout_size = nfi * nfj
-    gout_stride = (gout_size + gout_width-1) // gout_width
+    rem_threads = THREADS // nGv_per_block
+    width = np.where(gout_size > rem_threads * gout_width, gout_width_high_l, gout_width)
+    gout_stride = (gout_size + width-1) // width
     # Round up to the next 2^n
     gout_stride = _nearest_power2(gout_stride, return_leq=False)
 
-    rem_threads = THREADS // nGv_per_block
     nsp_max = rem_threads // gout_stride
     assert np.all(nsp_max > 0)
     g_size = (li+1+i_inc)*(lj+1+j_inc)
