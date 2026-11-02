@@ -2082,6 +2082,7 @@ class MultiGridNumInt(multigrid_v1.MultiGridNumIntBase):
 
         init_ke = mesh_to_ke(a, [8]*3).max()
         log.debug1('initial ke_cutoff = %g', init_ke)
+        fft_init_ke = init_ke
 
         # Shell pairs that the AFT kernels cannot handle
         high_l_pairs = None
@@ -2123,12 +2124,6 @@ class MultiGridNumInt(multigrid_v1.MultiGridNumIntBase):
 
             init_ke = aft_final_ke * 1.5
 
-        if high_l_pairs is not None:
-            if bas_ij_idx is None:
-                bas_ij_idx = high_l_pairs
-            else:
-                bas_ij_idx = cp.concatenate([bas_ij_idx, high_l_pairs])
-
         if bas_ij_idx is not None and len(bas_ij_idx) > 0:
             # bas_ij_idx are the effective paris between cell0 and bvkcell.
             # The FFT-MultiGrid code operates on cell0-supmol paris.
@@ -2136,6 +2131,16 @@ class MultiGridNumInt(multigrid_v1.MultiGridNumIntBase):
             # primitive shells in supmol.
             self.fft_buckets = _partition_ke_for_fft(
                 self, bas_ij_idx, init_ke, ke_cutoff, precision, xctype, log)
+
+        if high_l_pairs is not None:
+            # The pairs excluded from AFT span the full range of Ecut. They are
+            # partitioned with the initial ke_cutoff of the FFT-only scheme,
+            # rather than the one for the remaining pairs above the AFT Ecut.
+            buckets = _partition_ke_for_fft(
+                self, high_l_pairs, fft_init_ke, ke_cutoff, precision, xctype, log)
+            buckets.extend(self.fft_buckets or [])
+            # High Ecut to low Ecut, as in _partition_ke_for_fft
+            self.fft_buckets = sorted(buckets, key=lambda b: -b['ke_cutoff'])
 
         if self.allow_mesh_reduction:
             mesh = self.mesh

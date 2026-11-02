@@ -400,7 +400,7 @@ class FTOpt:
         kern = libpbc.build_ft_aopair
         # Whether the basis has pairs for the wide kernel instance
         nf_max = (lmax + 1) * (lmax + 2) // 2
-        with_high_l = nf_max**2 > (THREADS // 32) * GOUT_WIDTH
+        with_high_l = int(nf_max**2 > (THREADS // 32) * GOUT_WIDTH)
 
         def evaluate_ft(Gv, batch_id=0, out=None):
             nGv = len(Gv)

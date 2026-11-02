@@ -130,7 +130,12 @@ class KnownValues(unittest.TestCase):
             self.assertAlmostEqual(float(e1), e0, 8)
             self.assertLess(abs(v1.get() - v0).max(), 1e-8, xc)
 
-    def _check_multigrid(self, c, enable_aft):
+    def _check_multigrid(self, enable_aft):
+        # The multigrid truncation error of the diffuse h shell is ~1e-7 at
+        # precision=1e-9 and converges with cell.precision
+        c = make_cell()
+        c.precision = 1e-11
+        c.build(False, False)
         dm = random_dm(c)
         grids_cpu = gen_grid_cpu.UniformGrids(c)
         for xc in ('lda,', 'pbe,', 'm06l,'):
@@ -139,9 +144,9 @@ class KnownValues(unittest.TestCase):
             ni = multigrid.MultiGridNumInt(c)
             ni.enable_aft = enable_aft
             n1, e1, v1 = ni.nr_rks(c, None, xc, cp.asarray(dm), with_j=False)
-            self.assertAlmostEqual(float(n1), n0, 7)
-            self.assertAlmostEqual(float(e1), e0, 7)
-            self.assertLess(abs(v1.get() - v0).max(), 1e-7, xc)
+            self.assertAlmostEqual(float(n1), n0, 8)
+            self.assertAlmostEqual(float(e1), e0, 8)
+            self.assertLess(abs(v1.get() - v0).max(), 2e-8, xc)
             if ni.aft_buckets:
                 ang = ni.bvkcell._bas[:,1]
                 for bucket in ni.aft_buckets:
@@ -151,13 +156,13 @@ class KnownValues(unittest.TestCase):
         return ni
 
     def test_multigrid_fft(self):
-        self._check_multigrid(cell, enable_aft=False)
+        ni = self._check_multigrid(enable_aft=False)
+        self.assertFalse(ni.aft_buckets)
 
     def test_multigrid_aft(self):
-        # A larger cubic cell has more lattice images, enabling the AFT path for
-        # the shell pairs without h functions
-        c = make_cell(a=6.)
-        ni = self._check_multigrid(c, enable_aft=True)
+        # The shell pairs without h functions use AFT, the others FFT
+        ni = self._check_multigrid(enable_aft=True)
+        self.assertTrue(ni.aft_buckets)
         self.assertTrue(ni.fft_buckets)
 
 if __name__ == '__main__':
