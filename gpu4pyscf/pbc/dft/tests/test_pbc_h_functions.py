@@ -165,6 +165,40 @@ class KnownValues(unittest.TestCase):
         self.assertTrue(ni.aft_buckets)
         self.assertTrue(ni.fft_buckets)
 
+    def test_multigrid_strain_gradient(self):
+        # Analytical XC strain gradients vs finite differences of the XC energy
+        from pyscf.pbc.dft.numint import KNumInt as KNumInt_cpu
+        from gpu4pyscf.pbc.grad.rhf import _finite_diff_cells
+        from gpu4pyscf.pbc.lib.kpts_helper import fft_matrix
+        a = np.eye(3) * 5
+        np.random.seed(5)
+        a += np.random.rand(3, 3) - .5
+        c = pbcgto.M(atom='He 1 1 1; He 2 1.5 2.4', a=a, unit='Bohr',
+                     basis=[[0, [.5, 1]], [1, [.8, 1]], [5, [.9, 1]]],
+                     precision=1e-11, verbose=0)
+        kmesh = [3, 1, 1]
+        kpts = c.make_kpts(kmesh)
+        nao = c.nao
+        dm = np.random.rand(np.prod(kmesh), nao, nao) - .5
+        phase = fft_matrix(kmesh).get() / np.prod(kmesh)
+        dm = np.einsum('Lpq,Lk->kpq', dm, phase.conj())
+        dm = np.einsum('kpi,kqi->kpq', dm, dm.conj())
+        for xc in ('lda,', 'pbe,', 'm06,'):
+            ni = multigrid.MultiGridNumInt(c)
+            ni.allow_mesh_reduction = False
+            dat = ni.energy_strain_gradient(xc, dm, kpts, spin=0, with_j=False,
+                                            with_nuc=False)
+            for (i, j) in [(0, 0), (0, 1), (0, 2), (2, 0), (2, 2)]:
+                cell1, cell2 = _finite_diff_cells(c, i, j, disp=1e-4)
+                cell1.precision = 1e-10
+                cell2.precision = 1e-10
+                exc1 = KNumInt_cpu().nr_rks(cell1, gen_grid_cpu.UniformGrids(cell1), xc,
+                                            dm, kpts=cell1.make_kpts(kmesh))[1]
+                exc2 = KNumInt_cpu().nr_rks(cell2, gen_grid_cpu.UniformGrids(cell2), xc,
+                                            dm, kpts=cell2.make_kpts(kmesh))[1]
+                # The same agreement as with g functions in place of the h shell
+                self.assertLess(abs(dat[i,j] - (exc1 - exc2)/2e-4), 2e-7, f'{xc} {i}{j}')
+
 if __name__ == '__main__':
     print('Full Tests for h functions in PBC')
     unittest.main()
