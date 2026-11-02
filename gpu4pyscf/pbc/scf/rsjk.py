@@ -108,6 +108,10 @@ def get_j(cell, dm, hermi=1, kpts=None, kpts_band=None, vhfopt=None):
     vj += vhfopt._get_j_lr(dm, hermi, kpts, kpts_band)
     return vj
 
+def _check_exxdiv(exxdiv):
+    if exxdiv in ('vcut_sph', 'vcut_ws', 'smooth_vcut_sph', 'smooth_vcut_ws'):
+        raise NotImplementedError(f'rsjk for exxdiv={exxdiv}')
+
 class PBCJKMatrixOpt:
 
     def __init__(self, cell, omega=None):
@@ -234,6 +238,7 @@ class PBCJKMatrixOpt:
         matrix is still evaluated as the k-point sampling case. The "nkpts"
         dimension is set to 1
         '''
+        _check_exxdiv(exxdiv)
         log = logger.new_logger(self, verbose)
         cell = self.cell
         assert cell.dimension == 3
@@ -429,6 +434,7 @@ class PBCJKMatrixOpt:
 
     def _get_k_lr(self, dm, hermi, kpts=None, kpts_band=None, exxdiv=None,
                   omega=None, lr_factor=None, sr_factor=None):
+        _check_exxdiv(exxdiv)
         if kpts_band is not None:
             raise NotImplementedError
 

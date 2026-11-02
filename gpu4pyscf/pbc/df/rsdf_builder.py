@@ -63,12 +63,17 @@ THREADS = 256
 
 def build_cderi(cell, auxcell, kpts=None, kmesh=None, j_only=False,
                 omega=None, linear_dep_threshold=LINEAR_DEP_THR,
-                compress=False, exclude_dd=False, int3c2e_opt=None):
+                compress=False, exclude_dd=False, int3c2e_opt=None, stc=None):
     '''
     Create density fitting integral tensor.
 
     This function currently only supports full-range and short-range Coulomb
     potential.
+
+    Kwargs:
+        stc : :class:`gpu4pyscf.pbc.tools.stc.STCKernel`
+            Build the tensor with the smooth truncated Coulomb kernel (for
+            exchange) instead of the full-range Coulomb kernel.
     '''
     assert cell.low_dim_ft_type != 'inf_vacuum'
     assert cell.dimension >= 2
@@ -76,10 +81,12 @@ def build_cderi(cell, auxcell, kpts=None, kmesh=None, j_only=False,
     is_gamma_point = kpts is None or is_zero(kpts)
     if is_gamma_point:
         cderi, cderip, cderi_idx = compressed_cderi_gamma_point(
-            cell, auxcell, omega, linear_dep_threshold, exclude_dd, int3c2e_opt)
+            cell, auxcell, omega, linear_dep_threshold, exclude_dd, int3c2e_opt,
+            stc)
         kpts = np.zeros((1, 3))
         kmesh = np.array([1, 1, 1])
     elif j_only:
+        assert stc is None
         # Coulomb integrals can be converged within a smaller bvk cell.
         if kmesh is None:
             kmesh = kpts_to_kmesh(cell, kpts)
@@ -97,7 +104,8 @@ def build_cderi(cell, auxcell, kpts=None, kmesh=None, j_only=False,
         else:
             assert np.prod(kmesh) == len(kpts)
         cderi, cderip, cderi_idx = compressed_cderi_kk(
-            cell, auxcell, kpts, kmesh, omega, linear_dep_threshold, exclude_dd, int3c2e_opt)
+            cell, auxcell, kpts, kmesh, omega, linear_dep_threshold, exclude_dd,
+            int3c2e_opt, stc)
     if compress:
         return cderi, cderip, cderi_idx
 
@@ -131,8 +139,11 @@ def _weighted_coulG_LR(cell, Gv, omega, kws, kpt=np.zeros(3)):
     coulG *= kws
     return asarray(coulG)
 
-def _weighted_coulG_kpts(cell, mesh, omega, rsdf_omega, kpts=None):
+def _weighted_coulG_kpts(cell, mesh, omega, rsdf_omega, kpts=None, stc=None):
     # _weighted_coulG_LR for multiple k-points.
+    if stc is not None:
+        assert omega == 0
+        return _weighted_stc_coulG_kpts(cell, mesh, rsdf_omega, kpts, stc)
     Gv, Gvbase, kws = cell.get_Gv_weights(mesh)
     ngrids = len(Gv)
     assert Gv[0].dot(Gv[0]) == 0
@@ -151,6 +162,28 @@ def _weighted_coulG_kpts(cell, mesh, omega, rsdf_omega, kpts=None):
         coulG -= get_coulG(cell, Gv=Gk, omega=omega).reshape(nkpts, ngrids)
     # Remove the G=0 component for sr_int3c2e as it is evaluated in the real space
     coulG[0,0] -= np.pi / rsdf_omega**2
+    coulG *= kws
+    return coulG
+
+def _weighted_stc_coulG_kpts(cell, mesh, rsdf_omega, kpts, stc):
+    '''The smooth truncated Coulomb kernel minus the short-range part
+    erfc(rsdf_omega r)/r, which is evaluated in real space.'''
+    Gv, Gvbase, kws = cell.get_Gv_weights(mesh)
+    assert Gv[0].dot(Gv[0]) == 0
+    if kpts is None:
+        kpts = np.zeros((1, 3))
+    kpts = kpts.reshape(-1, 3)
+    Gv = asarray(Gv)
+    coulG = cp.empty((len(kpts), len(Gv)))
+    for k, kpt in enumerate(kpts):
+        # Each k-point is evaluated separately as the Wigner-Seitz kernel
+        # is indexed by the k+G vectors
+        coulG[k] = stc.get_coulG(kpt, Gv, mesh)
+        coulG[k] -= get_coulG(cell, k=kpt, Gv=Gv, mesh=mesh, omega=-rsdf_omega,
+                              wrap_around=True)
+        if is_zero(kpt):
+            # Remove the G=0 component for sr_int3c2e as it is evaluated in the real space
+            coulG[k,0] -= np.pi / rsdf_omega**2
     coulG *= kws
     return coulG
 
@@ -195,14 +228,14 @@ def eigenvalue_decomposed_metric(j2c, linear_dep_threshold=LINEAR_DEP_THR):
     j2ctag = 'ED'
     return j2c, j2c_negative, j2ctag
 
-def _get_2c2e(auxcell, uniq_kpts, omega, rsdf_omega, bvk_kmesh=None):
+def _get_2c2e(auxcell, uniq_kpts, omega, rsdf_omega, bvk_kmesh=None, stc=None):
     # Compute SR Coulomb 2c2e
     if uniq_kpts is not None:
         assert uniq_kpts.ndim == 2
     j2c = sr_int2c2e(auxcell, rsdf_omega, kpts=uniq_kpts, bvk_kmesh=bvk_kmesh)
     j2c = cp.asarray(j2c)
 
-    with_long_range = omega < rsdf_omega
+    with_long_range = omega < rsdf_omega or stc is not None
     # This is identical to _weighted_coulG_kpts with mesh=[1]*3 below
     #if not with_long_range:
     #    assert auxcell.dimension == 3
@@ -230,7 +263,7 @@ def _get_2c2e(auxcell, uniq_kpts, omega, rsdf_omega, bvk_kmesh=None):
         mesh = [1] * 3
     logger.debug(auxcell, 'Set 2c2e integrals precision %g, mesh %s', precision, mesh)
 
-    coulG = _weighted_coulG_kpts(auxcell, mesh, omega, rsdf_omega, uniq_kpts)
+    coulG = _weighted_coulG_kpts(auxcell, mesh, omega, rsdf_omega, uniq_kpts, stc)
     Gv = auxcell.get_Gv(mesh)
     ngrids = Gv.shape[0]
     naux = auxcell.nao
@@ -285,7 +318,8 @@ def _guess_omega(cell, kmesh=None):
             omega = estimate_omega_for_ke_cutoff(cell, ke_cutoff)
     return omega
 
-def _append_dd_cderi(opt, cderi, cd_j2c_cache, omega, recontract, kpts=None):
+def _append_dd_cderi(opt, cderi, cd_j2c_cache, omega, recontract, kpts=None,
+                     stc=None):
     """Recontract real or complex DD integrals in bounded pair/G batches."""
     dd_ft_opt = opt.dd_ft_opt
     cell = opt.cell
@@ -349,7 +383,10 @@ def _append_dd_cderi(opt, cderi, cd_j2c_cache, omega, recontract, kpts=None):
     write_buf = empty_mapped(j3c_size, dtype=dtype)
 
     for (kp, target), coeff, q in zip(cderi.items(), cd_j2c_cache, kpts):
-        coulG = get_coulG(cell, k=q, Gv=Gv, omega=-omega, wrap_around=True)
+        if stc is None:
+            coulG = get_coulG(cell, k=q, Gv=Gv, omega=-omega, wrap_around=True)
+        else:
+            coulG = stc.get_coulG(q, Gv, opt.mesh)
         coulG *= weights
         coeff = asarray(coeff)
         naux = coeff.shape[1]
@@ -394,15 +431,18 @@ def _append_dd_cderi(opt, cderi, cd_j2c_cache, omega, recontract, kpts=None):
 
 def compressed_cderi_gamma_point(cell, auxcell, omega=None,
                                  linear_dep_threshold=LINEAR_DEP_THR,
-                                 exclude_dd=False, int3c2e_opt=None):
+                                 exclude_dd=False, int3c2e_opt=None, stc=None):
     kmesh = np.array([1, 1, 1])
     return compressed_cderi_j_only(
-        cell, auxcell, kmesh, omega, linear_dep_threshold, exclude_dd, int3c2e_opt)
+        cell, auxcell, kmesh, omega, linear_dep_threshold, exclude_dd, int3c2e_opt,
+        stc)
 
 def compressed_cderi_j_only(cell, auxcell, kmesh, omega=None,
                             linear_dep_threshold=LINEAR_DEP_THR,
-                            exclude_dd=False, int3c2e_opt=None):
+                            exclude_dd=False, int3c2e_opt=None, stc=None):
     assert kmesh is not None
+    # The smooth truncated kernel is only available for the Gamma point here
+    assert stc is None or np.prod(kmesh) == 1
     log = logger.new_logger(cell)
     t0 = t1 = log.init_timer()
 
@@ -412,6 +452,10 @@ def compressed_cderi_j_only(cell, auxcell, kmesh, omega=None,
         omega = abs(omega)
     if int3c2e_opt is None:
         rsdf_omega = max(omega, _guess_omega(cell, kmesh))
+        if stc is not None:
+            # The long-range part of the smooth truncated kernel decays as
+            # exp(-G^2/(4*rsdf_omega^2)) only if rsdf_omega >= omega_stc
+            rsdf_omega = max(rsdf_omega, stc.omega_stc)
         int3c2e_opt = SRInt3c2eOpt(
             cell, auxcell, omega=rsdf_omega, bvk_kmesh=kmesh).build(separate_dd=True)
 
@@ -419,23 +463,27 @@ def compressed_cderi_j_only(cell, auxcell, kmesh, omega=None,
     auxcell = int3c2e_opt.auxcell
     rsdf_omega = int3c2e_opt.omega
     log.debug('omega = %g, rsdf_builder omega = %g', omega, rsdf_omega)
+    if stc is not None:
+        assert omega == 0
+        assert rsdf_omega >= stc.omega_stc
+        log.debug('smooth truncated Coulomb %s, omega_stc = %g', stc.exxdiv, stc.omega_stc)
     bvk_ncells = len(int3c2e_opt.bvkmesh_Ls)
 
     log.debug('Generate auxcell 2c2e integrals. naux=%d', auxcell.nao)
     cd_j2c_cache, negative_metric_size = _precontract_j2c_aux_coeff(
-        auxcell, None, omega, rsdf_omega, linear_dep_threshold)
+        auxcell, None, omega, rsdf_omega, linear_dep_threshold, stc=stc)
     naux_cart, naux = cd_j2c_cache[0].shape
 
     is_gamma_point = kmesh is None or np.prod(kmesh) == 1
 
-    with_long_range = omega < rsdf_omega
+    with_long_range = omega < rsdf_omega or stc is not None
     if with_long_range:
         mesh = int3c2e_opt.mesh
     else:
         assert cell.dimension == 3
         mesh = [1] * 3
     log.debug('mesh = %s', mesh)
-    coulG = _weighted_coulG_kpts(auxcell, mesh, omega, rsdf_omega)
+    coulG = _weighted_coulG_kpts(auxcell, mesh, omega, rsdf_omega, stc=stc)
     Gv = cell.get_Gv(mesh)
     ngrids = len(Gv)
 
@@ -564,7 +612,7 @@ def compressed_cderi_j_only(cell, auxcell, kmesh, omega=None,
     if with_dd:
         t1 = log.timer_debug1('compact part of GDF tensor', *t0)
         _append_dd_cderi(
-            int3c2e_opt, cderi, cd_j2c_cache, omega, recontract)
+            int3c2e_opt, cderi, cd_j2c_cache, omega, recontract, stc=stc)
         t1 = log.timer_debug1('diffuse part of GDF tensor', *t1)
 
     cderip = None
@@ -579,7 +627,7 @@ def compressed_cderi_j_only(cell, auxcell, kmesh, omega=None,
 
 def compressed_cderi_kk(cell, auxcell, kpts, kmesh=None, omega=None,
                         linear_dep_threshold=LINEAR_DEP_THR, exclude_dd=False,
-                        int3c2e_opt=None):
+                        int3c2e_opt=None, stc=None):
     log = logger.new_logger(cell)
     t0 = log.init_timer()
 
@@ -599,6 +647,10 @@ def compressed_cderi_kk(cell, auxcell, kpts, kmesh=None, omega=None,
         omega = abs(omega)
     if int3c2e_opt is None:
         rsdf_omega = max(omega, _guess_omega(cell, kmesh))
+        if stc is not None:
+            # The long-range part of the smooth truncated kernel decays as
+            # exp(-G^2/(4*rsdf_omega^2)) only if rsdf_omega >= omega_stc
+            rsdf_omega = max(rsdf_omega, stc.omega_stc)
         int3c2e_opt = SRInt3c2eOpt(
             cell, auxcell, omega=rsdf_omega, bvk_kmesh=kmesh).build(separate_dd=True)
 
@@ -606,23 +658,27 @@ def compressed_cderi_kk(cell, auxcell, kpts, kmesh=None, omega=None,
     auxcell = int3c2e_opt.auxcell
     rsdf_omega = int3c2e_opt.omega
     log.debug('omega = %g, rsdf_builder omega = %g', omega, rsdf_omega)
+    if stc is not None:
+        assert omega == 0
+        assert rsdf_omega >= stc.omega_stc
+        log.debug('smooth truncated Coulomb %s, omega_stc = %g', stc.exxdiv, stc.omega_stc)
 
     log.debug('Generate auxcell 2c2e integrals. naux=%d', auxcell.nao)
     cd_j2c_cache, negative_metric_size = _precontract_j2c_aux_coeff(
-        auxcell, kpts, omega, rsdf_omega, linear_dep_threshold, kmesh)
+        auxcell, kpts, omega, rsdf_omega, linear_dep_threshold, kmesh, stc)
     naux_cart = cd_j2c_cache[0].shape[0]
     naux_max = max(x.shape[1] for x in cd_j2c_cache)
     n_compact_pairs = int3c2e_opt.get_n_compact_pairs()
     log.debug1('n_compact_pairs = %d', n_compact_pairs)
 
-    with_long_range = omega < rsdf_omega
+    with_long_range = omega < rsdf_omega or stc is not None
     if with_long_range:
         mesh = int3c2e_opt.mesh
     else:
         assert cell.dimension == 3
         mesh = [1] * 3
     log.debug('mesh = %s', mesh)
-    coulG = _weighted_coulG_kpts(auxcell, mesh, omega, rsdf_omega, uniq_kpts)
+    coulG = _weighted_coulG_kpts(auxcell, mesh, omega, rsdf_omega, uniq_kpts, stc)
     Gv = cell.get_Gv(mesh)
     ngrids = len(Gv)
 
@@ -765,7 +821,7 @@ def compressed_cderi_kk(cell, auxcell, kpts, kmesh=None, omega=None,
     if with_dd:
         t1 = log.timer_debug1('compact part of GDF tensor', *t0)
         _append_dd_cderi(int3c2e_opt, cderi, cd_j2c_cache, omega,
-                         recontract, uniq_kpts)
+                         recontract, uniq_kpts, stc)
         t1 = log.timer_debug1('diffuse part of GDF tensor', *t1)
 
     cderip = None
@@ -779,10 +835,10 @@ def compressed_cderi_kk(cell, auxcell, kpts, kmesh=None, omega=None,
     return cderi, cderip, cderi_idx
 
 def _precontract_j2c_aux_coeff(auxcell, kpts, omega, rsdf_omega,
-                               linear_dep_threshold, kmesh=None):
+                               linear_dep_threshold, kmesh=None, stc=None):
     auxcell = SortedGTO.from_cell(auxcell)
     if kmesh is None:
-        j2c = _get_2c2e(auxcell, kpts, omega, rsdf_omega, kmesh)
+        j2c = _get_2c2e(auxcell, kpts, omega, rsdf_omega, kmesh, stc)
         if j2c.ndim == 2:
             j2c = j2c[None]
     else:
@@ -790,7 +846,7 @@ def _precontract_j2c_aux_coeff(auxcell, kpts, omega, rsdf_omega,
         kpt_iters = list(kk_adapted_iter(kmesh))
         # uniq_kpts corresponds to (kj-ki)
         uniq_kpts = kpts[[x[0] for x in kpt_iters]]
-        j2c = _get_2c2e(auxcell, uniq_kpts, omega, rsdf_omega, kmesh)
+        j2c = _get_2c2e(auxcell, uniq_kpts, omega, rsdf_omega, kmesh, stc)
         # DF metric for self-conjugated k-point should be real
         j2c = [j2c_k.real if kp == kp_conj else j2c_k
                for j2c_k, (kp, kp_conj, _, _) in zip(j2c, kpt_iters)]

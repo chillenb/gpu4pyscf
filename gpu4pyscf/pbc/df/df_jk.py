@@ -127,13 +127,12 @@ def get_j_kpts_kshift(mydf, dm_kpts, kshift, hermi=0, kpts=None, kpts_band=None)
 
 def get_k_kpts(mydf, dm_kpts, hermi=1, kpts=None, kpts_band=None,
                exxdiv=None):
+    from gpu4pyscf.pbc.df.df_jk_real import check_exxdiv
+    from gpu4pyscf.pbc.tools.stc import STC_EXXDIV
     cell = mydf.cell
     log = logger.new_logger(mydf)
-
-    if exxdiv is not None and exxdiv != 'ewald':
-        log.warn('GDF does not support exxdiv %s. '
-                 'exxdiv needs to be "ewald" or None', exxdiv)
-        raise RuntimeError('GDF does not support exxdiv %s' % exxdiv)
+    if exxdiv not in STC_EXXDIV:
+        check_exxdiv(mydf, exxdiv)
 
     t0 = (logger.process_clock(), logger.perf_counter())
     assert kpts_band is None or kpts_band is kpts
@@ -142,6 +141,7 @@ def get_k_kpts(mydf, dm_kpts, hermi=1, kpts=None, kpts_band=None,
     if mydf._cderi is None or mydf._j_only:
         mydf.build(j_only=False, kpts_band=kpts_band)
         t0 = log.timer_debug1('Init get_k_kpts', *t0)
+    check_exxdiv(mydf, exxdiv)
 
     kpts_band, input_band = _format_kpts_band(kpts_band, kpts), kpts_band
     nband = len(kpts_band)

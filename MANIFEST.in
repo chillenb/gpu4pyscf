@@ -26,4 +26,5 @@ recursive-exclude *test*
 recursive-include gpu4pyscf *.dat
 recursive-include gpu4pyscf/lib/deps *.so
 include gpu4pyscf/lib/*.so
+recursive-include gpu4pyscf/lib/xsf *.h LICENSE README.md
 exclude gpu4pyscf/lib.deps *.so.*

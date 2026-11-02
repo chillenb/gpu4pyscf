@@ -31,6 +31,7 @@ from pyscf.pbc.lib.kpts import KPoints
 from pyscf.pbc.df import ft_ao
 from gpu4pyscf.pbc.tools.k2gamma import kpts_to_kmesh
 from gpu4pyscf.pbc.tools.pbc import get_coulG
+from gpu4pyscf.pbc.tools import stc
 from gpu4pyscf.pbc.gto.cell import get_Gv, get_Gv_base, get_Gv_weights, get_SI
 from gpu4pyscf.pbc.df import aft_jk
 from gpu4pyscf.pbc.df.ft_ao import FTOpt
@@ -123,7 +124,11 @@ class AFTDF(lib.StreamObject):
 
     time_reversal_symmetry = True
 
-    _keys = aft_cpu.AFTDF._keys
+    _keys = aft_cpu.AFTDF._keys.union({'omega_dot_Rc'})
+
+    # omega_stc*Rc for the smooth truncated Coulomb exchange (exxdiv =
+    # smooth_vcut_sph or smooth_vcut_ws)
+    omega_dot_Rc = 4.
 
     def __init__(self, cell, kpts=None):
         self.cell = cell
@@ -174,12 +179,16 @@ class AFTDF(lib.StreamObject):
                 self.kpts = reset_kpts(self.kpts, cell)
             self.cell = cell
         self._rsh_df = {}
+        # Wigner-Seitz kernels cached by tools.get_coulG
+        self.__dict__.pop('_ws_exx', None)
+        self.__dict__.pop('_ws_lr_exx', None)
         return self
 
     pw_loop = NotImplemented
 
     def weighted_coulG(self, kpt=None, exx=None, mesh=None, omega=None,
-                       kpts=None, lr_factor=1, sr_factor=1):
+                       kpts=None, lr_factor=1, sr_factor=1, omega_stc=None,
+                       withSR=True):
         '''Weighted Coulomb kernel'''
         cell = self.cell
         if mesh is None:
@@ -187,10 +196,13 @@ class AFTDF(lib.StreamObject):
         if omega is None:
             omega = cell.omega
         Gv, Gvbase, kws = get_Gv_weights(cell, mesh)
+        # The truncated kernels cache the precomputed Wigner-Seitz kernel in self
+        mf = self if exx in stc.TRUNC_EXXDIV or exx in stc.STC_EXXDIV else None
+        kwargs = dict(mf=mf, mesh=mesh, Gv=Gv, wrap_around=True, kpts=kpts,
+                      omega_stc=omega_stc, withSR=withSR)
 
         if lr_factor == sr_factor:
-            coulG = get_coulG(cell, kpt, exx, mesh=mesh, Gv=Gv,
-                              wrap_around=True, omega=omega, kpts=kpts)
+            coulG = get_coulG(cell, kpt, exx, omega=omega, **kwargs)
             if lr_factor is not None and lr_factor != 1:
                 coulG *= kws * lr_factor
             else:
@@ -199,18 +211,14 @@ class AFTDF(lib.StreamObject):
 
         assert omega > 0
         if lr_factor == 0:
-            coulG = get_coulG(cell, kpt, exx, mesh=mesh, Gv=Gv,
-                              wrap_around=True, omega=-omega, kpts=kpts)
+            coulG = get_coulG(cell, kpt, exx, omega=-omega, **kwargs)
             coulG *= sr_factor * kws
-        if sr_factor == 0:
-            coulG = get_coulG(cell, kpt, exx, mesh=mesh, Gv=Gv,
-                              wrap_around=True, omega=omega, kpts=kpts)
+        elif sr_factor == 0:
+            coulG = get_coulG(cell, kpt, exx, omega=omega, **kwargs)
             coulG *= lr_factor * kws
         else:
-            coulG = get_coulG(cell, kpt, exx, mesh=mesh, Gv=Gv,
-                              wrap_around=True, omega=0., kpts=kpts)
-            coulG_LR = get_coulG(cell, kpt, exx, mesh=mesh, Gv=Gv,
-                                 wrap_around=True, omega=omega, kpts=kpts)
+            coulG = get_coulG(cell, kpt, exx, omega=0., **kwargs)
+            coulG_LR = get_coulG(cell, kpt, exx, omega=omega, **kwargs)
             coulG -= coulG_LR
             coulG *= sr_factor
             coulG += coulG_LR * lr_factor

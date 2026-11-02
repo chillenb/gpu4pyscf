@@ -43,6 +43,7 @@ from gpu4pyscf.df import df as mol_df
 from gpu4pyscf.pbc.df import rsdf_builder, df_jk, df_jk_real
 from gpu4pyscf.pbc.df.aft import _check_kpts, AFTDF
 from gpu4pyscf.pbc.tools.k2gamma import kpts_to_kmesh
+from gpu4pyscf.pbc.tools import stc
 from gpu4pyscf.pbc.lib.kpts_helper import (
     reset_kpts, fft_matrix, conj_images_in_bvk_cell)
 from gpu4pyscf.__config__ import num_devices
@@ -56,16 +57,29 @@ class GDF(lib.StreamObject):
     blockdim = df_cpu.GDF.blockdim
     is_gamma_point = False
 
-    _keys = df_cpu.GDF._keys.union({'is_gamma_point', 'nao', 'kmesh'})
+    _keys = df_cpu.GDF._keys.union({'is_gamma_point', 'nao', 'kmesh', 'omega_dot_Rc'})
+
+    # omega_stc*Rc for the smooth truncated Coulomb exchange (exxdiv =
+    # smooth_vcut_sph or smooth_vcut_ws)
+    omega_dot_Rc = 4.
 
     __getstate__, __setstate__ = lib.generate_pickle_methods(
-        excludes=('_cderi_to_save', '_cderi', '_cderip', '_cderi_idx', '_rsh_df'),
+        excludes=('_cderi_to_save', '_cderi', '_cderip', '_cderi_idx', '_rsh_df',
+                  '_with_df_j', '_stc'),
         reset_state=True)
 
     def __init__(self, cell, kpts=None):
         df_cpu.GDF.__init__(self, cell, kpts)
         self.nao = None
         self._omega = 0
+        # If exxdiv is smooth_vcut_sph or smooth_vcut_ws, the tensor is built
+        # with the smooth truncated Coulomb kernel for exchange. The Coulomb
+        # matrix is then computed with a separate tensor (_with_df_j).
+        self.exxdiv = None
+        self._stc = None
+        self._with_df_j = None
+        # Lower bound of the range-separation parameter of the builder
+        self._rsdf_omega_min = None
 
     # Some methods inherited from the molecule code tries to access the .mol attribute
     @property
@@ -99,6 +113,11 @@ class GDF(lib.StreamObject):
             self.auxcell = None
         self._cderi = self._cderip = self._cderi_idx = None
         self._rsh_df = {}
+        self._stc = None
+        self._with_df_j = None
+        # Wigner-Seitz kernels cached by tools.get_coulG
+        self.__dict__.pop('_ws_exx', None)
+        self.__dict__.pop('_ws_lr_exx', None)
         return self
 
     auxbasis = df_cpu.GDF.auxbasis
@@ -114,6 +133,8 @@ class GDF(lib.StreamObject):
         log.info('exp_to_discard = %s', self.exp_to_discard)
         #log.info('len(kpts) = %d', len(self.kpts))
         log.info('is_gamma_point = %s', self.is_gamma_point)
+        if self.exxdiv in stc.STC_EXXDIV:
+            log.info('exxdiv = %s, omega_dot_Rc = %s', self.exxdiv, self.omega_dot_Rc)
         return self
 
     def build(self, j_only=None, kpts_band=None):
@@ -142,15 +163,57 @@ class GDF(lib.StreamObject):
         else:
             self.kmesh = kpts_to_kmesh(cell, kpts, bound_by_supmol=not self._j_only)
 
+        stc_kernel = None
+        if self.exxdiv in stc.STC_EXXDIV and not self._j_only:
+            if self._omega != 0:
+                raise NotImplementedError(
+                    f'GDF with exxdiv={self.exxdiv} for cell.omega={self._omega}')
+            stc_kernel = stc.STCKernel(cell, self._full_kpts(), self.exxdiv, mf=self)
+            logger.info(self, 'GDF tensor with the smooth truncated Coulomb kernel, '
+                        'omega_stc = %g', stc_kernel.omega_stc)
+
+        int3c2e_opt = None
+        if self._rsdf_omega_min is not None:
+            kmesh = [1] * 3 if is_zero(self._full_kpts()) else self.kmesh
+            rsdf_omega = max(abs(self._omega), rsdf_builder._guess_omega(cell, kmesh),
+                             self._rsdf_omega_min)
+            int3c2e_opt = rsdf_builder.SRInt3c2eOpt(
+                cell, auxcell, omega=rsdf_omega, bvk_kmesh=kmesh).build(separate_dd=True)
+
         t1 = (logger.process_clock(), logger.perf_counter())
         self._cderi, self._cderip, self._cderi_idx = rsdf_builder.build_cderi(
             cell, auxcell, kpts, self.kmesh, j_only=self._j_only, omega=self._omega,
-            linear_dep_threshold=self.linear_dep_threshold, compress=True)
+            linear_dep_threshold=self.linear_dep_threshold, compress=True,
+            int3c2e_opt=int3c2e_opt, stc=stc_kernel)
+        self._stc = stc_kernel
         ao_pair_mapping, diag_idx = self._cderi_idx
         logger.debug1(self, 'len(cderi)=%d len(ao_pair)=%d len(diag)=%d',
                       len(self._cderi), len(ao_pair_mapping), len(diag_idx))
         t1 = logger.timer_debug1(self, 'j3c', *t1)
         return self
+
+    def _full_kpts(self):
+        kpts = self.kpts
+        if self.is_gamma_point or kpts is None:
+            return np.zeros((1, 3))
+        return np.asarray(getattr(kpts, 'kpts', kpts)).reshape(-1, 3)
+
+    def _get_df_j(self):
+        '''The GDF object of the full-range Coulomb tensor, for the Coulomb
+        matrix when the tensor of this object is built with the smooth truncated
+        Coulomb kernel.'''
+        if self._with_df_j is None:
+            dfj = self.copy()
+            dfj.exxdiv = None
+            dfj._rsh_df = {}
+            # The Coulomb matrix does not depend on the range-separation
+            # parameter. A large one (as used for the smooth truncated
+            # kernel) reduces the cost of the short-range lattice sums.
+            if self._stc is not None:
+                dfj._rsdf_omega_min = self._stc.omega_stc
+            dfj.build(j_only=True)
+            self._with_df_j = dfj
+        return self._with_df_j
 
     has_kpts = df_cpu.GDF.has_kpts
     weighted_coulG = AFTDF.weighted_coulG
@@ -234,15 +297,31 @@ class GDF(lib.StreamObject):
     # post-HF methods.
     def get_jk(self, dm, hermi=1, kpts=None, kpts_band=None,
                with_j=True, with_k=True, omega=None, exxdiv=None):
+        is_stc = exxdiv in stc.STC_EXXDIV
         if omega is not None and omega != 0:
             cell = self.cell
             if omega > 0:
-                mydf = AFTDF(cell, self.kpts)
-                ke_cutoff = estimate_ke_cutoff_for_omega(cell, omega)
-                mydf.mesh = cell.cutoff_to_mesh(ke_cutoff)
+                # The AFTDF object is cached so that the precomputed
+                # Wigner-Seitz kernels can be reused
+                key = 'aft%.6f%s' % (omega, exxdiv if is_stc else '')
+                mydf = self._rsh_df.get(key)
+                if mydf is None:
+                    mydf = AFTDF(cell, self.kpts)
+                    mydf.omega_dot_Rc = self.omega_dot_Rc
+                    mesh_omega = omega
+                    if is_stc:
+                        omega_stc = stc.get_omega_stc(
+                            cell, self._full_kpts(), exxdiv, self)
+                        mesh_omega = max(omega, omega_stc)
+                    ke_cutoff = estimate_ke_cutoff_for_omega(cell, mesh_omega)
+                    mydf.mesh = cell.cutoff_to_mesh(ke_cutoff)
+                    self._rsh_df[key] = mydf
                 return mydf.get_jk(dm, hermi, kpts, kpts_band, with_j, with_k,
                                    omega=omega, exxdiv=exxdiv)
 
+            if is_stc and with_k:
+                raise NotImplementedError(
+                    f'Short-range exchange with GDF for exxdiv={exxdiv}')
             with self.range_coulomb(omega) as rsh_df:
                 if rsh_df._cderi is None:
                     rsh_df.build(j_only=not with_k)
@@ -250,6 +329,38 @@ class GDF(lib.StreamObject):
                 return rsh_df.get_jk(dm, hermi, kpts, kpts_band, with_j, with_k,
                                      omega=None, exxdiv=exxdiv)
 
+        if with_k and is_stc:
+            if (self._cderi is None or self._stc is None or
+                self._stc.exxdiv != exxdiv):
+                dfj = None
+                if self._cderi is not None and self._stc is None:
+                    # The existing full-range Coulomb tensor (e.g. built by an
+                    # earlier get_j call) is kept for the Coulomb matrix
+                    dfj = self.copy()
+                    dfj.exxdiv = None
+                    dfj._rsh_df = {}
+                elif self._cderi is not None:
+                    logger.warn(self, 'Rebuild the GDF tensor for exxdiv=%s', exxdiv)
+                self.exxdiv = exxdiv
+                self.build(j_only=False)
+                if dfj is not None:
+                    self._with_df_j = dfj
+            vk = self._get_jk(dm, hermi, kpts, kpts_band, False, True, exxdiv)[1]
+            vj = None
+            if with_j:
+                vj = self._get_df_j()._get_jk(dm, hermi, kpts, kpts_band, True, False, None)[0]
+            return vj, vk
+
+        if self._stc is not None:
+            if with_k:
+                raise RuntimeError(
+                    f'The GDF tensor was built for exxdiv={self._stc.exxdiv}. '
+                    f'Exchange for exxdiv={exxdiv} is not available.')
+            return self._get_df_j()._get_jk(dm, hermi, kpts, kpts_band, True, False, None)
+
+        return self._get_jk(dm, hermi, kpts, kpts_band, with_j, with_k, exxdiv)
+
+    def _get_jk(self, dm, hermi, kpts, kpts_band, with_j, with_k, exxdiv):
         if self.is_gamma_point:
             return df_jk_real.get_jk(self, dm, hermi, with_j, with_k, exxdiv)
         else:

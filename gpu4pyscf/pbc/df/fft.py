@@ -180,7 +180,11 @@ class FFTDF(lib.StreamObject):
     '''Density expansion on plane waves (GPW method)
     '''
 
-    _keys = fft_cpu.FFTDF._keys
+    _keys = fft_cpu.FFTDF._keys.union({'omega_dot_Rc'})
+
+    # omega_stc*Rc for the smooth truncated Coulomb exchange (exxdiv =
+    # smooth_vcut_sph or smooth_vcut_ws)
+    omega_dot_Rc = 4.
 
     def __init__(self, cell, kpts=None):
         from gpu4pyscf.pbc.dft import numint
@@ -244,6 +248,9 @@ class FFTDF(lib.StreamObject):
                 self.kpts = reset_kpts(self.kpts, cell)
             self.cell = cell
         self._rsh_df = {}
+        # Wigner-Seitz kernels cached by tools.get_coulG
+        self.__dict__.pop('_ws_exx', None)
+        self.__dict__.pop('_ws_lr_exx', None)
         return self
 
     weighted_coulG = aft.AFTDF.weighted_coulG

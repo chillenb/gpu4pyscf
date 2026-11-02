@@ -122,7 +122,8 @@ def _Gv_wrap_around(cell, Gv, k, mesh):
     return kG
 
 def get_coulG(cell, k=np.zeros(3), exx=False, mf=None, mesh=None, Gv=None,
-              wrap_around=True, omega=None, kpts=None, **kwargs):
+              wrap_around=True, omega=None, kpts=None, omega_stc=None,
+              withSR=True, **kwargs):
     '''Calculate the Coulomb kernel for all G-vectors, handling G=0 and exchange.
 
     Args:
@@ -131,6 +132,12 @@ def get_coulG(cell, k=np.zeros(3), exx=False, mf=None, mesh=None, Gv=None,
         exx : bool or str
             Whether this is an exchange matrix element
         mf : instance of :class:`SCF`
+            For the truncated kernels (exxdiv = vcut_sph, vcut_ws,
+            smooth_vcut_sph, smooth_vcut_ws), the DF object. It provides
+            omega_dot_Rc and caches the precomputed Wigner-Seitz kernels.
+        omega_stc, withSR :
+            Parameters of the smooth truncated kernels. See
+            :func:`gpu4pyscf.pbc.tools.stc.get_coulG`.
 
     Returns:
         coulG : (ngrids,) ndarray
@@ -149,14 +156,12 @@ def get_coulG(cell, k=np.zeros(3), exx=False, mf=None, mesh=None, Gv=None,
             range-separated JK builder and range-separated DF (and other
             range-separated integral methods if any).
     '''
-    from pyscf.pbc.tools.pbc import get_coulG
+    from gpu4pyscf.pbc.tools import stc
     exxdiv = exx
     if isinstance(exx, str):
         exxdiv = exx
     elif exx and mf is not None:
         exxdiv = mf.exxdiv
-    if exxdiv == 'vcut_sph' or exxdiv == 'vcut_ws':
-        return asarray(get_coulG(cell, k, exx, mf, mesh, Gv, wrap_around, omega, **kwargs))
 
     if mesh is None:
         mesh = cell.mesh
@@ -208,6 +213,19 @@ def get_coulG(cell, k=np.zeros(3), exx=False, mf=None, mesh=None, Gv=None,
 
     # absG2 = cp.einsum('gi,gi->g', kG, kG)
     absG2 = batched_vec_norm2(kG)
+
+    if exxdiv in stc.TRUNC_EXXDIV or exxdiv in stc.STC_EXXDIV:
+        if kpts is None:
+            if mf is not None and getattr(mf, 'kpts', None) is not None:
+                kpts = mf.kpts
+            elif k is not None:
+                kpts = k
+        kpts = getattr(kpts, 'kpts', kpts)  # KPoints
+        if isinstance(kpts, cp.ndarray):
+            kpts = kpts.get()
+        return stc.get_coulG(cell, kG, absG2, exxdiv, mf, kpts, _omega,
+                             omega_stc, withSR)
+
     G0_idx = 0
     if not is_gamma_point:
         G0_idx = None
