@@ -29,6 +29,23 @@ from gpu4pyscf.lib.cupy_helper import contract, unpack_tril
 from gpu4pyscf.pbc.df.fft_jk import _ewald_exxdiv_for_G0
 from gpu4pyscf.df import df_jk as mol_df_jk
 
+def check_exxdiv(mydf, exxdiv):
+    '''Exchange from the GDF tensor supports exxdiv=None, 'ewald', and the
+    smooth truncated Coulomb kernels if the tensor was built with them.'''
+    from gpu4pyscf.pbc.tools.stc import STC_EXXDIV
+    if exxdiv is None or exxdiv == 'ewald':
+        return
+    if exxdiv in STC_EXXDIV:
+        stc = getattr(mydf, '_stc', None)
+        if stc is None or stc.exxdiv != exxdiv:
+            raise RuntimeError(f'The GDF tensor was not built for exxdiv={exxdiv}. '
+                               'Set mydf.exxdiv before building the GDF tensor.')
+        return
+    logger.warn(mydf, 'GDF does not support exxdiv %s. '
+                'exxdiv needs to be "ewald", None, "smooth_vcut_sph" or '
+                '"smooth_vcut_ws"', exxdiv)
+    raise RuntimeError('GDF does not support exxdiv %s' % exxdiv)
+
 # TOOD: refactor and reuse the molecule df functions
 
 def get_jk(mydf, dm, hermi=1, with_j=True, with_k=True, exxdiv=None):
@@ -41,6 +58,8 @@ def get_jk(mydf, dm, hermi=1, with_j=True, with_k=True, exxdiv=None):
         t0 = log.timer_debug1('Init get_jk', *t0)
     assert dm.dtype == np.float64
     assert with_j or with_k
+    if with_k:
+        check_exxdiv(mydf, exxdiv)
 
     out_shape = dm.shape
     nao = out_shape[-1]

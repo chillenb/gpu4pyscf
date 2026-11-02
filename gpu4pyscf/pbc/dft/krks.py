@@ -29,6 +29,7 @@ from gpu4pyscf.pbc.gto import int1e
 from gpu4pyscf.pbc.scf import khf
 from gpu4pyscf.pbc.scf.rsjk import PBCJKMatrixOpt
 from gpu4pyscf.pbc.scf.j_engine import PBCJMatrixOpt
+from gpu4pyscf.pbc.tools.stc import STC_EXXDIV
 from gpu4pyscf.pbc.dft import rks
 from gpu4pyscf.pbc.dft import multigrid
 
@@ -144,7 +145,10 @@ def _get_jk(mf, cell, dm, hermi, kpts, kpts_band=None, with_j=True,
             hyb = sr_factor
             vj, vk = mf.get_jk(cell, dm, hermi, kpts, kpts_band, with_j=with_j)
             vk *= hyb
-        elif lr_factor == 0: # LR=0, only SR exchange
+        # For the smooth truncated Coulomb exchange, SR-only exchange (e.g. HSE)
+        # is computed in the last branch as sr_factor*(K_full - K_LR), as in
+        # pyscf. The short-range kernels are not available with GDF.
+        elif lr_factor == 0 and mf.exxdiv not in STC_EXXDIV: # LR=0, only SR exchange
             if with_j:
                 vj = mf.get_j(cell, dm, hermi, kpts, kpts_band)
             vk = mf.get_k(cell, dm, hermi, kpts, kpts_band, omega=-omega)

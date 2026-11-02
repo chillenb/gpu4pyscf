@@ -153,6 +153,7 @@ class SCF(mol_hf.SCF):
 
     def check_sanity(self):
         if (isinstance(self.exxdiv, str) and self.exxdiv.lower() != 'ewald' and
+            self.exxdiv not in ('smooth_vcut_sph', 'smooth_vcut_ws') and
             isinstance(self.with_df, df.DF)):
             logger.warn(self, 'exxdiv %s is not supported in DF', self.exxdiv)
 
