@@ -79,6 +79,27 @@ void gto_cartesian(double values[], double fx, double fy, double fz)
         values[12] = yy * zz;
         values[13] = fy * zzz;
         values[14] = fz * zzz;
+    } else {
+        // Generic lexical order, used for ANG >= 5
+        double px[ANG+1];
+        double py[ANG+1];
+        double pz[ANG+1];
+        px[0] = 1.;
+        py[0] = 1.;
+        pz[0] = 1.;
+#pragma unroll
+        for (int i = 0; i < ANG; ++i) {
+            px[i+1] = px[i] * fx;
+            py[i+1] = py[i] * fy;
+            pz[i+1] = pz[i] * fz;
+        }
+#pragma unroll
+        for (int i = 0, lx = ANG; lx >= 0; lx--) {
+#pragma unroll
+            for (int ly = ANG - lx; ly >= 0; ly--, i++) {
+                values[i] = px[lx] * py[ly] * pz[ANG-lx-ly];
+            }
+        }
     }
 }
 
@@ -361,6 +382,38 @@ void gto_deriv1(double gradient_values[], double original_values[],
         gradient_values[44] =
             4 * fz * fz * fz +
             minus_2afz * original_values[14]; // d/dz(zzzz) - 2*exponent*zzzz*fz
+    } else {
+        // Generic lexical order, used for ANG >= 5.
+        // d/dx(x^l exp(-a r^2)) / exp(-a r^2) = l x^(l-1) - 2a x^(l+1)
+        constexpr int nf = (ANG+1)*(ANG+2)/2;
+        double px[ANG+2];
+        double py[ANG+2];
+        double pz[ANG+2];
+        px[0] = 1.;
+        py[0] = 1.;
+        pz[0] = 1.;
+#pragma unroll
+        for (int i = 0; i < ANG+1; ++i) {
+            px[i+1] = px[i] * fx;
+            py[i+1] = py[i] * fy;
+            pz[i+1] = pz[i] * fz;
+        }
+#pragma unroll
+        for (int i = 0, lx = ANG; lx >= 0; lx--) {
+#pragma unroll
+            for (int ly = ANG - lx; ly >= 0; ly--, i++) {
+                int lz = ANG - lx - ly;
+                double dx = a2 * px[lx+1];
+                double dy = a2 * py[ly+1];
+                double dz = a2 * pz[lz+1];
+                if (lx > 0) dx += lx * px[lx-1];
+                if (ly > 0) dy += ly * py[ly-1];
+                if (lz > 0) dz += lz * pz[lz-1];
+                gradient_values[i       ] = dx * py[ly] * pz[lz];
+                gradient_values[i + nf  ] = px[lx] * dy * pz[lz];
+                gradient_values[i + nf*2] = px[lx] * py[ly] * dz;
+            }
+        }
     }
 }
 
@@ -608,6 +661,49 @@ void gto_deriv2(double output[], double x, double y, double z, double exponent)
         output[88] = y*z*(aa2*z4 - 7*aa*z2 + 6);
         output[89] = z2*(aa2*z4 - 9*aa*z2 + 12);
     } else {
-        output[0] = NAN;
+        // Generic lexical order, used for ANG >= 5. With aa = 2a,
+        // d/dx(x^l exp(-a r^2)) / exp(-a r^2) = l x^(l-1) - aa x^(l+1)
+        // d2/dx2(x^l exp(-a r^2)) / exp(-a r^2) = l(l-1) x^(l-2) - aa(2l+1) x^l + aa^2 x^(l+2)
+        constexpr int nf = (ANG+1)*(ANG+2)/2;
+        double px[ANG+3];
+        double py[ANG+3];
+        double pz[ANG+3];
+        px[0] = 1.;
+        py[0] = 1.;
+        pz[0] = 1.;
+#pragma unroll
+        for (int i = 0; i < ANG+2; ++i) {
+            px[i+1] = px[i] * x;
+            py[i+1] = py[i] * y;
+            pz[i+1] = pz[i] * z;
+        }
+#pragma unroll
+        for (int i = 0, lx = ANG; lx >= 0; lx--) {
+#pragma unroll
+            for (int ly = ANG - lx; ly >= 0; ly--, i++) {
+                int lz = ANG - lx - ly;
+                double fx0 = px[lx];
+                double fy0 = py[ly];
+                double fz0 = pz[lz];
+                double fx1 = -aa * px[lx+1];
+                double fy1 = -aa * py[ly+1];
+                double fz1 = -aa * pz[lz+1];
+                if (lx > 0) fx1 += lx * px[lx-1];
+                if (ly > 0) fy1 += ly * py[ly-1];
+                if (lz > 0) fz1 += lz * pz[lz-1];
+                double fx2 = aa2 * px[lx+2] - aa * (2*lx+1) * fx0;
+                double fy2 = aa2 * py[ly+2] - aa * (2*ly+1) * fy0;
+                double fz2 = aa2 * pz[lz+2] - aa * (2*lz+1) * fz0;
+                if (lx > 1) fx2 += lx * (lx-1) * px[lx-2];
+                if (ly > 1) fy2 += ly * (ly-1) * py[ly-2];
+                if (lz > 1) fz2 += lz * (lz-1) * pz[lz-2];
+                output[i       ] = fx2 * fy0 * fz0;
+                output[i + nf  ] = fx1 * fy1 * fz0;
+                output[i + nf*2] = fx1 * fy0 * fz1;
+                output[i + nf*3] = fx0 * fy2 * fz0;
+                output[i + nf*4] = fx0 * fy1 * fz1;
+                output[i + nf*5] = fx0 * fy0 * fz2;
+            }
+        }
     }
 }

@@ -89,7 +89,7 @@ while (1) {
         jprim = bas[jsh*BAS_SLOTS+NPRIM_OF];
         kprim = bas[ksh*BAS_SLOTS+NPRIM_OF];
         nao = envs.ao_loc[envs.nbas];
-        gout_stride = gout_stride_lookup[lk*LMAX1*LMAX1+li*LMAX1+lj];
+        gout_stride = gout_stride_lookup[lk*PBC_LMAX1*PBC_LMAX1+li*PBC_LMAX1+lj];
         nst_per_block = THREADS / gout_stride;
     }
     __syncthreads();
@@ -356,7 +356,7 @@ while (1) {
         xjxi = rj[0] - xi;
         yjyi = rj[1] - yi;
         zjzi = rj[2] - zi;
-        gout_stride = gout_stride_lookup[lk*LMAX1*LMAX1+li*LMAX1+lj];
+        gout_stride = gout_stride_lookup[lk*PBC_LMAX1*PBC_LMAX1+li*PBC_LMAX1+lj];
         nst_per_block = THREADS / gout_stride;
     }
     __syncthreads();
