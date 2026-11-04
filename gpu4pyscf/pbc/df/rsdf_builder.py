@@ -62,9 +62,67 @@ PREFER_ED = True
 
 THREADS = 256
 
+def _omp_zero(ptr, size, dtype):
+    '''Zero `size` elements (float64 or complex128) of host memory at address
+    ptr with OpenMP threads (pyscf NPomp_dset0 / NPomp_zset0). ndarray.fill runs
+    on one thread.'''
+    from pyscf.lib.numpy_helper import _np_helper
+    dtype = np.dtype(dtype)
+    if dtype == np.complex128:
+        _np_helper.NPomp_zset0(ctypes.c_size_t(size), ctypes.c_void_p(ptr))
+    elif dtype == np.float64:
+        _np_helper.NPomp_dset0(ctypes.c_size_t(size), ctypes.c_void_p(ptr))
+    else:
+        raise TypeError(dtype)
+
+class MappedHostBuffer:
+    '''Reusable pinned, mapped host memory for the k-point GDF tensor.
+
+    Pinning host memory (cudaHostAlloc) runs on one CPU thread at a few GB/s,
+    and the tensor then has to be zeroed. A caller that builds many GDF tensors
+    of similar size (e.g. exchange in batches of q-vectors) can pass one buffer
+    to every build: the memory is pinned once, grown only when a larger tensor
+    is requested, and zeroed with OpenMP threads (pyscf NPomp_zset0).
+
+    The arrays returned by take() are views into the buffer. They are
+    invalidated by the next take() or reserve(); the caller must drop the GDF
+    tensor that uses them before the buffer is reused.
+    '''
+    def __init__(self, nbytes=0):
+        self._mem = None
+        self.nbytes = 0
+        if nbytes > 0:
+            self.reserve(nbytes)
+
+    def reserve(self, nbytes):
+        nbytes = int(nbytes)
+        if nbytes > self.nbytes:
+            self._mem = None  # release the old buffer before pinning a larger one
+            self._mem = cp.cuda.PinnedMemoryPointer(
+                cp.cuda.PinnedMemory(nbytes, cp.cuda.runtime.hostAllocMapped), 0)
+            self.nbytes = nbytes
+        return self
+
+    def take(self, shapes, dtype=np.complex128):
+        '''Zero-initialized arrays of the given shapes, laid out back to back'''
+        dtype = np.dtype(dtype)
+        sizes = [int(np.prod(shape)) * dtype.itemsize for shape in shapes]
+        total = sum(sizes)
+        self.reserve(total)
+        if total > 0:
+            _omp_zero(self._mem.ptr, total // dtype.itemsize, dtype)
+        out = []
+        offset = 0
+        for shape, size in zip(shapes, sizes):
+            out.append(np.ndarray(shape, dtype=dtype, buffer=self._mem,
+                                  offset=offset))
+            offset += size
+        return out
+
 def build_cderi(cell, auxcell, kpts=None, kmesh=None, j_only=False,
                 omega=None, linear_dep_threshold=LINEAR_DEP_THR,
-                compress=False, exclude_dd=False, int3c2e_opt=None, stc=None):
+                compress=False, exclude_dd=False, int3c2e_opt=None, stc=None,
+                host_buffer=None):
     '''
     Create density fitting integral tensor.
 
@@ -107,7 +165,7 @@ def build_cderi(cell, auxcell, kpts=None, kmesh=None, j_only=False,
             assert np.prod(kmesh) == len(kpts)
         cderi, cderip, cderi_idx = compressed_cderi_kk(
             cell, auxcell, kpts, kmesh, omega, linear_dep_threshold, exclude_dd,
-            int3c2e_opt, stc)
+            int3c2e_opt, stc, host_buffer)
     if compress:
         return cderi, cderip, cderi_idx
 
@@ -633,7 +691,7 @@ def compressed_cderi_j_only(cell, auxcell, kmesh, omega=None,
 
 def compressed_cderi_kk(cell, auxcell, kpts, kmesh=None, omega=None,
                         linear_dep_threshold=LINEAR_DEP_THR, exclude_dd=False,
-                        int3c2e_opt=None, stc=None):
+                        int3c2e_opt=None, stc=None, host_buffer=None):
     log = logger.new_logger(cell)
     t0 = log.init_timer()
 
@@ -730,10 +788,17 @@ def compressed_cderi_kk(cell, auxcell, kpts, kmesh=None, omega=None,
     log.info('Requires %.6g GB mapped memory on host',
              len(cd_j2c_cache)*naux_max*nao_pairs*16e-9)
     cderi = {}
-    for j2c_idx, (kp, kp_conj, ki_idx, kj_idx) in enumerate(kpt_iters):
-        naux = cd_j2c_cache[j2c_idx].shape[1]
-        cderi[kp] = empty_mapped((naux,nao_pairs), dtype=np.complex128)
-        cderi[kp].fill(0.)
+    if host_buffer is None:
+        for j2c_idx, (kp, kp_conj, ki_idx, kj_idx) in enumerate(kpt_iters):
+            naux = cd_j2c_cache[j2c_idx].shape[1]
+            cderi[kp] = empty_mapped((naux,nao_pairs), dtype=np.complex128)
+            _omp_zero(cderi[kp].ctypes.data, cderi[kp].size, cderi[kp].dtype)
+    else:
+        shapes = [(cd_j2c_cache[j2c_idx].shape[1], nao_pairs)
+                  for j2c_idx in range(len(kpt_iters))]
+        views = host_buffer.take(shapes, np.complex128)
+        for (kp, _, _, _), view in zip(kpt_iters, views):
+            cderi[kp] = view
 
     tasks = iter(range(len(ao_pair_counts)))
     def proc():

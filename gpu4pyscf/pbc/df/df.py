@@ -57,14 +57,15 @@ class GDF(lib.StreamObject):
     blockdim = df_cpu.GDF.blockdim
     is_gamma_point = False
 
-    _keys = df_cpu.GDF._keys.union({'is_gamma_point', 'nao', 'kmesh', 'omega_dot_Rc'})
+    _keys = df_cpu.GDF._keys.union({'is_gamma_point', 'nao', 'kmesh', 'omega_dot_Rc',
+                                    'host_buffer'})
 
     # omega_stc*Rc for the smooth truncated Coulomb exchange (exxdiv =
     # smooth_vcut_sph or smooth_vcut_ws)
     omega_dot_Rc = 4.
 
     __getstate__, __setstate__ = lib.generate_pickle_methods(
-        excludes=('_cderi_to_save', '_cderi', '_cderip', '_cderi_idx', '_rsh_df',
+        excludes=('_cderi_to_save', '_cderi', '_cderip', '_cderi_idx', '_rsh_df', 'host_buffer',
                   '_with_df_j', '_stc'),
         reset_state=True)
 
@@ -80,6 +81,9 @@ class GDF(lib.StreamObject):
         self._with_df_j = None
         # Lower bound of the range-separation parameter of the builder
         self._rsdf_omega_min = None
+        # Optional rsdf_builder.MappedHostBuffer that holds the k-point tensor
+        # (reused across builds instead of pinning new host memory each time)
+        self.host_buffer = None
 
     # Some methods inherited from the molecule code tries to access the .mol attribute
     @property
@@ -104,6 +108,13 @@ class GDF(lib.StreamObject):
             self._kpts = val
         else:
             self._kpts = self.cell.get_scaled_kpts(val)
+
+    def copy(self):
+        # A copy (e.g. the Coulomb or range-separated DF objects) must not
+        # build its tensor in the host buffer of this object
+        new = lib.StreamObject.copy(self)
+        new.host_buffer = None
+        return new
 
     def reset(self, cell=None):
         if cell is not None:
@@ -184,7 +195,7 @@ class GDF(lib.StreamObject):
         self._cderi, self._cderip, self._cderi_idx = rsdf_builder.build_cderi(
             cell, auxcell, kpts, self.kmesh, j_only=self._j_only, omega=self._omega,
             linear_dep_threshold=self.linear_dep_threshold, compress=True,
-            int3c2e_opt=int3c2e_opt, stc=stc_kernel)
+            int3c2e_opt=int3c2e_opt, stc=stc_kernel, host_buffer=self.host_buffer)
         self._stc = stc_kernel
         ao_pair_mapping, diag_idx = self._cderi_idx
         logger.debug1(self, 'len(cderi)=%d len(ao_pair)=%d len(diag)=%d',
