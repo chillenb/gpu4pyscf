@@ -147,29 +147,23 @@ def _weighted_coulG_kpts(cell, mesh, omega, rsdf_omega, kpts=None, stc=None):
         assert omega == 0
         return _weighted_stc_coulG_kpts(cell, mesh, rsdf_omega, kpts, stc)
     Gv, Gvbase, kws = cell.get_Gv_weights(mesh)
-    ngrids = len(Gv)
     assert Gv[0].dot(Gv[0]) == 0
     if kpts is None:
-        Gk = asarray(Gv)
-        nkpts = 1
-    else:
-        kpts = kpts.reshape(-1, 3)
-        Gk = asarray((Gv + kpts[:,None]).reshape(-1, 3))
-        # To ensure the symmetry between conjugated k-points, it is important to
-        # wrap around the high-freq Gv.
-        Gk = _Gv_wrap_around(cell, Gk, cp.zeros(3), mesh)
-        nkpts = len(kpts)
-    coulG = get_coulG(cell, Gv=Gk, omega=rsdf_omega).reshape(nkpts, ngrids)
-    if omega != 0:
-        coulG -= get_coulG(cell, Gv=Gk, omega=omega).reshape(nkpts, ngrids)
-    # Remove the G=0 component for sr_int3c2e as it is evaluated in the real space.
-    # Only the Gamma point has G=0 at index 0, and it need not be the first k-point.
-    if kpts is None:
-        coulG[0,0] -= np.pi / rsdf_omega**2
-    else:
-        for k, kpt in enumerate(kpts):
-            if is_zero(kpt):
-                coulG[k,0] -= np.pi / rsdf_omega**2
+        kpts = np.zeros((1, 3))
+    kpts = kpts.reshape(-1, 3)
+    Gv = asarray(Gv)
+    coulG = cp.empty((len(kpts), len(Gv)))
+    for k, kpt in enumerate(kpts):
+        # Each k-point is passed to get_coulG explicitly: with the default k=0,
+        # get_coulG zeroes element 0 as if it were G=0, which holds only when
+        # the first k-point is Gamma. get_coulG also wraps around the high-freq
+        # k+G vectors, which keeps conjugated k-points symmetric.
+        coulG[k] = get_coulG(cell, k=kpt, Gv=Gv, mesh=mesh, omega=rsdf_omega)
+        if omega != 0:
+            coulG[k] -= get_coulG(cell, k=kpt, Gv=Gv, mesh=mesh, omega=omega)
+        if is_zero(kpt):
+            # Remove the G=0 component for sr_int3c2e as it is evaluated in the real space
+            coulG[k,0] -= np.pi / rsdf_omega**2
     coulG *= kws
     return coulG
 
