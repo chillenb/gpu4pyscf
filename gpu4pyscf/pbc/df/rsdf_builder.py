@@ -162,8 +162,14 @@ def _weighted_coulG_kpts(cell, mesh, omega, rsdf_omega, kpts=None, stc=None):
     coulG = get_coulG(cell, Gv=Gk, omega=rsdf_omega).reshape(nkpts, ngrids)
     if omega != 0:
         coulG -= get_coulG(cell, Gv=Gk, omega=omega).reshape(nkpts, ngrids)
-    # Remove the G=0 component for sr_int3c2e as it is evaluated in the real space
-    coulG[0,0] -= np.pi / rsdf_omega**2
+    # Remove the G=0 component for sr_int3c2e as it is evaluated in the real space.
+    # Only the Gamma point has G=0 at index 0, and it need not be the first k-point.
+    if kpts is None:
+        coulG[0,0] -= np.pi / rsdf_omega**2
+    else:
+        for k, kpt in enumerate(kpts):
+            if is_zero(kpt):
+                coulG[k,0] -= np.pi / rsdf_omega**2
     coulG *= kws
     return coulG
 

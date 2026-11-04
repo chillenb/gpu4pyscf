@@ -244,9 +244,15 @@ class Int2c2eOpt:
             out = cell.apply_CT_mat_C(out)
         if kpts is None:
             out = out[0]
-        elif not is_zero(kpts):
-            expLk = cp.exp(1j*asarray(self.bvkmesh_Ls).dot(asarray(kpts).T))
+        elif not is_zero(kpts) or bvk_ncells > 1:
+            # A Gamma-only k-list still needs the lattice sum over the BvK
+            # cells (e.g. a subset of the k-conserving q-vectors that holds
+            # only q=0).
+            kpts = np.asarray(kpts)
+            expLk = cp.exp(1j*asarray(self.bvkmesh_Ls).dot(asarray(kpts.reshape(-1,3)).T))
             out = contract('lk,lpq->kpq', expLk, out)
+            if kpts.ndim == 1:
+                out = out[0]
         return out
 
     def int2c2e_ip1(self, kpts=None, sort_output=True,
