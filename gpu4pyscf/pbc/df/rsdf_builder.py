@@ -78,18 +78,25 @@ def _omp_zero(ptr, size, dtype):
 class MappedHostBuffer:
     '''Reusable pinned, mapped host memory for the k-point GDF tensor.
 
-    Pinning host memory (cudaHostAlloc) runs on one CPU thread at a few GB/s,
-    and the tensor then has to be zeroed. A caller that builds many GDF tensors
-    of similar size (e.g. exchange in batches of q-vectors) can pass one buffer
-    to every build: the memory is pinned once, grown only when a larger tensor
-    is requested, and zeroed with OpenMP threads (pyscf NPomp_zset0).
+    cudaHostAlloc faults in, zeroes and pins every page on one CPU thread
+    (~3.7 GB/s on an H200 node). Here the memory is allocated with pyscf's
+    lib.zeros, which first-touches (and zeroes) the pages with OpenMP threads,
+    and then page-locked and mapped with cudaHostRegister, which by itself is
+    fast (30 GB: 1.1 s in total vs 8.5 s for cudaHostAlloc + zeroing; same H2D
+    bandwidth). A caller that builds many GDF tensors of similar size (e.g.
+    exchange in batches of q-vectors) can pass one buffer to every build: it is
+    allocated once, grown only when a larger tensor is requested, and re-zeroed
+    with OpenMP threads (NPomp_zset0) when reused.
 
     The arrays returned by take() are views into the buffer. They are
-    invalidated by the next take() or reserve(); the caller must drop the GDF
-    tensor that uses them before the buffer is reused.
+    invalidated by the next take(), reserve() or free(); the caller must drop
+    the GDF tensor that uses them before the buffer is reused.
     '''
+    _cudaHostRegisterMapped = 2
+
     def __init__(self, nbytes=0):
-        self._mem = None
+        self._host = None
+        self._clean = False
         self.nbytes = 0
         if nbytes > 0:
             self.reserve(nbytes)
@@ -97,11 +104,26 @@ class MappedHostBuffer:
     def reserve(self, nbytes):
         nbytes = int(nbytes)
         if nbytes > self.nbytes:
-            self._mem = None  # release the old buffer before pinning a larger one
-            self._mem = cp.cuda.PinnedMemoryPointer(
-                cp.cuda.PinnedMemory(nbytes, cp.cuda.runtime.hostAllocMapped), 0)
-            self.nbytes = nbytes
+            self.free()  # release the old buffer before allocating a larger one
+            host = lib.zeros((nbytes + 15) // 16, dtype=np.complex128)
+            cp.cuda.runtime.hostRegister(host.ctypes.data, host.nbytes,
+                                         self._cudaHostRegisterMapped)
+            self._host = host
+            self._clean = True
+            self.nbytes = host.nbytes
         return self
+
+    def free(self):
+        if self._host is not None:
+            cp.cuda.runtime.hostUnregister(self._host.ctypes.data)
+            self._host = None
+            self.nbytes = 0
+
+    def __del__(self):
+        try:
+            self.free()
+        except Exception:
+            pass
 
     def take(self, shapes, dtype=np.complex128):
         '''Zero-initialized arrays of the given shapes, laid out back to back'''
@@ -109,12 +131,13 @@ class MappedHostBuffer:
         sizes = [int(np.prod(shape)) * dtype.itemsize for shape in shapes]
         total = sum(sizes)
         self.reserve(total)
-        if total > 0:
-            _omp_zero(self._mem.ptr, total // dtype.itemsize, dtype)
+        if total > 0 and not self._clean:
+            _omp_zero(self._host.ctypes.data, total // dtype.itemsize, dtype)
+        self._clean = False
         out = []
         offset = 0
         for shape, size in zip(shapes, sizes):
-            out.append(np.ndarray(shape, dtype=dtype, buffer=self._mem,
+            out.append(np.ndarray(shape, dtype=dtype, buffer=self._host,
                                   offset=offset))
             offset += size
         return out
