@@ -352,6 +352,9 @@ class _GrandCanonicalKSBase(lib.StreamObject):
     # Write scan points and chkfiles from a background thread while the GPU works on.
     async_io = getattr(__config__, 'pbc_dft_grand_canonical_async_io', True)
     # Diagonalize one k of each (k, -k) pair (k-point sets closed under inversion).
+    # N-scans: start each point from H linearly extrapolated in N through the two
+    # previous converged points (0 starts from the previous point's H).
+    scan_extrapolate = getattr(__config__, 'pbc_dft_grand_canonical_scan_extrapolate', 0)
     time_reversal_eigh = getattr(
         __config__, 'pbc_dft_grand_canonical_time_reversal_eigh', True)
     # Scan h5: keep only MOs with occupation >= this (None keeps every MO).  The
@@ -361,7 +364,7 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         __config__, 'pbc_dft_grand_canonical_scan_mo_occ_threshold', None)
 
     _keys = {
-        'async_io', 'scan_mo_occ_threshold', 'time_reversal_eigh',
+        'async_io', 'scan_mo_occ_threshold', 'time_reversal_eigh', 'scan_extrapolate',
         'mf', 'mu', 'sigma', 'nelec', 'max_cycle', 'max_outer_cycle',
         'conv_tol', 'conv_tol_coarse', 'conv_tol_mu',
         'nlcg_initial_step', 'nlcg_max_line_search_evaluations',
@@ -1442,6 +1445,17 @@ class _GrandCanonicalKSBase(lib.StreamObject):
             _write_scan_point, csv_path, h5_path, columns, dict(record), data,
             self.scan_mo_occ_threshold, label='scan point %d' % record['index'])
 
+    def _extrapolate_h(self, history, nelec):
+        '''Starting Hamiltonian for the next N-scan point: linear extrapolation in N
+        through the converged Hamiltonians of the two previous points.'''
+        (n0, h0), (n1, h1) = history
+        if abs(n1 - n0) < 1e-12:
+            return self._copy(h1)
+        t = (nelec - n1) / (n1 - n0)
+        logger.debug(self, 'N-scan start: extrapolating H from N = %g, %g (t = %g)',
+                     n0, n1, t)
+        return [x1 + t * (x1 - x0) for x0, x1 in zip(h0, h1)]
+
     def nelec_scan(self, nelecs, output_prefix, dm0=None,
                    nelec_scan_h5=None):
         self.build()
@@ -1465,6 +1479,7 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         records = []
         last_cycle_data = None
         last_converged = False
+        history = []      # (nelec, h) of the last converged, chained points
         columns = {
             'index': np.int64,
             'requested_nelec': np.float64,
@@ -1497,6 +1512,9 @@ class _GrandCanonicalKSBase(lib.StreamObject):
                         abs(nearest['nelec']-nelec) <
                         abs(last_cycle_data.nelec-nelec)):
                     h = self._initial_h(nearest['dm'])[0]
+                    history = []
+            if self.scan_extrapolate and len(history) >= 2:
+                h = self._extrapolate_h(history[-2:], nelec)
             fixed_n_calc = self.start_fixed_n_calc(h, nelec)
             self.fixed_n_subproblem(fixed_n_calc, self.conv_tol)
             cycle_data = fixed_n_calc.cycle_data
@@ -1522,6 +1540,10 @@ class _GrandCanonicalKSBase(lib.StreamObject):
                 csv_path, h5_path, columns, record, cycle_data)
 
             h = self._copy(cycle_data.h)
+            if fixed_n_calc.converged:
+                history = (history + [(float(nelec), h)])[-2:]
+            else:
+                history = []
             last_cycle_data = cycle_data
             last_converged = fixed_n_calc.converged
 
