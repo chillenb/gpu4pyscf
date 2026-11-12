@@ -351,6 +351,9 @@ class _GrandCanonicalKSBase(lib.StreamObject):
     callback = None
     # Write scan points and chkfiles from a background thread while the GPU works on.
     async_io = getattr(__config__, 'pbc_dft_grand_canonical_async_io', True)
+    # Diagonalize one k of each (k, -k) pair (k-point sets closed under inversion).
+    time_reversal_eigh = getattr(
+        __config__, 'pbc_dft_grand_canonical_time_reversal_eigh', True)
     # Scan h5: keep only MOs with occupation >= this (None keeps every MO).  The
     # density, hence every restart/seed, is unchanged by dropping MOs with
     # occupation below ~1e-18.
@@ -358,7 +361,7 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         __config__, 'pbc_dft_grand_canonical_scan_mo_occ_threshold', None)
 
     _keys = {
-        'async_io', 'scan_mo_occ_threshold',
+        'async_io', 'scan_mo_occ_threshold', 'time_reversal_eigh',
         'mf', 'mu', 'sigma', 'nelec', 'max_cycle', 'max_outer_cycle',
         'conv_tol', 'conv_tol_coarse', 'conv_tol_mu',
         'nlcg_initial_step', 'nlcg_max_line_search_evaluations',
@@ -618,6 +621,14 @@ class _GrandCanonicalKSBase(lib.StreamObject):
             raise ValueError('overlap, hcore, and k-point counts differ')
         x = self.mf.check_linear_dependency(_stack_or_list(s_ao))
         x_ao2orth = coerce_to_list_of_matrices(x, 'orthogonalizers')
+        # With X(-k) = X(k)* the orthogonal-basis Hamiltonian obeys H(-k) = H(k)*
+        # whenever the density does (see _time_reversal), so only one k of each
+        # (k, -k) pair needs an eigendecomposition.
+        self._x_time_reversal = bool(self.time_reversal_eigh and
+                                     self._kinv is not None)
+        if self._x_time_reversal:
+            x_ao2orth = [x_ao2orth[j].conj() if j < k else x_ao2orth[k]
+                         for k, j in enumerate(self._kinv)]
         if len(x_ao2orth) != self.nkpts:
             raise ValueError('orthogonalizer and k-point counts differ')
 
@@ -792,13 +803,37 @@ class _GrandCanonicalKSBase(lib.StreamObject):
                 all(n == self.north[0] for n in self.north):
             if not bool(cp.isfinite(stack).all().item()):
                 raise FloatingPointError('Hamiltonian contains nonfinite values')
-            return list(0.5 * (stack + _ht(stack)))
-        for k, x in enumerate(h):
-            if x.shape != (self.north[k], self.north[k]):
-                raise ValueError('invalid Hamiltonian shape at block %d' % k)
-            if not bool(cp.all(cp.isfinite(x)).item()):
-                raise FloatingPointError('Hamiltonian contains nonfinite values')
-        return self._hermi(h)
+            h = list(0.5 * (stack + _ht(stack)))
+        else:
+            for k, x in enumerate(h):
+                if x.shape != (self.north[k], self.north[k]):
+                    raise ValueError('invalid Hamiltonian shape at block %d' % k)
+                if not bool(cp.all(cp.isfinite(x)).item()):
+                    raise FloatingPointError('Hamiltonian contains nonfinite values')
+            h = self._hermi(h)
+        if getattr(self, '_x_time_reversal', False):
+            h = self._time_reversal(h)
+        return h
+
+    def _eigh_h(self, h):
+        '''Eigenpairs of the sanitized orthogonal-basis Hamiltonian blocks.  With
+        time-reversal symmetry only one k of each (k, -k) pair is diagonalized; the
+        partner gets the same eigenvalues and conjugated eigenvectors.'''
+        if not getattr(self, '_x_time_reversal', False):
+            return _eigh_blocks(h)
+        nk = self.nkpts
+        partner = [s*nk + int(self._kinv[k]) for s in range(self.nspin) for k in range(nk)]
+        reps = [b for b in range(self.nblocks) if partner[b] >= b]
+        w, v = _eigh_blocks([h[b] for b in reps])
+        eig = [None] * self.nblocks
+        coeff = [None] * self.nblocks
+        for b, wb, vb in zip(reps, w, v):
+            eig[b], coeff[b] = wb, vb
+        for b in range(self.nblocks):
+            if eig[b] is None:
+                eig[b] = eig[partner[b]]
+                coeff[b] = coeff[partner[b]].conj()
+        return eig, coeff
 
     def _x_stack(self):
         '''x_ao2orth as one (nblocks, nao, north) stack, or None if north varies.'''
@@ -995,7 +1030,7 @@ class _GrandCanonicalKSBase(lib.StreamObject):
             raise TypeError('specify exactly one of nelec and mu')
         self.nfev += 1
         h = self._sanitize_h(h)
-        eig, coeff = _eigh_blocks(h)
+        eig, coeff = self._eigh_h(h)
         mu = self._solve_mu(eig, nelec) if nelec is not None else mu
 
         x_stack = self._x_stack()
