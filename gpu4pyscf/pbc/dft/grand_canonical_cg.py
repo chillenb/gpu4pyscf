@@ -664,7 +664,7 @@ def fixed_mu_diis_inner(self, dm0=None, h=None, dump_chk=True):
             state.nelec, self._spin_info(state))
 
         if dump_chk and self.chkfile:
-            self.dump_chk(self._chk_envs(state))
+            self._dump_chk_async(state)
 
     converged = state.residual_rms <= self.conv_tol
     self.message = ('converged fixed-mu gradient DIIS' if converged else
@@ -679,4 +679,5 @@ def fixed_mu_diis(self, dm0=None, h=None):
     self.nfev = 0
     self.refinements = 0
     state, converged = self.fixed_mu_diis_inner(dm0=dm0, h=h, dump_chk=True)
+    self._flush_chk()
     return self._finalize(state, converged)

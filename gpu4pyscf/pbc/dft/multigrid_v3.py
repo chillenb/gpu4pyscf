@@ -1576,6 +1576,10 @@ def _vxc_to_reciprocal_space(vxc, out, Gv_bases=None, work=None):
     else:
         return out
 
+_imag_absmax = cp.ReductionKernel(
+    'T x', 'float64 y', 'fabs(x.imag())', 'max(a, b)', 'y = a', '0',
+    'gc_imag_absmax')
+
 def _wannier_transform_dm(ni, dm_kpts, kpts, hermi=1, xctype='LDA', out=None):
     ni._ensure_initialized(kpts, xctype)
 
@@ -1600,7 +1604,10 @@ def _wannier_transform_dm(ni, dm_kpts, kpts, hermi=1, xctype='LDA', out=None):
         else:
             expLk = fft_matrix(ni.kmesh)
         dm_sc = contract('nkpq,Lk->nLqp', dms, expLk)
-        assert absmax(dm_sc.imag) < cell.precision*5e2
+        # One fused pass over the contiguous complex array.  absmax(dm_sc.imag)
+        # reduced a strided view on cupy's slow path: ~60 ms per call for
+        # 196 k-points x 598 AOs.
+        assert _imag_absmax(dm_sc).item() < cell.precision*5e2
     dm_sc = cp.asarray(dm_sc.real, order='C')
 
     dm_sc = cell.apply_C_mat_CT(dm_sc.reshape(-1,nao,nao), out=out)

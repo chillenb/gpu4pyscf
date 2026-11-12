@@ -28,6 +28,7 @@ fixed (or controlled by mu) and the magnetization relaxes self-consistently.
 '''
 
 import csv
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -38,9 +39,9 @@ from scipy.special import expit
 
 from pyscf import __config__, lib
 from pyscf.scf import chkfile
-from pyscf.scf.addons import _fermi_smearing_occ, _smearing_optimize
 
 from gpu4pyscf.lib import diis, logger
+from gpu4pyscf.lib.cusolver import eigh_batched
 from gpu4pyscf.scf import hf as mol_hf
 from gpu4pyscf.pbc.dft.grand_canonical_cg import fixed_mu_diis, fixed_mu_diis_inner, nlcg
 
@@ -55,6 +56,105 @@ _HERMITICITY_TOL = getattr(
 # X^H S X when the overlap matrix is badly conditioned (see build()).
 _ORTHOGONALITY_TOL = getattr(
     __config__, 'pbc_dft_grand_canonical_orthogonality_tol', 1e-9)
+
+
+class _BackgroundWriter:
+    '''Run host-side file writes (h5py, csv) in a background thread.
+
+    h5py releases the GIL inside HDF5 reads and writes, so the thread that drives the
+    GPU keeps launching work while a scan point or chkfile goes to disk.  Callers move
+    every array to the host before submit().  At most one write is in flight: submit()
+    and wait() join the previous one and re-raise its exception.
+    '''
+    def __init__(self, enabled=True):
+        self.enabled = bool(enabled)
+        self._thread = None
+        self._error = None
+        self._label = None
+
+    def busy(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def wait(self):
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+        if self._error is not None:
+            error, self._error = self._error, None
+            raise RuntimeError('background write %s failed' % self._label) from error
+
+    def submit(self, fn, *args, label=''):
+        self.wait()
+        self._label = label
+        if not self.enabled:
+            fn(*args)
+            return
+
+        def run():
+            try:
+                fn(*args)
+            except BaseException as e:   # re-raised by the next wait()
+                self._error = e
+        self._thread = threading.Thread(target=run, name='gc-writer', daemon=False)
+        self._thread.start()
+
+
+def _eigh_blocks(blocks, vectors=True):
+    '''cupy.linalg.eigh (eigvalsh) of every Hermitian block, batched over blocks of
+    equal size.  Returns lists (w, v) or w, in block order.'''
+    groups = {}
+    for i, x in enumerate(blocks):
+        groups.setdefault((x.shape, x.dtype), []).append(i)
+    w = [None] * len(blocks)
+    v = [None] * len(blocks)
+    for idx in groups.values():
+        if len(idx) == 1:
+            x = blocks[idx[0]]
+            if vectors:
+                w[idx[0]], v[idx[0]] = cp.linalg.eigh(x)
+            else:
+                w[idx[0]] = cp.linalg.eigvalsh(x)
+            continue
+        out = eigh_batched(cp.stack([blocks[i] for i in idx]), vectors=vectors)
+        if vectors:
+            for j, i in enumerate(idx):
+                w[i], v[i] = out[0][j], out[1][j]
+        else:
+            for j, i in enumerate(idx):
+                w[i] = out[j]
+    return (w, v) if vectors else w
+
+
+def _write_scan_point(csv_path, h5_path, columns, record, data, occ_threshold):
+    '''Append one N/mu-scan point (host arrays only) to the scan h5, then its CSV row.'''
+    index = record['index']
+    with h5py.File(h5_path, 'a') as h5f:
+        point = h5f['points'].create_group(str(index))
+        for name, values in data.items():
+            group = point.create_group(name)
+            for k, value in enumerate(values):
+                group.create_dataset(str(k), data=value)
+        for name in columns:
+            dataset = h5f[name]
+            dataset.resize(index+1, axis=0)
+            dataset[index] = record[name]
+        if occ_threshold is not None:
+            h5f.attrs['mo_occ_threshold'] = occ_threshold
+        point.attrs['complete'] = True
+        h5f.attrs['completed_points'] = index+1
+        h5f.flush()
+    with open(csv_path, 'a', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writerow(record)
+        stream.flush()
+
+
+def _write_chk(chk_path, cell, kpts, envs):
+    '''mf.dump_chk of a periodic SCF, from host arrays.'''
+    chkfile.dump_scf(cell, chk_path, envs['e_tot'], envs['mo_energy'],
+                     envs['mo_coeff'], envs['mo_occ'], overwrite_mol=False)
+    with lib.H5FileWrap(chk_path, 'a') as fh5:
+        fh5['scf/kpts'] = kpts
 
 
 def _as_float(value, name='value'):
@@ -92,15 +192,35 @@ def _stack_or_list(values):
     return list(values)
 
 
+def _uniform_stack(blocks):
+    '''cp.stack(blocks) when every block has the same shape and dtype, else None.'''
+    if len(blocks) == 0:
+        return None
+    first = blocks[0]
+    if any(x.shape != first.shape or x.dtype != first.dtype for x in blocks):
+        return None
+    return cp.stack(blocks)
+
+
+def _ht(a):
+    '''Conjugate transpose of every matrix in a (..., n, m) stack.'''
+    return a.conj().swapaxes(-1, -2)
+
+
+def _concat_ravel(arrays):
+    return cp.concatenate([cp.asarray(x).ravel() for x in arrays])
+
+
 def _fermi_occ(gamma):
     return expit(-cp.asarray(gamma))
 
 
 def _fermi_entropy(occ):
-    occ = cp.asarray(occ)
-    f = occ[(occ>0) & (occ<1)]
-    entropy = -(f*cp.log(f) + (1-f)*cp.log(1-f)).sum()
-    return entropy
+    # cp.where instead of boolean indexing: no host sync for the mask size
+    f = cp.asarray(occ)
+    inside = (f > 0) & (f < 1)
+    g = cp.where(inside, f, 0.5)
+    return cp.where(inside, -(g*cp.log(g) + (1-g)*cp.log(1-g)), 0.).sum()
 
 
 class GCSolverCycle:
@@ -229,8 +349,16 @@ class _GrandCanonicalKSBase(lib.StreamObject):
     max_nelec_step_fraction = getattr(__config__, 'pbc_dft_grand_canonical_max_nelec_step_fraction', 0.1)
     root_nelec_tol = getattr(__config__, 'pbc_dft_grand_canonical_root_nelec_tol', 1e-8)
     callback = None
+    # Write scan points and chkfiles from a background thread while the GPU works on.
+    async_io = getattr(__config__, 'pbc_dft_grand_canonical_async_io', True)
+    # Scan h5: keep only MOs with occupation >= this (None keeps every MO).  The
+    # density, hence every restart/seed, is unchanged by dropping MOs with
+    # occupation below ~1e-18.
+    scan_mo_occ_threshold = getattr(
+        __config__, 'pbc_dft_grand_canonical_scan_mo_occ_threshold', None)
 
     _keys = {
+        'async_io', 'scan_mo_occ_threshold',
         'mf', 'mu', 'sigma', 'nelec', 'max_cycle', 'max_outer_cycle',
         'conv_tol', 'conv_tol_coarse', 'conv_tol_mu',
         'nlcg_initial_step', 'nlcg_max_line_search_evaluations',
@@ -297,6 +425,8 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         self._built = False
         self._cycle_data = None
         self._potential_cycle = None
+        self._writer = None
+        self._chk_pending = None
 
     def dump_flags(self, verbose=None):
         log = logger.new_logger(self, verbose)
@@ -393,6 +523,27 @@ class _GrandCanonicalKSBase(lib.StreamObject):
             self.mf.chkfile = self.chkfile
             self.mf.dump_chk(envs)
         return self
+
+    def _dump_chk_async(self, cycle_data, force=False):
+        '''Dump cycle_data to the chkfile from the background writer.  A dump requested
+        while the previous one is still being written is deferred (only the newest
+        deferred cycle is kept); _flush_chk(), at the end of kernel(), writes it.'''
+        if not self.chkfile:
+            return
+        writer = self._get_writer()
+        if not force and writer.busy():
+            self._chk_pending = cycle_data
+            return
+        self._chk_pending = None
+        self.mf.chkfile = self.chkfile
+        kpts = np.asarray(cp.asnumpy(cp.asarray(self.mf.kpts)), dtype=float)
+        writer.submit(_write_chk, self.chkfile, self.cell, kpts,
+                      self._chk_envs(cycle_data), label='chkfile')
+
+    def _flush_chk(self):
+        if self._chk_pending is not None:
+            self._dump_chk_async(self._chk_pending, force=True)
+        self.wait_io()
 
     def _chk_envs(self, cycle_data):
         '''Orbitals of cycle_data for dump_chk, padded to nao at every k-point
@@ -535,16 +686,26 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         return [x.copy() for x in blocks]
 
     def _hermi(self, blocks):
+        stack = _uniform_stack(blocks)
+        if stack is not None:
+            return list(0.5 * (stack + _ht(stack)))
         return [0.5 * (x + x.conj().T) for x in blocks]
 
     def _inner(self, a, b):
+        sa, sb = _uniform_stack(a), _uniform_stack(b)
+        if sa is not None and sb is not None and sa.shape == sb.shape:
+            return self.weight * float(cp.vdot(sa, sb).real.item())
         return self.weight * sum(float(cp.vdot(x, y).real.item()) for x, y in zip(a, b))
 
     def _rms(self, blocks):
         return max(0.0, self._inner(blocks, blocks) / self.ndof) ** 0.5
 
     def _trace_mean(self, blocks):
-        numerator = sum(float(cp.trace(x).real.item()) for x in blocks)
+        stack = _uniform_stack(blocks)
+        if stack is not None:
+            numerator = float(cp.trace(stack, axis1=1, axis2=2).real.sum().item())
+        else:
+            numerator = sum(float(cp.trace(x).real.item()) for x in blocks)
         return numerator / sum(x.shape[0] for x in blocks)
 
     def _blocks(self, values, name='matrices'):
@@ -596,6 +757,15 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         to the supercell then finds a large imaginary part.'''
         if self._kinv is None:
             return blocks
+        stack = _uniform_stack(blocks)
+        if stack is not None:
+            stack = stack.reshape((self.nspin, self.nkpts) + stack.shape[1:])
+            partner = stack[:, self._kinv].conj()
+            if self.verbose >= logger.DEBUG:
+                logger.debug(self, 'max |D(k) - D(-k)*| = %.3g',
+                             float(cp.abs(stack - partner).max().item()))
+            out = 0.5 * (stack + partner)
+            return list(out.reshape((-1,) + out.shape[2:]))
         out = []
         worst = 0.
         for sl in self._spin_slices():
@@ -617,6 +787,12 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         h = coerce_to_list_of_matrices(h, 'auxiliary Hamiltonian')
         if len(h) != self.nblocks:
             raise ValueError('Hamiltonian and block counts differ')
+        stack = _uniform_stack(h)
+        if stack is not None and stack.shape[1:] == (self.north[0],)*2 and \
+                all(n == self.north[0] for n in self.north):
+            if not bool(cp.isfinite(stack).all().item()):
+                raise FloatingPointError('Hamiltonian contains nonfinite values')
+            return list(0.5 * (stack + _ht(stack)))
         for k, x in enumerate(h):
             if x.shape != (self.north[k], self.north[k]):
                 raise ValueError('invalid Hamiltonian shape at block %d' % k)
@@ -624,8 +800,29 @@ class _GrandCanonicalKSBase(lib.StreamObject):
                 raise FloatingPointError('Hamiltonian contains nonfinite values')
         return self._hermi(h)
 
+    def _x_stack(self):
+        '''x_ao2orth as one (nblocks, nao, north) stack, or None if north varies.'''
+        if getattr(self, '_x_stack_cache', None) is None or \
+                self._x_stack_cache[0] is not self.x_ao2orth:
+            self._x_stack_cache = (self.x_ao2orth, _uniform_stack(self.x_ao2orth))
+        return self._x_stack_cache[1]
+
     def _to_orth(self, matrices):
         matrices = coerce_to_list_of_matrices(matrices, 'AO matrices')
+        a = _uniform_stack(matrices)
+        x = self._x_stack()
+        if a is not None and x is not None and a.shape[0] == x.shape[0]:
+            error = cp.abs(a - _ht(a)).max(axis=(1, 2))
+            scale = cp.maximum(1.0, cp.abs(a).max(axis=(1, 2)))
+            ratio = (error / scale).get()
+            if (ratio > _HERMITICITY_TOL).any():
+                k = int(ratio.argmax())
+                raise FloatingPointError(
+                    'Fock matrix at block %d is not Hermitian: '
+                    'max |F - F^H| / max |F| = %.3g' % (k, ratio[k]))
+            logger.debug1(self, 'max |F - F^H| / max |F| = %.3g', ratio.max())
+            value = cp.matmul(cp.matmul(_ht(x), a), x)
+            return list(0.5 * (value + _ht(value)))
         out = []
         worst = 0.
         for k, (a, x) in enumerate(zip(matrices, self.x_ao2orth)):
@@ -669,37 +866,73 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         return h, nelec
 
     def _solve_mu(self, orbital_energies, nelec):
-        mo_energy = np.concatenate([
-            cp.asnumpy(cp.asarray(x)).ravel() for x in orbital_energies])
-        nocc = nelec * self.nkpts / self.occ_scale
-        mu, _ = _smearing_optimize(
-            _fermi_smearing_occ, mo_energy, nocc, self.sigma)
-        mu = np.asarray(mu).reshape(-1)
-        if mu.size != 1:
-            raise ValueError('PySCF smearing returned a nonscalar mu')
-        mu = _as_float(mu[0], 'chemical potential')
+        '''Fermi level mu with nelec_from_eig(orbital_energies, mu) == nelec, on the GPU:
+        safeguarded Newton inside a sign-changing bracket, one host sync per step.'''
+        e = _concat_ravel(orbital_energies)
+        nocc = nelec / (self.occ_scale * self.weight)       # sum of occupations
+        if not 0 < nocc < e.size:
+            raise ValueError('nelec outside (0, capacity)')
+        beta = self.beta
+
+        def occ_sum(mu):
+            q = _fermi_occ(beta * (e - mu))
+            out = cp.stack([q.sum(), (q * (1 - q)).sum()]).get()
+            return out[0] - nocc, out[1] * beta
+
+        # Bracket from the sorted spectrum: the nocc-th level +- 40 sigma (widened if
+        # the smearing tails need it), else the whole spectrum +- 10 Ha.
+        es = cp.sort(e)
+        k = int(nocc)
+        lo = float(es[max(k - 1, 0)].item()) - 40. / beta
+        hi = float(es[min(k, e.size - 1)].item()) + 40. / beta
+        f_lo, f_hi = occ_sum(lo)[0], occ_sum(hi)[0]
+        if not (f_lo <= 0 <= f_hi):
+            lo, hi = float(es[0].item()) - 10., float(es[-1].item()) + 10.
+            f_lo, f_hi = occ_sum(lo)[0], occ_sum(hi)[0]
+        if f_lo == 0:
+            return self._check_mu(orbital_energies, nelec, lo)
+        if f_hi == 0:
+            return self._check_mu(orbital_energies, nelec, hi)
+        mu = 0.5 * (lo + hi)
+        tol = 1e-13 * max(1.0, nocc)
+        best = (np.inf, mu)
+        for _ in range(200):
+            f, df = occ_sum(mu)
+            if abs(f) < best[0]:
+                best = (abs(f), mu)
+            if abs(f) <= tol:
+                break
+            if f < 0:
+                lo = mu
+            else:
+                hi = mu
+            step = mu - f / df if df > 0 else np.nan
+            if lo < step < hi:
+                mu = step
+            else:
+                mu = 0.5 * (lo + hi)
+            if hi - lo <= 4 * np.spacing(max(abs(lo), abs(hi))):
+                break
+        return self._check_mu(orbital_energies, nelec, best[1])
+
+    def _check_mu(self, orbital_energies, nelec, mu):
+        mu = _as_float(mu, 'chemical potential')
         error = abs(self.nelec_from_eig(orbital_energies, mu) - nelec)
         if error > 1e-10:
             raise RuntimeError('chemical-potential solve has charge error %g' % error)
         return mu
 
     def nelec_from_eig(self, orbital_energies, mu):
-        return self.occ_scale * self.weight * sum(float(cp.sum(_fermi_occ(self.beta * (x - mu))).item()) for x in orbital_energies)
+        e = _concat_ravel(orbital_energies)
+        return self.occ_scale * self.weight * float(
+            cp.sum(_fermi_occ(self.beta * (e - mu))).item())
 
     def nelec_at_mu(self, h, mu):
-        return self.nelec_from_eig([cp.linalg.eigvalsh(x) for x in h], mu)
+        return self.nelec_from_eig(_eigh_blocks(h, vectors=False), mu)
 
-    def calculate_cycle(self, h, nelec=None, mu=None,
-                        align_fixed_n_gauge=True):
-        if (nelec is None) == (mu is None):
-            raise TypeError('specify exactly one of nelec and mu')
-        self.nfev += 1
-        h = self._sanitize_h(h)
-        eigenpairs = [cp.linalg.eigh(x) for x in h]
-        eig = [x[0] for x in eigenpairs]
-        coeff = [x[1] for x in eigenpairs]
-        mu = self._solve_mu(eig, nelec) if nelec is not None else mu
-
+    def _density_blocks(self, eig, coeff, mu, h):
+        '''Occupations, orthogonal and AO densities block by block (blocks of
+        different size).'''
         occ = []
         p = []
         dm = cp.empty((self.nblocks, self.nao, self.nao),
@@ -718,16 +951,62 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         p = self._hermi(p)
         dm_blocks = self._time_reversal(
             self._hermi([dm[k] for k in range(self.nblocks)]))
-        dm = self._from_blocks(dm_blocks)
 
         spin_nelec = tuple(
             self.occ_scale * self.weight *
             sum(float(cp.trace(x).real.item()) for x in p[sl])
             for sl in self._spin_slices())
-        electron_number = sum(spin_nelec)
         ao_nelec = self.weight * sum(
             _as_float(cp.einsum('ij,ji->', d, s), 'AO electron count') for d, s in zip(dm_blocks, self.s_ao)
         )
+        return occ, p, dm_blocks, entropy_sum, spin_nelec, ao_nelec
+
+    def _density_stacked(self, eig, coeff, mu, x_stack):
+        '''_density_blocks for equally sized blocks, as batched GPU operations with
+        a single host sync.'''
+        e = cp.stack(eig)
+        c = cp.stack(coeff)
+        q = _fermi_occ(self.beta * (e - mu))
+        p = cp.matmul(c * q[:, None, :], _ht(c))
+        p = 0.5 * (p + _ht(p))
+        dm = self.occ_scale * cp.matmul(cp.matmul(x_stack, p), _ht(x_stack))
+        dm = 0.5 * (dm + _ht(dm))
+        dm_blocks = self._time_reversal(list(dm))
+        s_stack = self._s_stack()
+        traces = cp.trace(p, axis1=1, axis2=2).real.reshape(self.nspin, self.nkpts).sum(axis=1)
+        ao = cp.einsum('kij,kji->', cp.stack(dm_blocks), s_stack)
+        scalars = cp.concatenate([traces.astype(cp.complex128), ao.reshape(1).astype(cp.complex128),
+                                  _fermi_entropy(q).reshape(1).astype(cp.complex128)]).get()
+        spin_nelec = tuple(self.occ_scale * self.weight * float(t.real)
+                           for t in scalars[:self.nspin])
+        ao_nelec = self.weight * _as_float(scalars[self.nspin], 'AO electron count')
+        entropy_sum = float(scalars[self.nspin + 1].real)
+        return list(q), list(p), dm_blocks, entropy_sum, spin_nelec, ao_nelec
+
+    def _s_stack(self):
+        if getattr(self, '_s_stack_cache', None) is None or \
+                self._s_stack_cache[0] is not self.s_ao:
+            self._s_stack_cache = (self.s_ao, cp.stack(self.s_ao))
+        return self._s_stack_cache[1]
+
+    def calculate_cycle(self, h, nelec=None, mu=None,
+                        align_fixed_n_gauge=True):
+        if (nelec is None) == (mu is None):
+            raise TypeError('specify exactly one of nelec and mu')
+        self.nfev += 1
+        h = self._sanitize_h(h)
+        eig, coeff = _eigh_blocks(h)
+        mu = self._solve_mu(eig, nelec) if nelec is not None else mu
+
+        x_stack = self._x_stack()
+        if x_stack is not None and len(set(c.shape for c in coeff)) == 1:
+            occ, p, dm_blocks, entropy_sum, spin_nelec, ao_nelec = \
+                self._density_stacked(eig, coeff, mu, x_stack)
+        else:
+            occ, p, dm_blocks, entropy_sum, spin_nelec, ao_nelec = \
+                self._density_blocks(eig, coeff, mu, h)
+        dm = self._from_blocks(dm_blocks)
+        electron_number = sum(spin_nelec)
         if abs(electron_number - ao_nelec) > 1e-8 * max(1.0, electron_number):
             raise ValueError('AO and orthogonal electron counts disagree')
 
@@ -881,7 +1160,7 @@ class _GrandCanonicalKSBase(lib.StreamObject):
             )
 
             if dump_chk and self.chkfile:
-                self.dump_chk(self._chk_envs(trial))
+                self._dump_chk_async(trial)
 
             if callable(self.callback):
                 self.callback({
@@ -1054,6 +1333,7 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         return best, False
 
     def _initialize_scan_output(self, output_prefix, columns):
+        self.wait_io()
         prefix = Path(output_prefix)
         csv_path = Path(str(prefix) + '.csv')
         h5_path = Path(str(prefix) + '.h5')
@@ -1089,33 +1369,43 @@ class _GrandCanonicalKSBase(lib.StreamObject):
             record['magnetization'] = cycle_data.magnetization
         return record
 
+    def _get_writer(self):
+        if self._writer is None or self._writer.enabled != bool(self.async_io):
+            if self._writer is not None:
+                self._writer.wait()
+            self._writer = _BackgroundWriter(self.async_io)
+        return self._writer
+
+    def wait_io(self):
+        '''Block until every background write (scan point, chkfile) is on disk.'''
+        if self._writer is not None:
+            self._writer.wait()
+        return self
+
+    def _scan_point_data(self, cycle_data):
+        '''Host copies of the orbitals of one scan point, optionally without the MOs
+        whose occupation is below scan_mo_occ_threshold.'''
+        threshold = self.scan_mo_occ_threshold
+        data = {'mo_coeff': [], 'mo_occ': [], 'mo_energy': []}
+        for x, c, q, e in zip(self.x_ao2orth, cycle_data.coeff, cycle_data.occ,
+                              cycle_data.eig):
+            occ = self.occ_scale*q
+            coeff = x.dot(c)
+            if threshold is not None:
+                # occupations are Fermi-ordered (ascending energy): keep a prefix
+                nkeep = max(1, int(cp.count_nonzero(occ >= threshold).item()))
+                coeff, occ, e = coeff[:, :nkeep], occ[:nkeep], e[:nkeep]
+            data['mo_coeff'].append(cp.asnumpy(coeff))
+            data['mo_occ'].append(cp.asnumpy(occ))
+            data['mo_energy'].append(cp.asnumpy(e))
+        return data
+
     def _append_scan_output(
             self, csv_path, h5_path, columns, record, cycle_data):
-        index = record['index']
-        with h5py.File(h5_path, 'a') as h5f:
-            point = h5f['points'].create_group(str(index))
-            data = {
-                'mo_coeff': [cp.asnumpy(x.dot(c)) for x, c in zip(
-                    self.x_ao2orth, cycle_data.coeff)],
-                'mo_occ': [cp.asnumpy(self.occ_scale*x)
-                           for x in cycle_data.occ],
-                'mo_energy': [cp.asnumpy(x) for x in cycle_data.eig],
-            }
-            for name, values in data.items():
-                group = point.create_group(name)
-                for k, value in enumerate(values):
-                    group.create_dataset(str(k), data=value)
-            for name in columns:
-                dataset = h5f[name]
-                dataset.resize(index+1, axis=0)
-                dataset[index] = record[name]
-            point.attrs['complete'] = True
-            h5f.attrs['completed_points'] = index+1
-            h5f.flush()
-        with csv_path.open('a', newline='') as stream:
-            writer = csv.DictWriter(stream, fieldnames=columns)
-            writer.writerow(record)
-            stream.flush()
+        data = self._scan_point_data(cycle_data)
+        self._get_writer().submit(
+            _write_scan_point, csv_path, h5_path, columns, dict(record), data,
+            self.scan_mo_occ_threshold, label='scan point %d' % record['index'])
 
     def nelec_scan(self, nelecs, output_prefix, dm0=None,
                    nelec_scan_h5=None):
@@ -1202,6 +1492,7 @@ class _GrandCanonicalKSBase(lib.StreamObject):
 
         self.nelec = nelecs[-1]
         self.message = records[-1]['message']
+        self.wait_io()
         self._finalize(last_cycle_data, last_converged)
 
         return records
@@ -1549,6 +1840,7 @@ class _GrandCanonicalKSBase(lib.StreamObject):
 
         self.nelec = None
         self.message = records[-1]['message']
+        self.wait_io()
         self._finalize(last_cycle_data, last_converged)
         return records
 
@@ -1643,6 +1935,8 @@ class _GrandCanonicalKSBase(lib.StreamObject):
             cycle_data, converged = fixed_n_calc.cycle_data, fixed_n_calc.converged
         logger.info(self, '%s; total Fock evaluations = %d',
                     self.message, self.nfev)
+        if dump_chk:
+            self._flush_chk()
         return self._finalize(cycle_data, converged)
 
     scf = kernel
