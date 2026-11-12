@@ -646,6 +646,20 @@ def _estimate_fft_Ecut_per_shell(cell, precision):
     Ecut = E2 * 2
     return Ecut
 
+def _bucket_mesh(a, ke_cutoff, mesh_max):
+    '''FFT mesh of an AFT/FFT bucket: ke_to_mesh rounded up to odd, capped at mesh_max.
+
+    An even sub-mesh m smaller than the full mesh n has a Nyquist plane at index m//2.
+    The AFT kernels (fftfreq, _get_Gv_bases) evaluate it at G = -m/2, while fft_take and
+    fft_takebak map index m//2 to +m/2 of the full mesh, and the +-m/2 partner is missing
+    either way, so the assembled rhoG is not Hermitian.  An odd box is symmetric and both
+    conventions agree on it.  A sub-mesh capped at an even mesh_max == n maps index m//2
+    onto itself, which is consistent.
+    '''
+    mesh = ke_to_mesh(a, ke_cutoff)
+    mesh = mesh + (1 - mesh % 2)
+    return np.minimum(mesh, mesh_max)
+
 def _partition_ke_for_aft(ni, pair_idx, pair_ke, init_ke, ke_max, xctype, log):
     cell = ni.sorted_cell
     bvkcell = ni.bvkcell
@@ -656,7 +670,7 @@ def _partition_ke_for_aft(ni, pair_idx, pair_ke, init_ke, ke_max, xctype, log):
 
     ke_upper = float(pair_ke.max().get())
     ke_upper = min(ke_upper, float(ke_max))
-    mesh = mesh_max = np.minimum(ke_to_mesh(a, ke_upper), ni.mesh)
+    mesh = mesh_max = _bucket_mesh(a, ke_upper, ni.mesh)
     ke_lower = ke_upper * 0.6
 
     buckets = []
@@ -690,8 +704,7 @@ def _partition_ke_for_aft(ni, pair_idx, pair_ke, init_ke, ke_max, xctype, log):
                       mesh, len(filtered_pairs))
 
         ke_lower, ke_upper = ke_lower*0.6, ke_lower
-        mesh = ke_to_mesh(a, ke_upper)
-        mesh = np.minimum(mesh, mesh_max)
+        mesh = _bucket_mesh(a, ke_upper, mesh_max)
     return buckets
 
 def _partition_ke_for_fft(ni, pair_idx, init_ke, ke_max, precision, xctype, log):
@@ -714,9 +727,8 @@ def _partition_ke_for_fft(ni, pair_idx, init_ke, ke_max, precision, xctype, log)
     atom_grid_ranges_kern = libmgrid.atom_grid_ranges
 
     ke_upper = float(pair_ke.max().get())
-    mesh = ke_to_mesh(a, ke_upper)
+    mesh = _bucket_mesh(a, ke_upper, mesh_final)
     log.debug1('Largest Ecut=%f mesh=%s', ke_upper, mesh)
-    mesh = np.minimum(mesh, mesh_final)
 
     # Some orbital pairs may require high Ecut, sometimes higher than ke_max.
     ke_lower = min(ke_upper, ke_max) * 0.7
@@ -821,8 +833,7 @@ def _partition_ke_for_fft(ni, pair_idx, init_ke, ke_max, precision, xctype, log)
         # mesh in each bucket. These sub-meshs are more stable in the high->low
         # scan order.
         ke_lower, ke_upper = ke_lower*0.7, ke_lower
-        mesh = ke_to_mesh(a, ke_upper)
-        mesh = np.minimum(mesh, mesh_final)
+        mesh = _bucket_mesh(a, ke_upper, mesh_final)
     return buckets
 
 def _non_trivial_bvk_pairs(ni, precision):
