@@ -33,6 +33,7 @@ from pathlib import Path
 
 import numpy as np
 import cupy as cp
+import cupyx
 import h5py
 from scipy.interpolate import PchipInterpolator
 from scipy.special import expit
@@ -125,8 +126,48 @@ def _eigh_blocks(blocks, vectors=True):
     return (w, v) if vectors else w
 
 
+class _DeviceData:
+    '''GPU arrays handed to the background writer: a dict of lists (or arrays) and an
+    event recorded on the producing stream once they are complete.  to_host() copies
+    them on a private stream into pinned memory, so the copy overlaps the GPU work the
+    main thread queues meanwhile.'''
+    def __init__(self, data):
+        self.data = data
+        self.device = cp.cuda.Device().id
+        self.event = cp.cuda.Event(disable_timing=True)
+        self.event.record()
+
+    def to_host(self):
+        with cp.cuda.Device(self.device):
+            stream = cp.cuda.Stream(non_blocking=True)
+            stream.wait_event(self.event)
+            out = {}
+            with stream:
+                for name, values in self.data.items():
+                    if isinstance(values, cp.ndarray):
+                        out[name] = self._get(values, stream)
+                    elif isinstance(values, (list, tuple)):
+                        out[name] = [self._get(v, stream) for v in values]
+                    else:
+                        out[name] = values
+            stream.synchronize()
+        self.data = None    # release the GPU arrays
+        return out
+
+    @staticmethod
+    def _get(a, stream):
+        if not isinstance(a, cp.ndarray):
+            return a
+        a = cp.ascontiguousarray(a) if not a.flags.c_contiguous else a
+        host = cupyx.empty_pinned(a.shape, a.dtype)
+        a.get(stream=stream, out=host, blocking=False)
+        return host
+
+
 def _write_scan_point(csv_path, h5_path, columns, record, data, occ_threshold):
-    '''Append one N/mu-scan point (host arrays only) to the scan h5, then its CSV row.'''
+    '''Append one N/mu-scan point to the scan h5, then its CSV row.'''
+    if isinstance(data, _DeviceData):
+        data = data.to_host()
     index = record['index']
     with h5py.File(h5_path, 'a') as h5f:
         point = h5f['points'].create_group(str(index))
@@ -150,7 +191,9 @@ def _write_scan_point(csv_path, h5_path, columns, record, data, occ_threshold):
 
 
 def _write_chk(chk_path, cell, kpts, envs):
-    '''mf.dump_chk of a periodic SCF, from host arrays.'''
+    '''mf.dump_chk of a periodic SCF.'''
+    if isinstance(envs, _DeviceData):
+        envs = envs.to_host()
     chkfile.dump_scf(cell, chk_path, envs['e_tot'], envs['mo_energy'],
                      envs['mo_coeff'], envs['mo_occ'], overwrite_mol=False)
     with lib.H5FileWrap(chk_path, 'a') as fh5:
@@ -530,6 +573,27 @@ class _GrandCanonicalKSBase(lib.StreamObject):
             self.mf.dump_chk(envs)
         return self
 
+    def _chk_envs_device(self, cycle_data):
+        mo_coeff = [x.dot(c) for x, c in zip(self.x_ao2orth, cycle_data.coeff)]
+        nblocks = len(mo_coeff)
+        coeff = cp.zeros((nblocks, self.nao, self.nao),
+                         dtype=cp.result_type(*mo_coeff))
+        energy = cp.empty((nblocks, self.nao))
+        occ = cp.zeros((nblocks, self.nao))
+        for k, (c, e, q) in enumerate(zip(mo_coeff, cycle_data.eig,
+                                          cycle_data.occ)):
+            nmo = e.size
+            coeff[k, :, :nmo] = c
+            energy[k, :nmo] = e
+            occ[k, :nmo] = self.occ_scale*q
+            if nmo < self.nao:
+                energy[k, nmo:] = abs(float(e.max().item())) * 2 + 1e5
+        shape = self._spin_kpts_shape
+        return {'e_tot': cycle_data.e_tot,
+                'mo_coeff': coeff.reshape(shape + coeff.shape[1:]),
+                'mo_occ': occ.reshape(shape + occ.shape[1:]),
+                'mo_energy': energy.reshape(shape + energy.shape[1:])}
+
     def _dump_chk_async(self, cycle_data, force=False):
         '''Dump cycle_data to the chkfile from the background writer.  A dump requested
         while the previous one is still being written is deferred (only the newest
@@ -544,18 +608,22 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         self.mf.chkfile = self.chkfile
         kpts = np.asarray(cp.asnumpy(cp.asarray(self.mf.kpts)), dtype=float)
         writer.submit(_write_chk, self.chkfile, self.cell, kpts,
-                      self._chk_envs(cycle_data), label='chkfile')
+                      _DeviceData(self._chk_envs(cycle_data, host=False)),
+                      label='chkfile')
 
     def _flush_chk(self):
         if self._chk_pending is not None:
             self._dump_chk_async(self._chk_pending, force=True)
         self.wait_io()
 
-    def _chk_envs(self, cycle_data):
+    def _chk_envs(self, cycle_data, host=True):
         '''Orbitals of cycle_data for dump_chk, padded to nao at every k-point
         the way KSCF.eig pads k-points that dropped linearly dependent AOs:
         zero coefficients, zero occupation, and a large orbital energy.
-        Arrays have shape (nkpts,...) for KRKS and (2,nkpts,...) for KUKS.'''
+        Arrays have shape (nkpts,...) for KRKS and (2,nkpts,...) for KUKS.
+        host=False builds them on the GPU (for the background writer).'''
+        if not host:
+            return self._chk_envs_device(cycle_data)
         mo_coeff = [cp.asnumpy(x.dot(c))
                     for x, c in zip(self.x_ao2orth, cycle_data.coeff)]
         nblocks = len(mo_coeff)
@@ -1423,22 +1491,21 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         return self
 
     def _scan_point_data(self, cycle_data):
-        '''Host copies of the orbitals of one scan point, optionally without the MOs
-        whose occupation is below scan_mo_occ_threshold.'''
+        '''Orbitals of one scan point as GPU arrays (copied to the host by the
+        writer thread), optionally without the MOs whose occupation is below
+        scan_mo_occ_threshold.'''
         threshold = self.scan_mo_occ_threshold
-        data = {'mo_coeff': [], 'mo_occ': [], 'mo_energy': []}
-        for x, c, q, e in zip(self.x_ao2orth, cycle_data.coeff, cycle_data.occ,
-                              cycle_data.eig):
-            occ = self.occ_scale*q
-            coeff = x.dot(c)
-            if threshold is not None:
-                # occupations are Fermi-ordered (ascending energy): keep a prefix
-                nkeep = max(1, int(cp.count_nonzero(occ >= threshold).item()))
-                coeff, occ, e = coeff[:, :nkeep], occ[:nkeep], e[:nkeep]
-            data['mo_coeff'].append(cp.asnumpy(coeff))
-            data['mo_occ'].append(cp.asnumpy(occ))
-            data['mo_energy'].append(cp.asnumpy(e))
-        return data
+        coeff = [x.dot(c) for x, c in zip(self.x_ao2orth, cycle_data.coeff)]
+        occ = [self.occ_scale*q for q in cycle_data.occ]
+        eig = list(cycle_data.eig)
+        if threshold is not None:
+            # occupations are Fermi-ordered (ascending energy): keep a prefix
+            nkeep = cp.stack([cp.count_nonzero(q >= threshold) for q in occ]).get()
+            nkeep = [max(1, int(n)) for n in nkeep]
+            coeff = [cp.ascontiguousarray(c[:, :n]) for c, n in zip(coeff, nkeep)]
+            occ = [q[:n] for q, n in zip(occ, nkeep)]
+            eig = [e[:n] for e, n in zip(eig, nkeep)]
+        return _DeviceData({'mo_coeff': coeff, 'mo_occ': occ, 'mo_energy': eig})
 
     def _append_scan_output(
             self, csv_path, h5_path, columns, record, cycle_data):
