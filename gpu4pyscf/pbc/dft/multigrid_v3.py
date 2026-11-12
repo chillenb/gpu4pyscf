@@ -34,7 +34,7 @@ import ctypes
 import numpy as np
 import cupy as cp
 import cupyx.scipy.fft as fft
-from pyscf import lib
+from pyscf import lib, __config__
 from pyscf.gto import ANG_OF, ATOM_OF, PTR_COORD, PTR_EXP, PTR_COEFF, gto_norm
 from pyscf.pbc.lib.kpts import KPoints
 from pyscf.pbc.df.df_jk import _format_kpts_band
@@ -258,7 +258,7 @@ def _eval_density_v2(ni, dm_sc, kpts=None, with_tau=False):
                 (ctypes.c_int*3)(*atom_mesh),
                 (ctypes.c_int*3)(*mesh),
                 ctypes.c_double(weight),
-                ctypes.c_double(bucket['negligible']),
+                ctypes.c_double(_ao_val_threshold(ni, bucket)),
                 ctypes.c_void_p(stream.ptr))
             if err != 0:
                 raise RuntimeError('evaluate_density kernel failed')
@@ -341,7 +341,7 @@ def _eval_density_v1(ni, dm_sc, kpts=None, with_tau=False):
                 ctypes.c_int(ntiles),
                 (ctypes.c_int*3)(*mesh),
                 ctypes.c_double(weight),
-                ctypes.c_double(bucket['negligible']),
+                ctypes.c_double(_ao_val_threshold(ni, bucket)),
                 ctypes.c_void_p(stream.ptr))
             if err != 0:
                 raise RuntimeError('evaluate_density kernel failed')
@@ -424,7 +424,7 @@ def _eval_xc_mat_v2(ni, vxcG, out=None, work=None):
                 ctypes.cast(grid_frac_ranges.data.ptr, ctypes.c_void_p),
                 (ctypes.c_int*3)(*mesh),
                 ctypes.c_int(len(bas_ij_idx)),
-                ctypes.c_double(bucket['negligible']),
+                ctypes.c_double(_ao_val_threshold(ni, bucket)),
                 ctypes.c_void_p(stream.ptr))
             if err != 0:
                 raise RuntimeError('evaluate_xc_mat kernel failed')
@@ -502,7 +502,7 @@ def _eval_xc_mat_v1(ni, vxcG, out=None, work=None):
                 ctypes.cast(grid_tile_idx.data.ptr, ctypes.c_void_p),
                 ctypes.c_int(len(grid_tile_idx)),
                 (ctypes.c_int*3)(*mesh),
-                ctypes.c_double(bucket['negligible']),
+                ctypes.c_double(_ao_val_threshold(ni, bucket)),
                 ctypes.c_void_p(stream.ptr))
             if err != 0:
                 raise RuntimeError('evaluate_xc_mat kernel failed')
@@ -571,7 +571,7 @@ def _eval_gradients(ni, dm_sc, vxcG, fft_buckets, work=None):
                 (ctypes.c_int*3)(*mesh),
                 ctypes.c_int(len(bas_ij_idx)),
                 ctypes.c_double(weight),
-                ctypes.c_double(bucket['negligible']),
+                ctypes.c_double(_ao_val_threshold(ni, bucket)),
                 ctypes.c_void_p(stream.ptr))
             if err != 0:
                 raise RuntimeError('evaluate_xc_grad kernel failed')
@@ -811,7 +811,6 @@ def _partition_ke_for_fft(ni, pair_idx, init_ke, ke_max, precision, xctype, log)
             #     Shell-pair indices contributing to the tiles in grid_tile_idx.
             #   - shl_pair_offsets:
             #     Partition the shell pairs in supmol_pair_idx by grid tile.
-            ao_val_threshold = precision * 1e-6
             buckets.append({
                 'ke_cutoff': ke_upper,
                 'mesh': np.asarray(mesh, dtype=np.int32),
@@ -820,7 +819,10 @@ def _partition_ke_for_fft(ni, pair_idx, init_ke, ke_max, precision, xctype, log)
                 'bas_ij_cache': bas_ij_cache,
                 'grid_ranges_cache': grid_ranges_cache,
                 'grid_tile_cache': None,
-                'negligible': ao_val_threshold,
+                # AO-product value cutoff = precision * ni.ao_val_rel_threshold,
+                # evaluated at use (_ao_val_threshold) so that changing the
+                # attribute after build takes effect.
+                'ao_val_precision': precision,
                 'atom_seg_offsets': atom_seg_offsets,
                 'atom_grid_ranges': atom_grid_ranges_cache,
                 'atom_mesh_max': atom_mesh_max,
@@ -835,6 +837,11 @@ def _partition_ke_for_fft(ni, pair_idx, init_ke, ke_max, precision, xctype, log)
         ke_lower, ke_upper = ke_lower*0.7, ke_lower
         mesh = _bucket_mesh(a, ke_upper, mesh_final)
     return buckets
+
+def _ao_val_threshold(ni, bucket):
+    '''Grid values |c_i c_j exp(...)| of an AO product below this are skipped in the
+    real-space (FFT-bucket) density and potential-matrix kernels.'''
+    return bucket['ao_val_precision'] * ni.ao_val_rel_threshold
 
 def _non_trivial_bvk_pairs(ni, precision):
     '''Search non-negligible pairs for <cell0|bvk-cell> overlaps'''
@@ -2038,6 +2045,14 @@ class MultiGridNumInt(multigrid_v1.MultiGridNumIntBase):
     # Enable analytical Fourier transforms (AFT), which are typically more
     # efficient for small unit cells.
     enable_aft = True
+
+    # Cutoff on the grid values of AO products in the FFT buckets, relative to the
+    # screening precision (cell.precision / lattice_sum_factor).  The total-energy error
+    # is roughly linear in it.  With large k-meshes and diffuse functions the default
+    # can leave ~1e-4 Ha in the energy (mostly Coulomb) and make mu != dA/dN in
+    # fixed-N scans; 1e-8 removes this at little cost (gpu4pyscf issue #890).
+    ao_val_rel_threshold = getattr(
+        __config__, 'pbc_dft_multigrid_v3_ao_val_rel_threshold', 1e-6)
 
     # Mesh in the final bucket can be smaller the estimated cell.mesh.
     # Allow the overall mesh to be reduced to the one in the final bucket.

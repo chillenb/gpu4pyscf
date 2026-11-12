@@ -197,6 +197,38 @@ def eval_nucG_SI_gradient(cell, mesh, rho_g):
     return de, sigma
 
 class KnownValues(unittest.TestCase):
+    def test_ao_val_rel_threshold(self):
+        # FFT-bucket AO-value cutoff = screening precision * ni.ao_val_rel_threshold
+        # (gpu4pyscf issue #890).  Changing it after the buckets are built takes effect,
+        # and tightening it removes most of the error vs. cell.precision = 1e-12.
+        kmesh = [3, 3, 3]
+
+        def coulomb(precision, rel=None, set_after_build=False):
+            cell = cell_he.copy()
+            cell.build(precision=precision)
+            kpts = cell.make_kpts(kmesh)
+            nao = cell.nao
+            x = np.random.default_rng(1).random((nao, nao)) - .5
+            dm = np.tile(x + x.T + 2 * np.eye(nao), (len(kpts), 1, 1))
+            ni = multigrid.MultiGridNumInt(cell)
+            ni.enable_aft = False
+            if rel is not None and not set_after_build:
+                ni.ao_val_rel_threshold = rel
+            vj = ni.get_j(dm, kpts=kpts)
+            if set_after_build:
+                self.assertTrue(ni.fft_buckets)
+                ni.ao_val_rel_threshold = rel
+                vj = ni.get_j(dm, kpts=kpts)
+            return float(cp.einsum('kij,kji->', cp.asarray(vj), cp.asarray(dm)).real.get()) / len(kpts)
+
+        self.assertEqual(multigrid.MultiGridNumInt.ao_val_rel_threshold, 1e-6)
+        ref = coulomb(1e-12)
+        e_default = coulomb(1e-6)
+        e_tight = coulomb(1e-6, 1e-10)
+        self.assertAlmostEqual(coulomb(1e-6, 1e-10, set_after_build=True), e_tight, 12)
+        self.assertGreater(abs(e_default - ref), 1e-8)
+        self.assertLess(abs(e_tight - ref), .1 * abs(e_default - ref))
+
     def test_aft_disabled_for_nonorthogonal_bvk_cell(self):
         kmesh = np.array([2, 2, 2])
         control = multigrid.MultiGridNumInt(cell_orth)
