@@ -319,6 +319,42 @@ def _half_Gv_bases(Gv_bases, mesh):
     return Gx, Gy, cp.ascontiguousarray(Gz[:, :_half_mesh(mesh)[2]])
 
 
+
+def _first_derivative_bases(Gv_bases):
+    '''Per-axis G bases for first (odd-order) derivatives: the Nyquist column (index n//2)
+    of every even axis is set to 0.  The Nyquist mode cos(pi x/h) has derivative
+    -(pi/h) sin(pi x/h), which vanishes at every grid point, and with the factor kept,
+    i G phi is not Hermitian there (a self-mirror point with an odd symbol), so it would not
+    map real fields to real fields.  With it zeroed, gradient and divergence are real
+    operators on any mesh, as in multigrid's XC gradients (which take .real).  Even-order
+    operators (Laplacian, Hessian) keep the full G.  Odd meshes are unchanged.'''
+    out = []
+    for Gb in Gv_bases:
+        n = Gb.shape[1]
+        if n % 2 == 0:
+            Gb = Gb.copy()
+            Gb[:, n // 2] = 0.0
+        out.append(Gb)
+    return tuple(out)
+
+
+def _zero_null_modes(a, mesh, half=False):
+    '''Zero, in place, the null modes of -div(eps grad) without electrolyte: G = 0 and the
+    modes whose index is 0 or Nyquist on every axis (their first-derivative symbol vanishes).
+    Without electrolyte the potential is defined up to these components (G = 0: a constant,
+    fixed later by the vacuum alignment), and a right-hand side with such components
+    (a charged density) has no solution.  a has shape mesh, or the half-spectrum shape.'''
+    choices = [[0] + ([int(n) // 2] if int(n) % 2 == 0 else []) for n in mesh]
+    if half and int(mesh[2]) % 2 == 0:
+        choices[2] = [0, int(mesh[2]) // 2]          # stored at index nz//2 of the half axis
+    a3 = a.reshape(_half_mesh(mesh) if half else tuple(int(n) for n in mesh))
+    for ix in choices[0]:
+        for iy in choices[1]:
+            for iz in choices[2]:
+                a3[ix, iy, iz] = 0
+    return a
+
+
 _r2c_plans = {}
 
 
@@ -481,7 +517,18 @@ def pseudocore_density(cell, mesh):
 _cg_update_p = cp.ElementwiseKernel(
     'T z, S beta', 'T p', 'p = z + beta * p', 'lpbe_cg_update_p')
 _cg_update_xr = cp.ElementwiseKernel(
-    'T p, T q, S alpha', 'T x, T r', 'x += alpha * p; r -= alpha * q', 'lpbe_cg_update_xr')
+    'T p, T q, S alpha', 'T x, T r',
+    'if (alpha != S(0)) { x += alpha * p; r -= alpha * q; }', 'lpbe_cg_update_xr')
+# alpha = rho / (p.Ap), or 0 once the previous residual (still on the device) is <= atol:
+# the iteration run while the host has not yet seen the convergence is then a no-op, so
+# the iterates are exactly those of the synchronous CG.
+_cg_alpha = cp.ElementwiseKernel(
+    'T rho, T pq, float64 res, float64 atol', 'T alpha',
+    'alpha = (res > atol && pq != T(0)) ? rho / pq : T(0)', 'lpbe_cg_alpha')
+# a / b, or 0 if b == 0: after exact convergence (r = 0, e.g. an exact preconditioner) the
+# lagged extra iteration would otherwise compute 0/0.
+_safe_div = cp.ElementwiseKernel(
+    'T a, T b', 'T c', 'c = (b == T(0)) ? T(0) : a / b', 'lpbe_safe_div')
 
 
 def cg_opt(n, matvec, psolve, b, x0=None, tol=1e-5, maxiter=None, M=None, callback=None,
@@ -581,26 +628,29 @@ def cg_opt(n, matvec, psolve, b, x0=None, tol=1e-5, maxiter=None, M=None, callba
     # No host synchronization inside the loop: rho, alpha, beta stay on the device as 0-d
     # arrays (fused update kernels), and the residual norm is copied asynchronously to
     # pinned memory and tested one iteration late, so the GPU always has the next
-    # iteration queued.  Costs at most one extra (harmless) iteration.
+    # iteration queued.  That extra iteration is frozen on the device (alpha = 0 once the
+    # device residual is <= atol), so x is exactly the synchronous CG result.
     hres = [cupyx.empty_pinned((1,), dtype=np.float64) for _ in range(2)]
     pending = None
     resid = None
+    res_dev = cp.asarray(np.inf)          # the first iteration always runs (as before)
     while iters < maxiter:
         z = psolve(r, out=z)
         rho_new = dot(r, z)
         if iters == 0:
             p = cp.copy(z)
         else:
-            _cg_update_p(z, rho_new / rho, p)          # p = z + beta p
+            _cg_update_p(z, _safe_div(rho_new, rho), p)    # p = z + beta p
         rho = rho_new
         q = matvec(p, out=q, buf=buf)
-        alpha = rho / dot(p, q)
+        alpha = _cg_alpha(rho, dot(p, q), res_dev, float(atol))
         _cg_update_xr(p, q, alpha, x, r)               # x += alpha p; r -= alpha q
         iters += 1
         if callback is not None:
             callback(x)
         h = hres[iters % 2]
-        nrm2(r).reshape(1).get(out=h, blocking=False)
+        res_dev = nrm2(r)
+        res_dev.reshape(1).get(out=h, blocking=False)
         ev = cp.cuda.Event(block=False, disable_timing=True)
         ev.record()
         if pending is not None:
@@ -641,7 +691,11 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
 
     Gv = pbc_tools.get_Gv(ni.cell, ni.mesh)
 
-    Gx, Gy, Gz = Gv_bases
+    # First derivatives (gradient, divergence, and through them -div(eps grad) and the
+    # vacuum Coulomb reference of the solve) use the Nyquist-zeroed bases; the Laplacian and
+    # Hessian keep Gv_bases.  Identical on odd meshes.
+    Gv_bases_d = _first_derivative_bases(Gv_bases)
+    Gx, Gy, Gz = Gv_bases_d
 
     Gabs2 = cp.einsum('gi,gi->g', Gv, Gv)
     del Gv
@@ -752,20 +806,19 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
     mean_ebkappa2 = float(mean_S * ebkappa2)
 
     def Mprecond(phiG, out=None):
-        precond_phiG = _precond_yukawa_or_coul(phiG, Gv_bases, eps_r=mean_eps_r, ebkappa2=mean_ebkappa2, out=out)
+        precond_phiG = _precond_yukawa_or_coul(phiG, Gv_bases_d, eps_r=mean_eps_r, ebkappa2=mean_ebkappa2, out=out)
         return precond_phiG.reshape(-1)
 
 
-    # 'auto': half-spectrum solve on odd meshes.  On an even mesh the derivative of the
-    # Nyquist mode has no unique real meaning and the two solves treat it differently,
-    # so even meshes keep the complex solve (unchanged results).
+    # With the Nyquist-zeroed first derivatives every operator maps real fields to real
+    # fields, so the half-spectrum solve is exact on any mesh; 'c2c' is kept as a check.
     fft_mode = options.get('fft', 'auto')
     if fft_mode == 'auto':
-        fft_mode = 'r2c' if all(int(m) % 2 == 1 for m in mesh) else 'c2c'
+        fft_mode = 'r2c'
     if fft_mode == 'r2c':
         # CG on the half spectrum of the (real) potential; see _make_aop_r2c.
         hmesh = _half_mesh(mesh)
-        Gv_bases_h = _half_Gv_bases(Gv_bases, mesh)
+        Gv_bases_h = _half_Gv_bases(Gv_bases_d, mesh)
         def hdot(a, b):
             return _hermitian_dot(a, b, mesh)
 
@@ -786,6 +839,8 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
         t0 = log.init_timer()
         RangePush("lpbe_cg_solve")
         rhs = fft.rfftn(4*np.pi*solute_chargeR.real.reshape(*mesh)).reshape(-1) * weight
+        if ebkappa2 == 0:
+            _zero_null_modes(rhs, mesh, half=True)
         niter = 0
         def callback(x):
             nonlocal niter
@@ -807,6 +862,8 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
         RangePush("lpbe_cg_solve")
 
         rhs = fft_3d(4*np.pi*solute_chargeR.reshape(*mesh)).reshape(-1) * weight
+        if ebkappa2 == 0:
+            _zero_null_modes(rhs, mesh)
 
         niter = 0
         def callback(x):
@@ -842,7 +899,8 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
     # compute solvation potential.
     solute_chargeG = fft_3d(solute_chargeR.reshape(*mesh)).reshape(-1) * weight
     #vac_coulomb_potentialG = coul_kernelG * solute_chargeG
-    vac_coulomb_potentialG = _precond_yukawa_or_coul(solute_chargeG, Gv_bases, eps_r=1.0, ebkappa2=0.0)
+    # Same discrete operator as the solve (|G'|^2), so phi - V_vac vanishes for eps -> 1.
+    vac_coulomb_potentialG = _precond_yukawa_or_coul(solute_chargeG, Gv_bases_d, eps_r=1.0, ebkappa2=0.0)
 
     vac_coulomb_potentialG = vac_coulomb_potentialG.reshape(-1)
     
@@ -930,8 +988,10 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
     for i in range(3):
         for j in range(3):
             # hij_g = -(Gv[:, i] * Gv[:, j]) * rhoG
-            hij_g = _apply_Gv_1j(rhoG, Gx[i], Gy[i], Gz[i])
-            hij_g = _apply_Gv_1j(hij_g, Gx[j], Gy[j], Gz[j], out=hij_g)
+            # even order: full G (-G_i G_j is a real operator on any mesh)
+            Fx, Fy, Fz = Gv_bases
+            hij_g = _apply_Gv_1j(rhoG, Fx[i], Fy[i], Fz[i])
+            hij_g = _apply_Gv_1j(hij_g, Fx[j], Fy[j], Fz[j], out=hij_g)
 
             hij_r = ifft_in_place(hij_g.reshape(*mesh)).real / weight
             grad_hess_grad_r += grad_rho_r[i] * hij_r * grad_rho_r[j]
