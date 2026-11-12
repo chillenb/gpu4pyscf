@@ -932,7 +932,9 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         if f_hi == 0:
             return self._check_mu(orbital_energies, nelec, hi)
         mu = 0.5 * (lo + hi)
-        tol = 1e-13 * max(1.0, nocc)
+        # Newton converges quadratically: ask for the rounding level of the sum so
+        # the electron count is as exact as pyscf's bisection to xtol=1e-16.
+        tol = 1e-15 * max(1.0, nocc)
         best = (np.inf, mu)
         for _ in range(200):
             f, df = occ_sum(mu)

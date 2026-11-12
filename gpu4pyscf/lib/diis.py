@@ -32,6 +32,14 @@ from pyscf import __config__
 # C2DIIS, IJQC, 45, 31 (1993); DOI:10.1002/qua.560450106
 # SCF-EDIIS, JCP 116, 8255 (2002); DOI:10.1063/1.1470195
 
+_axpy_kernel = cupy.ElementwiseKernel(
+    'T a, T x', 'T y', 'y += a * x', 'gpu4pyscf_diis_axpy')
+
+def _axpy(a, x, y):
+    '''y += a * x in place, without a temporary for a * x.'''
+    _axpy_kernel(cupy.asarray(a, dtype=y.dtype), x, y)
+
+
 class DIIS(object):
     '''Direct inversion in the iterative subspace method.
 
@@ -210,7 +218,11 @@ class DIIS(object):
             self._H[0,1:] = self._H[1:,0] = 1
         for i in range(nd):
             dti = self.get_err_vec(i)
-            tmp = cupy.asnumpy(dt.conj().dot(dti))
+            # vdot conjugates on the fly (cuBLAS dotc): no conj() copy of dt
+            if isinstance(dt, cupy.ndarray) and isinstance(dti, cupy.ndarray):
+                tmp = cupy.asnumpy(cupy.vdot(dt, dti))
+            else:
+                tmp = cupy.asnumpy(dt.conj().dot(dti))
             self._H[self._head,i+1] = tmp
             self._H[i+1,self._head] = tmp.conjugate()
         dt = None
@@ -247,7 +259,14 @@ class DIIS(object):
                 raise e
         logger.debug1(self, 'diis-c %s', c)
 
-        xnew = 0.
+        xnew = None
         for i, ci in enumerate(c[1:]):
-            xnew += self.get_vec(i) * ci
+            vec = self.get_vec(i)
+            if xnew is None:
+                xnew = vec * ci
+            elif (isinstance(xnew, cupy.ndarray) and isinstance(vec, cupy.ndarray)
+                  and vec.dtype == xnew.dtype):
+                _axpy(ci, vec, xnew)
+            else:
+                xnew += vec * ci
         return xnew
