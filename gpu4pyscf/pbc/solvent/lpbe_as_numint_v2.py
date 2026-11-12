@@ -3,6 +3,7 @@ import ctypes
 
 import numpy as np
 import cupy as cp
+from packaging.version import Version
 import cupyx
 import cupyx.scipy.fft as fft
 from cupyx.scipy.sparse.linalg import LinearOperator, cg
@@ -30,6 +31,8 @@ import gpu4pyscf.pbc.dft.multigrid_v2 as multigrid_v2
 from gpu4pyscf.pbc.dft.multigrid_v2 import MultiGridNumInt
 from gpu4pyscf.pbc.dft.multigrid_v2 import fft_in_place, ifft_in_place, evaluate_density_on_g_mesh, convert_xc_on_g_mesh_to_fock
 
+
+_CUPY_LT_14 = Version(cp.__version__) < Version('14.0.0')
 
 class LPBEGridResult:
     """Persistent reciprocal/real-space data from one LPBE NumInt call.
@@ -305,7 +308,9 @@ def lpbe_inner(ni, rhoG, coul_kernelG, Gv, options=None, pot_guess=None):
 
     RangePush("lpbe_cg_solve")
     # Div( eps_r * Grad(phi) ) - S phi / (debye_length^2) = -4*pi*solute_chargeR.
-    solution_phi_G, info = cg(A, rhs, M=M, x0=pot_guess, tol=tol, maxiter=400, callback=callback)
+    # CuPy 14 replaced cg(tol=) by rtol= (relative, as tol was with atol=None)
+    tol_kw = {'tol': tol} if _CUPY_LT_14 else {'rtol': tol}
+    solution_phi_G, info = cg(A, rhs, M=M, x0=pot_guess, **tol_kw, maxiter=400, callback=callback)
 
     RangePop()
 

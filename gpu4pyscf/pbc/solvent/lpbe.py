@@ -3,6 +3,7 @@ import ctypes
 
 import numpy as np
 import cupy as cp
+from packaging.version import Version
 import cupyx
 import cupyx.scipy.fft as fft
 
@@ -26,6 +27,8 @@ import gpu4pyscf.pbc.dft.multigrid_v2 as multigrid_v2
 from gpu4pyscf.pbc.dft.multigrid_v2 import MultiGridNumInt
 from gpu4pyscf.pbc.dft.multigrid_v2 import fft_in_place, ifft_in_place
 
+
+_CUPY_LT_14 = Version(cp.__version__) < Version('14.0.0')
 
 def shape_function(rhoR, sigma_k, nc_k, eps=1e-10):
     Z = cp.log(cp.maximum(rhoR.real, eps) / nc_k) * (1.0 / (np.sqrt(2) * sigma_k))
@@ -309,7 +312,9 @@ class PeriodicLPBE(lib.StreamObject):
             niter += 1
 
         # Div( eps_r * Grad(phi) ) - S phi / (debye_length^2) = -4*pi*solute_chargeR.
-        solution_phi_G, info = cg(A, rhs, M=M, x0=self.pot_guess, tol=self.tol, maxiter=400, callback=callback)
+        # CuPy 14 replaced cg(tol=) by rtol= (relative, as tol was with atol=None)
+        tol_kw = {'tol': self.tol} if _CUPY_LT_14 else {'rtol': self.tol}
+        solution_phi_G, info = cg(A, rhs, M=M, x0=self.pot_guess, **tol_kw, maxiter=400, callback=callback)
 
         if info != 0:
             logger.warn(self, f"Conjugate gradient did not converge: info={info}")
