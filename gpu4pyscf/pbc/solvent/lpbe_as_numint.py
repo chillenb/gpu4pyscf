@@ -286,6 +286,160 @@ void ''' + fn_name + r'''(cuDoubleComplex* __restrict__ out, cuDoubleComplex* __
     kernel((workers*2,), (1024,), (out, a, b, complex(alpha), complex(beta), ng))
     return out
 
+
+# ---- half-spectrum (R2C/C2R) representation of real fields ---------------------------
+# A real field f(r) on the mesh has a Hermitian spectrum, f(-G) = f(G)*, so only the
+# kz >= 0 half, shape (nx, ny, nz//2+1), is stored (cupyx rfftn/irfftn layout).  The
+# full-spectrum inner product of two such fields is the half-spectrum one with weight 2
+# for kz > 0, except the kz = 0 plane and, for even nz, the Nyquist plane kz = nz/2,
+# which are stored completely (weight 1).
+
+def _hermitian_dot(a, b, mesh):
+    '''Full-spectrum inner product Re<a|b> of two real fields from their half spectra
+    a, b of shape (nx, ny, nz//2+1): 2 Re<a|b>_half minus the planes stored completely
+    (kz = 0 and, for even nz, the Nyquist plane), which must count once.  cuBLAS dotc
+    on the contiguous arrays and on the strided planes; the result stays on the device.'''
+    nzh = int(mesh[2]) // 2 + 1
+    a2 = a.reshape(-1, nzh)
+    b2 = b.reshape(-1, nzh)
+    d = 2 * cublas.dotc(a.reshape(-1), b.reshape(-1)).real
+    # cublas.dotc ignores the stride of a sliced view; cp.vdot copies the plane.
+    d -= cp.vdot(a2[:, 0], b2[:, 0]).real
+    if int(mesh[2]) % 2 == 0:
+        d -= cp.vdot(a2[:, -1], b2[:, -1]).real
+    return d
+
+
+def _half_mesh(mesh):
+    return (int(mesh[0]), int(mesh[1]), int(mesh[2]) // 2 + 1)
+
+
+def _half_Gv_bases(Gv_bases, mesh):
+    Gx, Gy, Gz = Gv_bases
+    return Gx, Gy, cp.ascontiguousarray(Gz[:, :_half_mesh(mesh)[2]])
+
+
+_r2c_plans = {}
+
+
+def _r2c_plans_for(mesh, nbatch=4):
+    '''Cached raw cuFFT plans (unnormalized, out of place) for nbatch real fields on mesh.'''
+    from cupyx.scipy.fftpack import get_fft_plan
+    key = (tuple(int(x) for x in mesh), nbatch, cp.cuda.Device().id)
+    if key not in _r2c_plans:
+        hmesh = _half_mesh(mesh)
+        real = cp.empty((nbatch,) + tuple(mesh), dtype=cp.float64)
+        half = cp.empty((nbatch,) + hmesh, dtype=cp.complex128)
+        _r2c_plans[key] = (
+            get_fft_plan(real, axes=(1, 2, 3), value_type='R2C'),
+            get_fft_plan(half, shape=tuple(mesh), axes=(1, 2, 3), value_type='C2R'))
+    return _r2c_plans[key]
+
+
+_GV_INDEX = r'''
+        size_t ix = g / nyz;
+        size_t iyz = g - nyz * ix;
+        size_t iy = iyz / nz;
+        size_t iz = iyz - nz * iy;
+'''
+
+
+def _lpbe_r2c_kernels():
+    if 'lpbe_grad4' in _kernel_registry:
+        return (_kernel_registry['lpbe_grad4'], _kernel_registry['lpbe_coef4'],
+                _kernel_registry['lpbe_div4'])
+    common = r'''
+#include <cuComplex.h>
+'''
+    # work[i] = i G_i phi (i = 0..2), work[3] = phi
+    grad4 = common + r'''
+extern "C" __global__
+void lpbe_grad4(cuDoubleComplex* __restrict__ work, const cuDoubleComplex* __restrict__ phi,
+    const double *Gx, const double *Gy, const double *Gz, long long nx, long long ny, long long nz) {
+    size_t nyz = ny * nz;
+    size_t ng = nx * nyz;
+    for (size_t g = blockDim.x * (size_t)blockIdx.x + threadIdx.x; g < ng; g += (size_t)gridDim.x * blockDim.x) {
+''' + _GV_INDEX + r'''
+        cuDoubleComplex v = phi[g];
+        for (int n = 0; n < 3; ++n) {
+            double G = Gx[n*nx+ix] + Gy[n*ny+iy] + Gz[n*nz+iz];
+            work[n*ng+g] = make_cuDoubleComplex(-G * cuCimag(v), G * cuCreal(v));
+        }
+        work[3*ng+g] = v;
+    }
+}'''
+    # field[0..2] *= eps, field[3] *= S kappa^2   (both already divided by N)
+    coef4 = r'''
+extern "C" __global__
+void lpbe_coef4(double* __restrict__ field, const double* __restrict__ eps,
+    const double* __restrict__ sk, long long n) {
+    for (size_t g = blockDim.x * (size_t)blockIdx.x + threadIdx.x; g < n; g += (size_t)gridDim.x * blockDim.x) {
+        double e = eps[g];
+        field[g] *= e;
+        field[n+g] *= e;
+        field[2*n+g] *= e;
+        field[3*n+g] *= sk[g];
+    }
+}'''
+    # out = work[3] + sum_i (-i G_i) work[i]
+    div4 = common + r'''
+extern "C" __global__
+void lpbe_div4(cuDoubleComplex* __restrict__ out, const cuDoubleComplex* __restrict__ work,
+    const double *Gx, const double *Gy, const double *Gz, long long nx, long long ny, long long nz) {
+    size_t nyz = ny * nz;
+    size_t ng = nx * nyz;
+    for (size_t g = blockDim.x * (size_t)blockIdx.x + threadIdx.x; g < ng; g += (size_t)gridDim.x * blockDim.x) {
+''' + _GV_INDEX + r'''
+        cuDoubleComplex res = work[3*ng+g];
+        for (int n = 0; n < 3; ++n) {
+            double G = Gx[n*nx+ix] + Gy[n*ny+iy] + Gz[n*nz+iz];
+            cuDoubleComplex v = work[n*ng+g];
+            res.x += G * cuCimag(v);
+            res.y -= G * cuCreal(v);
+        }
+        out[g] = res;
+    }
+}'''
+    for name, code in (('lpbe_grad4', grad4), ('lpbe_coef4', coef4), ('lpbe_div4', div4)):
+        _kernel_registry[name] = cp.RawKernel(code, name)
+    return _lpbe_r2c_kernels()
+
+
+def _make_aop_r2c(mesh, Gv_bases_h, eps_r_field, Skappa2):
+    '''A phi = -div(eps grad phi) + S kappa^2 phi on half-spectrum vectors.
+    Per product: one fused kernel for (i G_x, i G_y, i G_z, 1) phi, one batched C2R of the
+    4 fields, one fused kernel scaling them by (eps, eps, eps, S kappa^2), one batched R2C,
+    one fused divergence kernel.  Raw cuFFT plans: unnormalized (the 1/N of the inverse is
+    folded into the coefficient fields), out of place into preallocated buffers.'''
+    from cupy.cuda import cufft
+    Gx, Gy, Gz = Gv_bases_h
+    hmesh = _half_mesh(mesh)
+    nx, ny, nzh = hmesh
+    n = int(np.prod(mesh))
+    eps_n = cp.ascontiguousarray(eps_r_field.real, dtype=cp.float64) * (1.0 / n)
+    skappa2_n = cp.ascontiguousarray(Skappa2.real, dtype=cp.float64) * (1.0 / n)
+    plan_r2c, plan_c2r = _r2c_plans_for(mesh)
+    work = cp.empty((4,) + hmesh, dtype=cp.complex128)
+    field = cp.empty((4,) + tuple(mesh), dtype=cp.float64)
+    grad4, coef4, div4 = _lpbe_r2c_kernels()
+    grid = (gpu_specs['multiProcessorCount'] * 4,)
+    block = (256,)
+    grid_coef = ((n + 255) // 256,)                   # one element per thread
+
+    def Aop(phiH, out=None, buf=None):
+        RangePush("Aop_r2c")
+        phi = cp.ascontiguousarray(phiH.reshape(hmesh))
+        if out is None:
+            out = cp.empty(hmesh, dtype=cp.complex128)
+        grad4(grid, block, (work, phi, Gx, Gy, Gz, nx, ny, nzh))
+        plan_c2r.fft(work, field, cufft.CUFFT_INVERSE)       # overwrites work: scratch
+        coef4(grid_coef, block, (field, eps_n, skappa2_n, n))
+        plan_r2c.fft(field, work, cufft.CUFFT_FORWARD)
+        div4(grid, block, (out, work, Gx, Gy, Gz, nx, ny, nzh))
+        RangePop()
+        return out.reshape(-1)
+    return Aop
+
 def pseudocore_density(cell, mesh):
     assert cell.dimension == 3
     Gv, (basex, basey, basez) = get_Gv_weights(cell, mesh)[:2]
@@ -324,8 +478,14 @@ def pseudocore_density(cell, mesh):
         rhocoreG += pcharge * SI
     return rhocoreG
 
+_cg_update_p = cp.ElementwiseKernel(
+    'T z, S beta', 'T p', 'p = z + beta * p', 'lpbe_cg_update_p')
+_cg_update_xr = cp.ElementwiseKernel(
+    'T p, T q, S alpha', 'T x, T r', 'x += alpha * p; r -= alpha * q', 'lpbe_cg_update_xr')
+
+
 def cg_opt(n, matvec, psolve, b, x0=None, tol=1e-5, maxiter=None, M=None, callback=None,
-       atol=None):
+       atol=None, dot=None, nrm2=None):
     """Uses Conjugate Gradient iteration to solve ``Ax = b``.
     Adapted from cupyx.scipy.sparse.linalg.cg.
 
@@ -348,6 +508,9 @@ def cg_opt(n, matvec, psolve, b, x0=None, tol=1e-5, maxiter=None, M=None, callba
             iteration. It is called as ``callback(xk)``, where ``xk`` is the
             current solution vector.
         atol (float): Tolerance for convergence.
+        dot, nrm2: inner product and norm of the vector space (default: the
+            plain complex ones, cublas dotc / nrm2).  The half-spectrum (R2C)
+            solve passes the Hermitian-weighted ones.
 
     Returns:
         tuple:
@@ -380,6 +543,10 @@ def cg_opt(n, matvec, psolve, b, x0=None, tol=1e-5, maxiter=None, M=None, callba
     # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
     # THE SOFTWARE.
 
+    if dot is None:
+        dot = cublas.dotc
+    if nrm2 is None:
+        nrm2 = cublas.nrm2
     x = x0
     if x is None:
         x = cp.zeros_like(b)
@@ -388,7 +555,7 @@ def cg_opt(n, matvec, psolve, b, x0=None, tol=1e-5, maxiter=None, M=None, callba
         maxiter = n * 10
     if n == 0:
         return cp.empty_like(b), 0
-    b_norm = cp.linalg.norm(b)
+    b_norm = nrm2(b)
     if b_norm == 0:
         return b, 0
     if atol is None:
@@ -411,31 +578,44 @@ def cg_opt(n, matvec, psolve, b, x0=None, tol=1e-5, maxiter=None, M=None, callba
     q = cp.empty_like(b)
     z = cp.empty_like(b)
 
+    # No host synchronization inside the loop: rho, alpha, beta stay on the device as 0-d
+    # arrays (fused update kernels), and the residual norm is copied asynchronously to
+    # pinned memory and tested one iteration late, so the GPU always has the next
+    # iteration queued.  Costs at most one extra (harmless) iteration.
+    hres = [cupyx.empty_pinned((1,), dtype=np.float64) for _ in range(2)]
+    pending = None
+    resid = None
     while iters < maxiter:
         z = psolve(r, out=z)
-        rho1 = rho
-        rho = cublas.dotc(r, z)
+        rho_new = dot(r, z)
         if iters == 0:
             p = cp.copy(z)
         else:
-            beta = rho / rho1
-            _fma(beta, p, 1.0, z, out=p)
-            #p = z + beta * p
+            _cg_update_p(z, rho_new / rho, p)          # p = z + beta p
+        rho = rho_new
         q = matvec(p, out=q, buf=buf)
-        alpha = rho / cublas.dotc(p, q)
-        _fma(alpha, p, 1.0, x, out=x)
-        #x += alpha * p
-        _fma(-alpha, q, 1.0, r, out=r)
-        #r -= alpha * q
+        alpha = rho / dot(p, q)
+        _cg_update_xr(p, q, alpha, x, r)               # x += alpha p; r -= alpha q
         iters += 1
         if callback is not None:
             callback(x)
-        resid = cublas.nrm2(r)
-        if resid <= atol:
-            break
+        h = hres[iters % 2]
+        nrm2(r).reshape(1).get(out=h, blocking=False)
+        ev = cp.cuda.Event(block=False, disable_timing=True)
+        ev.record()
+        if pending is not None:
+            pending[0].synchronize()
+            resid = float(pending[1][0])
+            if resid <= atol:
+                break
+        pending = (ev, h)
+    else:
+        if pending is not None:
+            pending[0].synchronize()
+            resid = float(pending[1][0])
 
     info = 0
-    if iters == maxiter and not (resid <= atol):
+    if iters == maxiter and not (resid is not None and resid <= atol):
         info = iters
 
     return x, info
@@ -576,32 +756,85 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
         return precond_phiG.reshape(-1)
 
 
-    t0 = log.init_timer()
-    RangePush("lpbe_cg_solve")
+    # 'auto': half-spectrum solve on odd meshes.  On an even mesh the derivative of the
+    # Nyquist mode has no unique real meaning and the two solves treat it differently,
+    # so even meshes keep the complex solve (unchanged results).
+    fft_mode = options.get('fft', 'auto')
+    if fft_mode == 'auto':
+        fft_mode = 'r2c' if all(int(m) % 2 == 1 for m in mesh) else 'c2c'
+    if fft_mode == 'r2c':
+        # CG on the half spectrum of the (real) potential; see _make_aop_r2c.
+        hmesh = _half_mesh(mesh)
+        Gv_bases_h = _half_Gv_bases(Gv_bases, mesh)
+        def hdot(a, b):
+            return _hermitian_dot(a, b, mesh)
 
-    rhs = fft_3d(4*np.pi*solute_chargeR.reshape(*mesh)).reshape(-1) * weight
+        def hnrm2(a):
+            return cp.sqrt(hdot(a, a))
 
-    niter = 0
-    def callback(x):
-        nonlocal niter
-        niter += 1
+        def Mprecond_h(phiH, out=None):
+            precond_phiH = _precond_yukawa_or_coul(
+                phiH.reshape(hmesh), Gv_bases_h, eps_r=mean_eps_r, ebkappa2=mean_ebkappa2, out=out)
+            return precond_phiH.reshape(-1)
+
+        x0 = pot_guess
+        if x0 is not None and x0.size == ngrids:    # full-spectrum guess (C2C solve)
+            x0 = cp.ascontiguousarray(x0.reshape(*mesh)[:, :, :hmesh[2]]).reshape(-1)
+        elif x0 is not None and x0.size != np.prod(hmesh):
+            x0 = None
+
+        t0 = log.init_timer()
+        RangePush("lpbe_cg_solve")
+        rhs = fft.rfftn(4*np.pi*solute_chargeR.real.reshape(*mesh)).reshape(-1) * weight
+        niter = 0
+        def callback(x):
+            nonlocal niter
+            niter += 1
+        solution_phi_H, info = cg_opt(
+            int(np.prod(hmesh)), _make_aop_r2c(mesh, Gv_bases_h, eps_r_field, S*ebkappa2),
+            Mprecond_h, rhs, x0=x0, tol=tol, maxiter=400, callback=callback,
+            dot=hdot, nrm2=hnrm2)
+        RangePop()
+        t1 = log.timer("LPBE CG solve (R2C)", *t0)
+        if info != 0:
+            log.warn(f"Conjugate gradient did not converge: info={info}")
+        log.debug(f"Number of CG iterations: {niter}")
+        pot_guess_out = solution_phi_H
+        solution_phi_R = fft.irfftn(solution_phi_H.reshape(hmesh), s=tuple(mesh)) / weight
+        solution_phi_G = fft_3d(solution_phi_R).reshape(-1) * weight
+    elif fft_mode == 'c2c':
+        t0 = log.init_timer()
+        RangePush("lpbe_cg_solve")
+
+        rhs = fft_3d(4*np.pi*solute_chargeR.reshape(*mesh)).reshape(-1) * weight
+
+        niter = 0
+        def callback(x):
+            nonlocal niter
+            niter += 1
 
 
-    # Div( eps_r * Grad(phi) ) - S phi / (debye_length^2) = -4*pi*solute_chargeR.
-    solution_phi_G, info = cg_opt(ngrids, make_aop(S*ebkappa2), Mprecond, rhs, x0=pot_guess, tol=tol, maxiter=400, callback=callback)
+        # Div( eps_r * Grad(phi) ) - S phi / (debye_length^2) = -4*pi*solute_chargeR.
+        if pot_guess is not None and pot_guess.size != ngrids:
+            pot_guess = None
+        solution_phi_G, info = cg_opt(ngrids, make_aop(S*ebkappa2), Mprecond, rhs, x0=pot_guess, tol=tol, maxiter=400, callback=callback)
 
-    RangePop()
-    t1 = log.timer("LPBE CG solve", *t0)
+        RangePop()
+        t1 = log.timer("LPBE CG solve", *t0)
 
 
-    if info != 0:
-        log.warn(f"Conjugate gradient did not converge: info={info}")
+        if info != 0:
+            log.warn(f"Conjugate gradient did not converge: info={info}")
 
-    log.debug(f"Number of CG iterations: {niter}")
+        log.debug(f"Number of CG iterations: {niter}")
 
+
+        solution_phi_R = ifft_3d(solution_phi_G.reshape(*mesh)) / weight
+        pot_guess_out = solution_phi_G
+    else:
+        raise ValueError(f"LPBE option fft={fft_mode!r}: use 'auto', 'r2c' or 'c2c'")
 
     RangePush("lpbe_postprocess")
-    solution_phi_R = ifft_3d(solution_phi_G.reshape(*mesh)) / weight
 
     # rho_ion_R = solution_phi_R * S * (ebkappa2 / (4*np.pi))
 
@@ -788,7 +1021,7 @@ def lpbe_inner(ni, rhoG, Gv_bases, options=None, pot_guess=None):
         'Ediel': Ediel,
         'Ecav': Ecav,
         'E_coul_corr': E_coul_corr,
-        'pot_guess': solution_phi_G,
+        'pot_guess': pot_guess_out,
         'cavity_r': S,
         'solvation_potentialR': solvation_potentialR,
         'vcav_r': vcav_r,

@@ -91,6 +91,16 @@ def tearDownModule():
     del lpbe_options
 
 
+def _assert_close(tc, a, b, msg, rtol=1e-9):
+    '''|a - b| relative to the size of the quantity (the fields here reach ~1e7).  The old
+    check (signed max, absolute 1e-6) only held while both solvers stopped at the same
+    CG iteration.'''
+    a = np.asarray(a.get() if hasattr(a, 'get') else a)
+    b = np.asarray(b.get() if hasattr(b, 'get') else b)
+    scale = max(float(np.abs(b).max()), 1.0)
+    tc.assertLessEqual(float(np.abs(a - b).max()), rtol * scale, msg=msg)
+
+
 class KnownValues(unittest.TestCase):
 
 
@@ -122,11 +132,14 @@ class KnownValues(unittest.TestCase):
         coulomb_kernel_on_g_mesh = pbc_tools.get_coulG(pcell, Gv=Gv)
 
 
-        v3_result = lpbe_inner_v3(numint_v3, rhoG.copy().reshape(-1), Gv_bases, options=lpbe_options)
-        v2_result = lpbe_inner_v2(numint_v2, rhoG.copy().reshape(-1), coulomb_kernel_on_g_mesh, Gv)
+        # Both CG solves converged tightly, so the comparison measures the two implementations,
+        # not where each solver happened to stop.
+        tight = dict(lpbe_options, tol=1e-11)
+        v3_result = lpbe_inner_v3(numint_v3, rhoG.copy().reshape(-1), Gv_bases, options=tight)
+        v2_result = lpbe_inner_v2(numint_v2, rhoG.copy().reshape(-1), coulomb_kernel_on_g_mesh, Gv, options=tight)
 
         for qname in ('Eion', 'Ediel', 'Ecav', 'E_coul_corr', 'cavity_r', 'solvation_potentialR', 'vcav_r', 'vdiel_r', 'vion_r', 'vcorr_g', 'pseudocore_densityR'):
-            self.assertAlmostEqual((v3_result[qname].get() - v2_result[qname].get()).max(), 0.0, 6, msg=f"Failed for {qname} in test_lpbe_gga")
+            _assert_close(self, v3_result[qname], v2_result[qname], f"{qname} in test_lpbe_gga")
 
 
     def test_lpbe_gga_kpts(self):
@@ -157,11 +170,14 @@ class KnownValues(unittest.TestCase):
         coulomb_kernel_on_g_mesh = pbc_tools.get_coulG(pcell, Gv=Gv)
 
 
-        v3_result = lpbe_inner_v3(numint_v3, rhoG.copy().reshape(-1), Gv_bases, options=lpbe_options)
-        v2_result = lpbe_inner_v2(numint_v2, rhoG.copy().reshape(-1), coulomb_kernel_on_g_mesh, Gv)
+        # Both CG solves converged tightly, so the comparison measures the two implementations,
+        # not where each solver happened to stop.
+        tight = dict(lpbe_options, tol=1e-11)
+        v3_result = lpbe_inner_v3(numint_v3, rhoG.copy().reshape(-1), Gv_bases, options=tight)
+        v2_result = lpbe_inner_v2(numint_v2, rhoG.copy().reshape(-1), coulomb_kernel_on_g_mesh, Gv, options=tight)
 
         for qname in ('Eion', 'Ediel', 'Ecav', 'E_coul_corr', 'cavity_r', 'solvation_potentialR', 'vcav_r', 'vdiel_r', 'vion_r', 'vcorr_g', 'pseudocore_densityR'):
-            self.assertAlmostEqual((v3_result[qname].get() - v2_result[qname].get()).max(), 0.0, 6, msg=f"Failed for {qname} in test_lpbe_gga")
+            _assert_close(self, v3_result[qname], v2_result[qname], f"{qname} in test_lpbe_gga")
 
 
 if __name__ == '__main__':
