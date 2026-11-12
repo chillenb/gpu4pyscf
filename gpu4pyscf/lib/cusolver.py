@@ -264,6 +264,9 @@ def _syev_batched(a, vectors):
     dtype_a = _CUDA_C_64F if cplx else _CUDA_R_64F
     jobz = CUSOLVER_EIG_MODE_VECTOR if vectors else CUSOLVER_EIG_MODE_NOVECTOR
     handle = device.get_cusolver_handle()
+    # The handle is shared: bind it to the current stream (as eigh() does) so the
+    # solve is ordered after the producer of a and before the consumers of w, v.
+    cusolver.setStream(handle, cupy.cuda.get_current_stream().ptr)
     params = _get_dn_params()
     dsize, hsize = ctypes.c_size_t(), ctypes.c_size_t()
     status = libcusolver.cusolverDnXsyevBatched_bufferSize(
