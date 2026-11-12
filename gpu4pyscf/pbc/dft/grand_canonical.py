@@ -402,9 +402,10 @@ class _GrandCanonicalKSBase(lib.StreamObject):
         __config__, 'pbc_dft_grand_canonical_time_reversal_eigh', True)
     # Scan h5: keep only MOs with occupation >= this (None keeps every MO).  The
     # density, hence every restart/seed, is unchanged by dropping MOs with
-    # occupation below ~1e-18.
+    # occupation below 1e-18; the file shrinks to the occupied MOs (~15% for
+    # Cu slabs).  The file's mo_occ_threshold attribute records the cut.
     scan_mo_occ_threshold = getattr(
-        __config__, 'pbc_dft_grand_canonical_scan_mo_occ_threshold', None)
+        __config__, 'pbc_dft_grand_canonical_scan_mo_occ_threshold', 1e-18)
 
     _keys = {
         'async_io', 'scan_mo_occ_threshold', 'time_reversal_eigh', 'scan_extrapolate',
