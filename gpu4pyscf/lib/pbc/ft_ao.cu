@@ -29,9 +29,15 @@
 #define GOUT_WIDTH_HIGH_L 56
 #define POOL_SIZE       65536
 
-__global__ static
+// Max l of the auxiliary basis in build_ft_ao. Bases with l <= AUXL use the
+// ft_ao_bdiv_kernel<AUXL> instance, l = AUXL+1..AUXL_HIGH the <AUXL_HIGH> one
+// (its static shared buffer is 48 KB, which halves the occupancy).
+#define AUXL_HIGH       7
+
+template <int auxl> __global__ static
 void ft_ao_bdiv_kernel(double *out, RysIntEnvVars envs, int nGv, double *Gv)
 {
+    constexpr int auxnf = (auxl+1)*(auxl+2)/2;
     int sh_block_id = gridDim.y - blockIdx.y - 1;
     int Gv_block_id = blockIdx.x;
     int nsh_per_block = FT_AO_THREADS / NG_PER_BLOCK;
@@ -59,9 +65,9 @@ void ft_ao_bdiv_kernel(double *out, RysIntEnvVars envs, int nGv, double *Gv)
     }
     double kk = kx * kx + ky * ky + kz * kz;
 
-    int gx_len = (AUXL+1) * FT_AO_THREADS;
-    __shared__ double g[(AUXL+1)*FT_AO_THREADS * 6];
-    double *gxR = g + (AUXL+1) * NG_PER_BLOCK * sh_id_in_block + Gv_id_in_block;
+    int gx_len = (auxl+1) * FT_AO_THREADS;
+    __shared__ double g[(auxl+1)*FT_AO_THREADS * 6];
+    double *gxR = g + (auxl+1) * NG_PER_BLOCK * sh_id_in_block + Gv_id_in_block;
     double *gxI = gxR + gx_len;
     double *gyR = gxR + gx_len*2;
     double *gyI = gxR + gx_len*3;
@@ -69,10 +75,10 @@ void ft_ao_bdiv_kernel(double *out, RysIntEnvVars envs, int nGv, double *Gv)
     double *gzI = gxR + gx_len*5;
     const int *idx = _c_cartesian_lexical_xyz + lex_xyz_offset(li);
 
-    double goutR[AUXNF];
-    double goutI[AUXNF];
+    double goutR[auxnf];
+    double goutI[auxnf];
 #pragma unroll
-    for (int n = 0; n < AUXNF; ++n) {
+    for (int n = 0; n < auxnf; ++n) {
         goutR[n] = 0.;
         goutI[n] = 0.;
     }
@@ -126,7 +132,7 @@ void ft_ao_bdiv_kernel(double *out, RysIntEnvVars envs, int nGv, double *Gv)
             gyI[NG_PER_BLOCK] = s1yI;
             gzR[NG_PER_BLOCK] = s1zR;
             gzI[NG_PER_BLOCK] = s1zI;
-            for (int i = 2; i <= AUXL; i++) {
+            for (int i = 2; i <= auxl; i++) {
                 if (i > li) break;
                 double ia2 = (i-1) * a2;
                 s2xR = ia2 * s0xR - xpaI * s1xI;
@@ -157,7 +163,7 @@ void ft_ao_bdiv_kernel(double *out, RysIntEnvVars envs, int nGv, double *Gv)
         }
         __syncthreads();
 #pragma unroll
-        for (int n = 0; n < AUXNF; ++n) {
+        for (int n = 0; n < auxnf; ++n) {
             if (n >= nfi) break;
             int addrx = idx[n*3+0] * NG_PER_BLOCK;
             int addry = idx[n*3+1] * NG_PER_BLOCK;
@@ -179,7 +185,7 @@ void ft_ao_bdiv_kernel(double *out, RysIntEnvVars envs, int nGv, double *Gv)
         size_t stride = (size_t)nGv * OF_COMPLEX;
         double *aft_tensor = out + ((size_t)envs.ao_loc[sh_id] * nGv + Gv_id) * OF_COMPLEX;
 #pragma unroll
-        for (int n = 0; n < AUXNF; ++n) {
+        for (int n = 0; n < auxnf; ++n) {
             if (n >= nfi) break;
             aft_tensor[n*stride  ] = goutR[n];
             aft_tensor[n*stride+1] = goutI[n];
@@ -1145,14 +1151,22 @@ while (1) {
 }
 
 extern "C" {
-int build_ft_ao(double *out, RysIntEnvVars *envs, int ngrids, double *grids, cudaStream_t stream)
+int build_ft_ao(double *out, RysIntEnvVars *envs, int ngrids, double *grids, int lmax,
+                cudaStream_t stream)
 {
     int nsh_per_block = FT_AO_THREADS/NG_PER_BLOCK;
     dim3 threads(NG_PER_BLOCK, nsh_per_block);
     int nbatches_grids = (ngrids + NG_PER_BLOCK - 1) / NG_PER_BLOCK;
     int nbatches_shls = (envs->nbas + nsh_per_block - 1) / nsh_per_block;
     dim3 blocks(nbatches_grids, nbatches_shls);
-    ft_ao_bdiv_kernel<<<blocks, threads, 0, stream>>>(out, *envs, ngrids, grids);
+    if (lmax <= AUXL) {
+        ft_ao_bdiv_kernel<AUXL><<<blocks, threads, 0, stream>>>(out, *envs, ngrids, grids);
+    } else if (lmax <= AUXL_HIGH) {
+        ft_ao_bdiv_kernel<AUXL_HIGH><<<blocks, threads, 0, stream>>>(out, *envs, ngrids, grids);
+    } else {
+        fprintf(stderr, "build_ft_ao: l = %d > %d not supported\n", lmax, AUXL_HIGH);
+        return 1;
+    }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in ft_ao_bdiv_kernel: %s\n", cudaGetErrorString(err));

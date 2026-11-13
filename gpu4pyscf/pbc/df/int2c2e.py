@@ -29,13 +29,17 @@ from gpu4pyscf.lib.cupy_helper import contract, asarray, hermi_triu
 from gpu4pyscf.gto.mole import (
     PTR_BAS_COORD, SortedGTO, PBCIntEnvVars, most_diffuse_pgto, _scale_sp_ctr_coeff)
 from gpu4pyscf.df.int3c2e_bdiv import (
-    _nearest_power2, SHM_SIZE, L_AUX_MAX, THREADS, _check_rsh_factors)
+    _nearest_power2, SHM_SIZE, THREADS, _check_rsh_factors)
 from gpu4pyscf.pbc.df.ft_ao import libpbc
 from gpu4pyscf.pbc.gto.int1e import _bvkcell_lattice_sum_Ls
 
 __all__ = [
     'int2c2e', 'sr_int2c2e', 'Int2c2eOpt'
 ]
+
+# Max l of PBC auxiliary basis sets. Must match L_AUX in lib/pbc/fill_int2c2e.cu,
+# fill_int2c2e_ip1.cu and e_int2c2e_ip1.cu (the stride of gout_stride_lookup).
+L_AUX_MAX = 7
 
 libpbc.fill_int2c2e.restype = ctypes.c_int
 libpbc.int2c2e_deriv.restype = ctypes.c_int

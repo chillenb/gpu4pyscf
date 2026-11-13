@@ -30,7 +30,7 @@ from gpu4pyscf.__config__ import props as gpu_specs
 from gpu4pyscf.gto.mole import RysIntEnvVars, _scale_sp_ctr_coeff
 from gpu4pyscf.pbc.df.int3c2e import (
     libpbc, POOL_SIZE, MAX_IMGS_PER_TASK, int3c2e_scheme,
-    _get_shl_pair_per_block, _counts_to_offsets)
+    _get_shl_pair_per_block, _counts_to_offsets, _shm_size_max, L_AUX_MAX_CONTRACT)
 from gpu4pyscf.pbc.df.int2c2e import Int2c2eOpt, _estimate_sr_2c2e_rcut
 from gpu4pyscf.pbc.df.rsdf_builder import LINEAR_DEP_THR, _unpack_cderi_v2
 from gpu4pyscf.pbc.tools.pbc import madelung, _Gv_wrap_around
@@ -552,7 +552,7 @@ def _get_ejk_derivatives(int3c2e_opt, dm, kpts=None, hermi=0, j_factor=1., k_fac
             gout_width=54, deriv=(1,0,0))
         lmax = cell.uniq_l_ctr[:,0].max()
         laux = auxcell.uniq_l_ctr[:,0].max()
-        shm_size_max = shm_size[:laux+1,:lmax+1,:lmax+1].max()
+        shm_size_max = _shm_size_max(nsp_per_block, shm_size, laux, lmax, L_AUX_MAX_CONTRACT)
 
         l_ctr_aux_offsets = _counts_to_offsets(auxcell.l_ctr_counts)
         # Split auxbasis in the unit cell. A large aux_batch can overflow the POOL_SIZE

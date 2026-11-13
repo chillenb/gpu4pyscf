@@ -129,10 +129,14 @@ def ft_ao(cell, Gv, shls_slice=None, b=None,
         GvT = (asarray(Gv.T) + asarray(kpt[:,None])).ravel()
     nao = ao_loc[-1]
     out = ndarray((nao, ngrids), dtype=np.complex128, buffer=out)
+    lmax = int(cell._bas[:,ANG_OF].max()) if cell.nbas > 0 else 0
+    if lmax > 7:
+        raise NotImplementedError(f'ft_ao for l = {lmax} (l <= 7 supported)')
     err = libpbc.build_ft_ao(
         ctypes.cast(out.data.ptr, ctypes.c_void_p),
         ctypes.byref(envs), ctypes.c_int(ngrids),
         ctypes.cast(GvT.data.ptr, ctypes.c_void_p),
+        ctypes.c_int(lmax),
         ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
     if err != 0:
         raise RuntimeError('build_ft_ao failed')

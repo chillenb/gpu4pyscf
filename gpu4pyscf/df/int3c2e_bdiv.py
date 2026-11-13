@@ -564,10 +564,13 @@ class Int3c2eEnvVars(ctypes.Structure):
 
 def int3c2e_scheme(*, short_range=False, shm_size=SHM_SIZE, gout_width=None,
                    gout_ndim='ijk', deriv=None, cache_cart_idx=False,
-                   angular_inc=None, lmax=LMAX):
+                   angular_inc=None, lmax=LMAX, l_aux_max=L_AUX_MAX):
     '''Launch parameters for each (lk, li, lj). The tables have the shape
-    (L_AUX_MAX+1, lmax+1, lmax+1). lmax must match the stride of the lookup
-    in the CUDA kernels (LMAX1 for the molecular kernels).'''
+    (l_aux_max+1, lmax+1, lmax+1). lmax must match the stride of the lookup
+    in the CUDA kernels (LMAX1 for the molecular kernels).
+
+    gout_width may be an array broadcastable to that shape. Entries whose
+    outputs do not fit in THREADS*gout_width get nsp_per_block = 0.'''
     if deriv is None:
         deriv = (0, 0, 0)
     if angular_inc is None:
@@ -576,7 +579,7 @@ def int3c2e_scheme(*, short_range=False, shm_size=SHM_SIZE, gout_width=None,
 
     li = np.arange(lmax+1)[:,None]
     lj = np.arange(lmax+1)
-    lk = np.arange(L_AUX_MAX+1)[:,None,None]
+    lk = np.arange(l_aux_max+1)[:,None,None]
     nfi = (li + 1) * (li + 2) // 2
     nfj = (lj + 1) * (lj + 2) // 2
     nfk = (lk + 1) * (lk + 2) // 2
@@ -601,7 +604,7 @@ def int3c2e_scheme(*, short_range=False, shm_size=SHM_SIZE, gout_width=None,
         gout_stride = _nearest_power2(gout_stride, return_leq=False)
         nsp_per_block = THREADS // gout_stride
     nsp_per_block = np.minimum(nsp_max, nsp_per_block)
-    gout_stride = cp.asarray(THREADS // nsp_per_block, dtype=np.int32)
+    gout_stride = cp.asarray(THREADS // np.maximum(nsp_per_block, 1), dtype=np.int32)
     shm_size = nsp_per_block * (unit*8)
     if cache_cart_idx:
         shm_size += (nfi + nfj + nfk) * 3 * 4

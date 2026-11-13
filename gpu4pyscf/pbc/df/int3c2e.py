@@ -41,7 +41,7 @@ from gpu4pyscf.df.int3c2e_bdiv import (
     int3c2e_scheme as mol_int3c2e_scheme)
 from gpu4pyscf.pbc.df.ft_ao import (
     libpbc, most_diffuse_pgto, FTOpt, ft_ao_scheme)
-from gpu4pyscf.pbc.df.int2c2e import _estimate_sr_2c2e_rcut
+from gpu4pyscf.pbc.df.int2c2e import _estimate_sr_2c2e_rcut, L_AUX_MAX
 from gpu4pyscf.pbc.lib.kpts_helper import conj_images_in_bvk_cell, _normalize_kpts
 from gpu4pyscf.pbc.tools.k2gamma import double_translation_indices
 from gpu4pyscf.__config__ import props as gpu_specs
@@ -59,11 +59,18 @@ libpbc.PBCpair_recontraction_info.restype = ctypes.c_int
 
 # Must match PBC_LMAX in lib/pbc/pbc_lmax.cuh
 LMAX = 5
-L_AUX_MAX = 6
+# Auxiliary basis: l <= L_AUX_MAX (7, from pbc/df/int2c2e.py) for the integrals
+# of the GDF build (fill_int3c2e, fill_int2c2e, build_ft_ao). contract_dm,
+# contract_auxvec (NF_AUX_MAX in contract_int3c2e.cu) and the derivative
+# kernels (ejk_int3c2e_ip1, ft_ao_deriv: AUXL in ft_ao.cuh) are limited to
+# L_AUX_MAX_CONTRACT.
+L_AUX_MAX_CONTRACT = 6
 THREADS = 256
 POOL_SIZE = 16384
 MAX_IMGS_PER_TASK = 31
+# Must match GOUT_WIDTH and GOUT_WIDTH_HIGH_L in lib/pbc/fill_int3c2e.cu
 GOUT_WIDTH = 54
+GOUT_WIDTH_HIGH_L = 64
 
 def sr_aux_e2(cell, auxcell, omega, kpts=None, bvk_kmesh=None, j_only=False):
     r'''
@@ -531,10 +538,12 @@ class SRInt3c2eOpt:
         bvk_ncells = np.prod(self.bvk_kmesh)
 
         nsp_per_block, gout_stride, shm_size = int3c2e_scheme(
-            gout_width=GOUT_WIDTH, cache_cart_idx=True)
+            gout_width=GOUT_WIDTH, cache_cart_idx=True,
+            gout_width_high_l=GOUT_WIDTH_HIGH_L)
         lmax = cell.uniq_l_ctr[:,0].max()
         laux = auxcell.uniq_l_ctr[:,0].max()
-        shm_size_max = shm_size[:laux+1,:lmax+1,:lmax+1].max()
+        shm_size_max = _shm_size_max(nsp_per_block, shm_size, laux, lmax)
+        with_high_l = int(_int3c2e_high_l(laux, lmax))
 
         uniq_l_ctr_aux = auxcell.uniq_l_ctr
         l_ctr_aux_offsets = _counts_to_offsets(auxcell.l_ctr_counts)
@@ -574,7 +583,7 @@ class SRInt3c2eOpt:
         pool = cp.empty(workers * POOL_SIZE*(MAX_IMGS_PER_TASK+2) + 1, dtype=np.uint32)
         head = pool[-1:]
         task_pool = empty_aligned((workers, POOL_SIZE*16), np.int32, alignment=128)
-        c2s_pool = cp.empty((workers, THREADS*GOUT_WIDTH))
+        c2s_pool = cp.empty((workers, THREADS*(GOUT_WIDTH_HIGH_L if with_high_l else GOUT_WIDTH)))
         int3c2e_envs = self.int3c2e_envs
         img_idx = cp.asarray(self.img_idx)
         img_offsets = cp.asarray(self.img_offsets)
@@ -626,6 +635,7 @@ class SRInt3c2eOpt:
                 ctypes.cast(diffuse_exps.data.ptr, ctypes.c_void_p),
                 ctypes.cast(diffuse_coefs.data.ptr, ctypes.c_void_p),
                 ctypes.c_float(log_cutoff),
+                ctypes.c_int(with_high_l),
                 ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
             if err != 0:
                 raise RuntimeError('fill_int3c2e kernel')
@@ -668,7 +678,8 @@ class SRInt3c2eOpt:
             cache_cart_idx=True, gout_width=28, gout_ndim='k')
         lmax = cell.uniq_l_ctr[:,0].max()
         laux = auxcell.uniq_l_ctr[:,0].max()
-        shm_size_max = shm_size[:laux+1,:lmax+1,:lmax+1].max()
+        shm_size_max = _shm_size_max(nsp_per_block, shm_size, laux, lmax,
+                                     L_AUX_MAX_CONTRACT)
         bvk_ncells = len(self.bvkmesh_Ls)
         pair_per_block = _get_shl_pair_per_block(np.diff(l_ctr_aux_offsets), bvk_ncells)
         bas_ij_idx, shl_pair_offsets = cell.aggregate_shl_pairs(
@@ -744,7 +755,8 @@ class SRInt3c2eOpt:
             cache_cart_idx=True, gout_width=29, gout_ndim='ij')
         lmax = cell.uniq_l_ctr[:,0].max()
         laux = auxcell.uniq_l_ctr[:,0].max()
-        shm_size_max = shm_size[:laux+1,:lmax+1,:lmax+1].max()
+        shm_size_max = _shm_size_max(nsp_per_block, shm_size, laux, lmax,
+                                     L_AUX_MAX_CONTRACT)
         pair_per_block = _get_shl_pair_per_block(np.diff(l_ctr_aux_offsets), bvk_ncells)
         bas_ij_idx = cell.aggregate_shl_pairs(self.bas_ij_cache, pair_per_block)[0]
 
@@ -808,11 +820,45 @@ def _conc_locs(ao_loc1, ao_loc2):
     return cp.array(comp_loc, dtype=np.int32)
 
 def int3c2e_scheme(*, shm_size=SHM_SIZE, gout_width=None, gout_ndim='ijk',
-                   deriv=None, cache_cart_idx=False):
+                   deriv=None, cache_cart_idx=False, gout_width_high_l=None):
+    '''Launch parameters for each (lk, li, lj), lk <= L_AUX_MAX, li, lj <= LMAX.
+
+    With gout_width_high_l (only for the fill_int3c2e kernel), the triplets
+    with more than THREADS*gout_width Cartesian components (see
+    _int3c2e_high_l) are given the parameters of the wide kernel instance.
+    Otherwise those entries have nsp_per_block = 0, and _shm_size_max raises
+    if the basis sets need them.
+    '''
+    if gout_width_high_l is not None:
+        assert gout_ndim == 'ijk' and deriv is None
+        gout_width = np.where(_int3c2e_high_l(np.arange(L_AUX_MAX+1)[:,None,None],
+                                              np.arange(LMAX+1)[:,None], np.arange(LMAX+1),
+                                              gout_width),
+                              gout_width_high_l, gout_width)
     return mol_int3c2e_scheme(
         short_range=True, shm_size=shm_size, gout_width=gout_width,
         gout_ndim=gout_ndim, deriv=deriv, cache_cart_idx=cache_cart_idx,
-        lmax=LMAX)
+        lmax=LMAX, l_aux_max=L_AUX_MAX)
+
+def _int3c2e_high_l(lk, li, lj=None, gout_width=GOUT_WIDTH):
+    '''Whether (li,lj|lk) needs the GOUT_WIDTH_HIGH_L instance of the
+    fill_int3c2e kernel (lj defaults to li, the largest pair of a basis).'''
+    if lj is None:
+        lj = li
+    nf = (li+1)*(li+2)//2 * ((lj+1)*(lj+2)//2) * ((lk+1)*(lk+2)//2)
+    return nf > THREADS * gout_width
+
+def _shm_size_max(nsp_per_block, shm_size, laux, lmax, l_aux_max=L_AUX_MAX):
+    '''The shared memory for the (lk, li, lj) patterns up to (laux, lmax, lmax);
+    raises if a kernel cannot handle them.'''
+    if laux > l_aux_max:
+        raise NotImplementedError(
+            f'auxiliary basis with l = {laux} (this kernel supports l <= {l_aux_max})')
+    if np.any(np.asarray(nsp_per_block)[:laux+1,:lmax+1,:lmax+1] == 0):
+        raise NotImplementedError(
+            f'3c2e kernel cannot hold the outputs of shell triplets with l_aux = {laux} '
+            f'and l = {lmax}')
+    return shm_size[:laux+1,:lmax+1,:lmax+1].max()
 
 # This modified rcut estimation function will be available in pyscf-2.8 or newer
 # TODO: improve the rcut estimation for PBCsr_int3c2e_latsum23 kernel
