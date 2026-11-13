@@ -28,9 +28,13 @@
 
 #define REMOTE_THRESHOLD 50
 #define GOUT_WIDTH      54
+// (h h|k) triplets (21*21*36 Cartesian components) exceed THREADS*GOUT_WIDTH
+#define GOUT_WIDTH_HIGH_L 64
 
 // lattice sum over j and k for (ij|k)
-__global__ static
+// Each (li,lj,lk) pattern is evaluated by exactly one of the two instances:
+// gout_width = GOUT_WIDTH if nfi*nfj*nfk <= THREADS*GOUT_WIDTH, otherwise GOUT_WIDTH_HIGH_L
+template <int gout_width> __global__ static
 void pbc_int3c2e_latsum23_kernel(double *out, double omega, PBCIntEnvVars envs, uint32_t *img_pool,
                                  ShellTripletTaskInfo *task_pool, double *c2s_pool, int shm_size,
                                  uint32_t *bas_ij_idx, int *shl_pair_offsets, int *ksh_offsets,
@@ -43,7 +47,7 @@ void pbc_int3c2e_latsum23_kernel(double *out, double omega, PBCIntEnvVars envs, 
 {
     int thread_id = threadIdx.x;
     int worker_id = blockIdx.x;
-    c2s_pool += worker_id * (THREADS*GOUT_WIDTH);
+    c2s_pool += worker_id * (THREADS*gout_width);
     img_pool += worker_id * POOL_SIZE * (MAX_IMGS_PER_TASK+2);
     // rem_task_idx stores the Id of the ijk tasks which has remaining_imgs > 0
     uint32_t *rem_task_idx = img_pool + POOL_SIZE * MAX_IMGS_PER_TASK;
@@ -104,6 +108,10 @@ while (1) {
         nst_per_block = THREADS / gout_stride;
     }
     __syncthreads();
+    if ((nf > THREADS * GOUT_WIDTH) != (gout_width > GOUT_WIDTH)) {
+        __syncthreads();
+        continue;
+    }
 
     int nfi = c_nf[li];
     int nfj = c_nf[lj];
@@ -182,9 +190,9 @@ while (1) {
                 int ri = bas[ish*BAS_SLOTS+PTR_BAS_COORD];
                 int rj = bas[jsh*BAS_SLOTS+PTR_BAS_COORD];
                 int rk = bas[ksh*BAS_SLOTS+PTR_BAS_COORD];
-                double gout[GOUT_WIDTH];
+                double gout[gout_width];
 #pragma unroll
-                for (int n = 0; n < GOUT_WIDTH; ++n) { gout[n] = 0; }
+                for (int n = 0; n < gout_width; ++n) { gout[n] = 0; }
 
                 for (int ijp = 0; ijp < iprim*jprim; ++ijp) {
                     int ip = ijp / jprim;
@@ -259,7 +267,7 @@ while (1) {
                                     float div_nfi = c_div_nf[li];
                                     float div_nfk = c_div_nf[lk];
 #pragma unroll
-                                    for (int n = 0; n < GOUT_WIDTH; ++n) {
+                                    for (int n = 0; n < gout_width; ++n) {
                                         uint32_t ijk = n*gout_stride+gout_id;
                                         if (ijk >= nf) break;
                                         uint32_t ij = ijk * div_nfk;
@@ -287,7 +295,7 @@ while (1) {
                     if (task_id < num_sub_tasks) {
                         int nfk = c_nf[lk];
 #pragma unroll
-                        for (int n = 0; n < GOUT_WIDTH; ++n) {
+                        for (int n = 0; n < gout_width; ++n) {
                             int ijk = n*gout_stride+gout_id;
                             if (ijk >= nf) break;
                             int ij = ijk / nfk;
@@ -308,7 +316,7 @@ while (1) {
                             inp_local = c2s_pool + st_id;
                         }
 #pragma unroll
-                        for (int n = 0; n < GOUT_WIDTH; ++n) {
+                        for (int n = 0; n < gout_width; ++n) {
                             int ijk = n*gout_stride+gout_id;
                             if (ijk >= nf) break;
                             int ij = ijk / nfk;
@@ -1103,23 +1111,38 @@ int PBCsr_int3c2e_latsum23(double *out, double omega, PBCIntEnvVars *envs, uint3
                            int *gout_stride_lookup, int *ao_pair_loc,
                            int ao_pair_offset, int aux_offset,
                            int nauxbas, int naux, int to_sph,
-                           float *diffuse_exps, float *diffuse_coefs, float log_cutoff, cudaStream_t stream)
+                           float *diffuse_exps, float *diffuse_coefs, float log_cutoff,
+                           int with_high_l, cudaStream_t stream)
 {
     if (nbatches_shl_pair == 0 || nbatches_ksh == 0) {
         return 0;
     }
-    cudaFuncSetAttribute(pbc_int3c2e_latsum23_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
     int workers = prop.multiProcessorCount;
+    // c2s_pool must hold workers*THREADS*GOUT_WIDTH_HIGH_L doubles if with_high_l
+    cudaFuncSetAttribute(pbc_int3c2e_latsum23_kernel<GOUT_WIDTH>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     cudaMemsetAsync(head, 0, sizeof(int), stream);
-    pbc_int3c2e_latsum23_kernel<<<workers, THREADS, shm_size, stream>>>(
+    pbc_int3c2e_latsum23_kernel<GOUT_WIDTH><<<workers, THREADS, shm_size, stream>>>(
             out, omega, *envs, pool, task_pool, c2s_pool, shm_size,
             bas_ij_idx, shl_pair_offsets, ksh_offsets, img_idx, sp_img_offsets,
             gout_stride_lookup, ao_pair_loc,
             ao_pair_offset, aux_offset, nauxbas, naux, to_sph,
             diffuse_exps, diffuse_coefs, log_cutoff,
             head, nbatches_shl_pair, nbatches_ksh);
+    if (with_high_l) {
+        cudaFuncSetAttribute(pbc_int3c2e_latsum23_kernel<GOUT_WIDTH_HIGH_L>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+        cudaMemsetAsync(head, 0, sizeof(int), stream);
+        pbc_int3c2e_latsum23_kernel<GOUT_WIDTH_HIGH_L><<<workers, THREADS, shm_size, stream>>>(
+                out, omega, *envs, pool, task_pool, c2s_pool, shm_size,
+                bas_ij_idx, shl_pair_offsets, ksh_offsets, img_idx, sp_img_offsets,
+                gout_stride_lookup, ao_pair_loc,
+                ao_pair_offset, aux_offset, nauxbas, naux, to_sph,
+                diffuse_exps, diffuse_coefs, log_cutoff,
+                head, nbatches_shl_pair, nbatches_ksh);
+    }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in fill_int3c2e: %s\n", cudaGetErrorString(err));

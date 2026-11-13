@@ -25,7 +25,8 @@
 #define THREADS         256
 #define GOUT_IP_WIDTH   20
 #define BLOCK_SIZE      16
-#define L_AUX           6
+// Must match L_AUX_MAX in pbc/df/int2c2e.py
+#define L_AUX           7
 #define L_AUX1          (L_AUX+1)
 
 __global__ static
